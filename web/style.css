@@ -211,3 +211,45 @@ body.hidden-hud #keys { opacity: 0; pointer-events: none; }
   border-radius: 2px;
   transition: width 120ms linear;
 }
+
+/* Fixation target for the centring pass.  A precise thing to stare at gives a
+   tighter centre estimate than "look at the middle of the screen" does, and it
+   sits above the overlay so it is the brightest thing on screen. */
+#fixation {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 50%;
+  background: var(--accent);
+  box-shadow: 0 0 0 5px rgba(110, 231, 183, .18), 0 0 22px 6px rgba(110, 231, 183, .45);
+  opacity: 0;
+  transform: scale(.4);
+  transition: opacity 240ms ease, transform 240ms ease;
+  pointer-events: none;
+  z-index: 20;
+}
+
+#fixation.on {
+  opacity: 1;
+  transform: scale(1);
+  animation: breathe 2s ease-in-out infinite;
+}
+
+@keyframes breathe {
+  50% { transform: scale(1.18); }
+}
+
+/* Keep the words clear of the dot they are asking you to stare at. */
+#overlaybox { transition: transform 300ms ease; }
+#overlay.calibrating #overlaybox { transform: translateY(-150px); }
+
+.count {
+  display: inline-block;
+  margin-top: 12px;
+  font-size: 26px;
+  color: var(--ink);
+  font-variant-numeric: tabular-nums;
+}

@@ -169,6 +169,7 @@ class ServerTests(unittest.TestCase):
                 confidence=1.0,
             ),
             calibration=1.0,
+            generation=1,
             gaze_fps=30.0,
             latency_ms=5.0,
             eye_visibility=(1.0, 1.0),
@@ -189,6 +190,7 @@ class ServerTests(unittest.TestCase):
         state.publish(
             ControlOutput(90.0, 0.0, "looking", 20.0, 0.0, (0.0, 0.0), 1.0),
             calibration=1.0,
+            generation=1,
             gaze_fps=30.0,
             latency_ms=5.0,
             eye_visibility=(1.0, 1.0),
@@ -203,6 +205,7 @@ class ServerTests(unittest.TestCase):
         state.publish(
             ControlOutput(90.0, 0.0, "looking", 20.0, 0.0, (0.0, 0.0), 1.0),
             calibration=1.0,
+            generation=1,
             gaze_fps=30.0,
             latency_ms=5.0,
             eye_visibility=(1.0, 1.0),

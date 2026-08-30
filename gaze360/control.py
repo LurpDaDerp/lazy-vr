@@ -145,15 +145,21 @@ class GazeController:
         self.calibration = CalibrationState.COLLECTING
         self._samples: list[tuple[float, float]] = []
         self._target = (0.0, 0.0)
+        # Bumped on every centring pass.  The page starts a pass and then has
+        # to tell this pass's progress from the previous pass's, which is
+        # still arriving on the stream; comparing generations settles it.
+        self.generation = 0
 
-    def recalibrate(self) -> None:
+    def recalibrate(self) -> int:
         """Re-run the centring pass.  The viewer looks at the screen centre."""
         self.calibration = CalibrationState.COLLECTING
         self._samples = []
+        self.generation += 1
         # Bring the view home while the viewer is being asked to look at the
         # centre, so it eases back during the countdown instead of snapping
         # the moment calibration finishes.
         self._target = (0.0, 0.0)
+        return self.generation
 
     @property
     def calibration_progress(self) -> float:

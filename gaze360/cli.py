@@ -156,6 +156,7 @@ def run(args: argparse.Namespace) -> int:
         state.publish(
             output,
             controller.calibration_progress,
+            controller.generation,
             tracker.gaze_rate.rate,
             reading.latency_ms,
             reading.eye_visibility,

@@ -16,8 +16,13 @@ personal calibration beyond a two-second centring pass.
 
 The first launch creates `.venv` and installs the two packages. It then opens
 your webcam, serves the player on `http://127.0.0.1:8360/`, and opens a browser
-tab. Click **Begin**, hold still while it learns where your neutral gaze sits,
-and then look around.
+tab.
+
+Click **Begin** and a green dot appears in the middle of the screen. Stare at
+it: three seconds of countdown to let your eyes settle on it, then about two
+seconds of sampling while you hold still. That pass is what teaches the player
+where your neutral gaze sits — everything afterwards is measured from it. Press
+`C` any time to run it again.
 
 ```powershell
 .\run.bat --video "D:\clips\my360.mp4"   # any equirectangular mp4
@@ -30,7 +35,7 @@ modified; the file is read where it lies.
 
 | Key | |
 |---|---|
-| `C` | recalibrate — look at the centre of the screen |
+| `C` | recalibrate — stare at the green dot |
 | `Space` | play / pause |
 | `F` | fullscreen |
 | `H` | hide the overlay |
@@ -95,8 +100,11 @@ Three details that matter more than they sound:
 - **Calibration eases home.** Pressing `C` returns the view to the origin
   while you are being asked to look at the centre, rather than snapping when
   the countdown ends.
-- **Startup calibration.** Where your webcam sits relative to your screen is a
-  real per-setup bias. The centring pass removes it; `C` redoes it if you move.
+- **Calibration counts down before it samples.** Sampling the instant you
+  press the key would average in the moment your eyes were still travelling
+  towards the dot. Where your webcam sits relative to your screen is a real
+  per-setup bias, and this pass is what removes it — so it is worth the three
+  seconds. Press `C` again whenever you shift in your seat.
 
 ## Design
 

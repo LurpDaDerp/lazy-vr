@@ -151,6 +151,53 @@ class CalibrationTests(unittest.TestCase):
         controller.recalibrate()
         self.assertEqual(controller.update(tracked(0.0, 0.0, after)).state, "calibrating")
 
+    def test_generation_starts_at_zero(self):
+        self.assertEqual(GazeController(config()).generation, 0)
+
+    def test_recalibrate_bumps_the_generation(self):
+        """The page tells this pass from the previous one by its generation.
+
+        Python begins collecting at construction, so by the time a browser
+        connects the stream already reports a finished pass.  Without this the
+        first packet after the countdown satisfies the progress bar and the
+        whole step disappears before it is seen.
+        """
+        controller = GazeController(config())
+        before = controller.generation
+        self.assertEqual(controller.recalibrate(), before + 1)
+        self.assertEqual(controller.generation, before + 1)
+
+    def test_generation_increases_every_pass(self):
+        controller = GazeController(config())
+        seen = [controller.recalibrate() for _ in range(5)]
+        self.assertEqual(seen, sorted(set(seen)))
+        self.assertEqual(len(seen), 5)
+
+    def test_recalibrate_resets_progress_to_zero(self):
+        controller = GazeController(config())
+        calibrated(controller)
+        self.assertEqual(controller.calibration_progress, 1.0)
+        controller.recalibrate()
+        self.assertEqual(controller.calibration_progress, 0.0)
+
+    def test_progress_climbs_while_collecting(self):
+        controller = GazeController(config(calibration_samples=4))
+        seen = []
+        for index in range(4):
+            controller.update(tracked(0.0, 0.0, 0.01 * index))
+            seen.append(controller.calibration_progress)
+        self.assertEqual(seen, [0.25, 0.5, 0.75, 1.0])
+
+    def test_recalibrate_brings_the_view_home(self):
+        """The view eases back while the viewer is asked to look at the dot."""
+        controller = GazeController(config())
+        after = calibrated(controller)
+        controller.update(tracked(25.0, 15.0, after))
+        controller.recalibrate()
+        held = controller.update(lost(after + 0.1))
+        self.assertEqual(held.yaw, 0.0)
+        self.assertEqual(held.pitch, 0.0)
+
     def test_recalibrating_adopts_a_new_centre(self):
         controller = GazeController(config(calibration_samples=4))
         after = calibrated(controller, yaw=0.0)

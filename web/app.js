@@ -202,6 +202,7 @@ const el = {
   progresswrap: document.getElementById("progresswrap"),
   needle: document.getElementById("compassneedle"),
   marks: document.getElementById("compassmarks"),
+  dot: document.getElementById("fixation"),
 };
 
 let packet = { deadzone_yaw: 2, deadzone_pitch: 1, span_yaw: 12, span_pitch: 12 };
@@ -229,7 +230,8 @@ setInterval(() => {
 const WARN = { "low confidence": 1, calibrating: 1, stalled: 1 };
 
 function render(p) {
-  if (!calibrated && started) {
+  if (!calibrated && started && awaitingGeneration !== null
+      && p.generation >= awaitingGeneration) {
     el.progress.style.width = `${Math.round(p.calibration * 100)}%`;
     if (p.calibration >= 1) finishCalibration();
   }
@@ -312,41 +314,70 @@ function clamp(value, limit) {
 /* ---------- start-up and keys ---------- */
 
 function send(action) {
-  fetch("/cmd", {
+  return fetch("/cmd", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ action }),
-  }).catch(() => {});
+  })
+    .then((response) => response.json())
+    .catch(() => null);
 }
 
-function beginCalibration(message) {
+/* Which centring pass the page is waiting on.  Python starts collecting the
+ * moment it launches, long before this tab exists, so the stream is already
+ * reporting a finished pass.  Without matching generations the first packet
+ * after the countdown satisfies the progress bar and the whole step vanishes
+ * before the viewer has seen it. */
+let awaitingGeneration = null;
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function runCalibration(headline) {
   calibrated = false;
+  awaitingGeneration = null;
   velocity.yaw = velocity.pitch = 0;
   target.yaw = target.pitch = 0;
   view.yaw = view.pitch = 0;
-  command.yawRate = 0;
-  command.pitchRate = 0;
+
   el.overlay.classList.remove("gone");
+  el.overlay.classList.add("calibrating");
   el.begin.classList.add("gone");
+  el.progresswrap.classList.remove("on");
+  el.dot.classList.add("on");
+
+  // Count down before sampling starts, so the samples are taken while the
+  // viewer is already fixed on the dot rather than still moving onto it.
+  for (let count = 3; count > 0; count--) {
+    el.overlaytext.innerHTML = `${headline}<br><span class="count">${count}</span>`;
+    await wait(1000);
+  }
+  el.overlaytext.innerHTML = `${headline}<br><span class="count">hold still…</span>`;
+  el.progress.style.width = "0%";
   el.progresswrap.classList.add("on");
-  el.overlaytext.innerHTML = message;
-  send("recenter");
+
+  const reply = await send("recenter");
+  // If the command did not get through, accept any pass rather than leave the
+  // viewer staring at a dot forever.
+  awaitingGeneration =
+    reply && typeof reply.result === "number" ? reply.result : 0;
 }
 
 function finishCalibration() {
   calibrated = true;
+  awaitingGeneration = null;
   el.overlay.classList.add("gone");
+  el.overlay.classList.remove("calibrating");
   el.progresswrap.classList.remove("on");
+  el.dot.classList.remove("on");
 }
 
 el.begin.addEventListener("click", () => {
   started = true;
   video.loop = true;
   video.play().catch(() => {});
-  beginCalibration(
-    "Hold still and look at the <b>centre</b> of the screen.<br>" +
-    "This learns where your neutral gaze sits."
-  );
+  runCalibration("Look at the dot.");
   watchForBackgroundedTab();
 });
 
@@ -384,7 +415,7 @@ function watchForBackgroundedTab() {
 document.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();
   if (key === "c" && started) {
-    beginCalibration("Recalibrating.<br>Look at the <b>centre</b> of the screen.");
+    runCalibration("Recalibrating — look at the dot.");
   } else if (key === " ") {
     event.preventDefault();
     video.paused ? video.play() : video.pause();

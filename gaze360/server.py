@@ -87,6 +87,7 @@ class GazePacket:
     pitch_error: float = 0.0
     confidence: float = 0.0
     calibration: float = 0.0
+    generation: int = 0
     deadzone_yaw: float = 2.0
     deadzone_pitch: float = 1.0
     span_yaw: float = 12.0
@@ -119,6 +120,7 @@ class SharedState:
         self,
         output: ControlOutput,
         calibration: float,
+        generation: int,
         gaze_fps: float,
         latency_ms: float,
         eye_visibility: tuple[float, float],
@@ -132,6 +134,7 @@ class SharedState:
                 pitch_error=output.pitch_error,
                 confidence=output.confidence,
                 calibration=calibration,
+                generation=generation,
                 gaze_fps=gaze_fps,
                 latency_ms=latency_ms,
                 eye_visibility=eye_visibility,
@@ -209,8 +212,7 @@ class Handler(BaseHTTPRequestHandler):
         if handler is None:
             self.send_error(404, f"unknown action {action!r}")
             return
-        handler()
-        self._json({"ok": True, "action": action})
+        self._json({"ok": True, "action": action, "result": handler()})
 
     # -- routes ---------------------------------------------------------
 
