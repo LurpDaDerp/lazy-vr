@@ -24,8 +24,7 @@ from .control import ControlOutput
 from .mp4 import open_video
 
 
-# The browser holds the last rate it was given, so a dead tracker would spin
-# the view forever.  Older than this and the server commands zero instead.
+# How long a reading may go unrefreshed before the HUD calls it stalled.
 STALE_AFTER = 0.4
 GAZE_HZ = 50.0
 PREVIEW_HZ = 12.0
@@ -81,15 +80,18 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
 class GazePacket:
     """What the browser needs each tick."""
 
-    yaw_rate: float = 0.0
-    pitch_rate: float = 0.0
+    yaw: float = 0.0
+    pitch: float = 0.0
     state: str = "starting"
     yaw_error: float = 0.0
     pitch_error: float = 0.0
     confidence: float = 0.0
     calibration: float = 0.0
-    deadzone: float = 6.0
-    max_angle: float = 26.0
+    deadzone_yaw: float = 2.0
+    deadzone_pitch: float = 1.0
+    span_yaw: float = 12.0
+    span_pitch: float = 12.0
+    smooth_time: float = 0.13
     gaze_fps: float = 0.0
     latency_ms: float = 0.0
     eye_visibility: tuple[float, float] = (1.0, 1.0)
@@ -98,13 +100,20 @@ class GazePacket:
 class SharedState:
     """The handoff between the tracker thread and every HTTP responder."""
 
-    def __init__(self, deadzone: float, max_angle: float) -> None:
+    def __init__(self, config, smooth_time: float = 0.13) -> None:
         self._lock = threading.Lock()
-        self._packet = GazePacket(deadzone=deadzone, max_angle=max_angle)
+        self._limits = dict(
+            deadzone_yaw=config.deadzone_yaw,
+            deadzone_pitch=config.deadzone_pitch,
+            # How far off centre the HUD widget should draw as full deflection.
+            span_yaw=config.deadzone_yaw + config.max_yaw / max(config.gain_yaw, 1e-6),
+            span_pitch=config.deadzone_pitch
+            + config.max_pitch / max(config.gain_pitch, 1e-6),
+            smooth_time=smooth_time,
+        )
+        self._packet = GazePacket(**self._limits)
         self._updated = 0.0
         self._preview: bytes | None = None
-        self.deadzone = deadzone
-        self.max_angle = max_angle
 
     def publish(
         self,
@@ -116,18 +125,17 @@ class SharedState:
     ) -> None:
         with self._lock:
             self._packet = GazePacket(
-                yaw_rate=output.yaw_rate,
-                pitch_rate=output.pitch_rate,
+                yaw=output.yaw,
+                pitch=output.pitch,
                 state=output.state,
                 yaw_error=output.yaw_error,
                 pitch_error=output.pitch_error,
                 confidence=output.confidence,
                 calibration=calibration,
-                deadzone=self.deadzone,
-                max_angle=self.max_angle,
                 gaze_fps=gaze_fps,
                 latency_ms=latency_ms,
                 eye_visibility=eye_visibility,
+                **self._limits,
             )
             self._updated = time.monotonic()
 
@@ -145,13 +153,10 @@ class SharedState:
             packet = self._packet
             age = time.monotonic() - self._updated if self._updated else None
         data = asdict(packet)
-        if age is None or age > STALE_AFTER:
-            # The tracker has gone quiet; command a stop rather than let the
-            # browser keep integrating a stale rate.
-            data["yaw_rate"] = 0.0
-            data["pitch_rate"] = 0.0
-            if age is not None:
-                data["state"] = "stalled"
+        if age is not None and age > STALE_AFTER:
+            # An absolute target is safe to hold -- unlike a rate, it cannot
+            # run away -- so only the label changes.
+            data["state"] = "stalled"
         return data
 
 
@@ -298,7 +303,23 @@ class Handler(BaseHTTPRequestHandler):
 
 class GazeServer(ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # NOT on Windows.  There SO_REUSEADDR lets a second server bind a port that
+    # is already being served, rather than only reclaiming one in TIME_WAIT as
+    # it does on POSIX.  A leftover instance then keeps answering while the new
+    # one appears to start cleanly, so edits and flags silently do nothing.
+    # Better to fail the bind and say so.
+    allow_reuse_address = sys.platform != "win32"
+
+    def server_bind(self) -> None:
+        try:
+            super().server_bind()
+        except OSError as error:
+            host, port = self.server_address[:2]
+            raise SystemExit(
+                f"cannot listen on {host}:{port} — {error.strerror or error}.\n"
+                f"Another gaze360 is probably still running; close it, or pass "
+                f"--port to use a different one."
+            ) from error
 
     def __init__(
         self,

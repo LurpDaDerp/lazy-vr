@@ -33,16 +33,24 @@ def make_parser() -> argparse.ArgumentParser:
                        help="do not open a browser tab on start")
 
     control = parser.add_argument_group("control")
-    control.add_argument("--deadzone", type=float, default=6.0,
-                         help="degrees of gaze error that command no motion (default: 6)")
-    control.add_argument("--max-angle", type=float, default=26.0,
-                         help="gaze error at which the pan reaches full speed (default: 26)")
-    control.add_argument("--max-speed", type=float, default=120.0,
-                         help="degrees per second at full deflection (default: 120)")
-    control.add_argument("--expo", type=float, default=2.0,
-                         help="response curve exponent; 1 is linear (default: 2)")
-    control.add_argument("--tau", type=float, default=0.08,
-                         help="gaze smoothing time constant in seconds (default: 0.08)")
+    control.add_argument("--gain-yaw", type=float, default=4.0,
+                         help="degrees of view per degree of gaze, left/right (default: 4)")
+    control.add_argument("--gain-pitch", type=float, default=7.0,
+                         help="degrees of view per degree of gaze, up/down (default: 7)")
+    control.add_argument("--deadzone-yaw", type=float, default=2.0,
+                         help="gaze error that commands no motion, left/right (default: 2)")
+    control.add_argument("--deadzone-pitch", type=float, default=1.0,
+                         help="gaze error that commands no motion, up/down (default: 1)")
+    control.add_argument("--max-yaw", type=float, default=180.0,
+                         help="furthest the view may turn left/right (default: 180)")
+    control.add_argument("--max-pitch", type=float, default=85.0,
+                         help="furthest the view may look up/down (default: 85)")
+    control.add_argument("--smooth-time", type=float, default=0.13,
+                         help="seconds the view takes to reach a new target (default: 0.13)")
+    control.add_argument("--expo", type=float, default=1.0,
+                         help="response curve exponent; 1 is proportional (default: 1)")
+    control.add_argument("--tau", type=float, default=0.03,
+                         help="gaze smoothing time constant in seconds (default: 0.03)")
     control.add_argument("--min-confidence", type=float, default=0.5,
                          help="in-frame landmark fraction below which the view freezes")
     control.add_argument("--calibration-samples", type=int, default=45)
@@ -68,12 +76,14 @@ def make_parser() -> argparse.ArgumentParser:
 
 
 def validate(args: argparse.Namespace) -> None:
-    if args.deadzone < 0:
-        raise SystemExit("--deadzone must not be negative")
-    if args.max_angle <= args.deadzone:
-        raise SystemExit("--max-angle must exceed --deadzone")
-    if args.max_speed <= 0:
-        raise SystemExit("--max-speed must be positive")
+    if args.deadzone_yaw < 0 or args.deadzone_pitch < 0:
+        raise SystemExit("deadzones must not be negative")
+    if args.gain_yaw <= 0 or args.gain_pitch <= 0:
+        raise SystemExit("gains must be positive")
+    if args.max_yaw <= 0 or args.max_pitch <= 0:
+        raise SystemExit("view limits must be positive")
+    if args.smooth_time < 0:
+        raise SystemExit("--smooth-time must not be negative")
     if args.expo <= 0:
         raise SystemExit("--expo must be positive")
     if args.tau < 0:
@@ -110,9 +120,12 @@ def run(args: argparse.Namespace) -> int:
 
     controller = GazeController(
         ControlConfig(
-            deadzone=args.deadzone,
-            max_angle=args.max_angle,
-            max_speed=args.max_speed,
+            gain_yaw=args.gain_yaw,
+            gain_pitch=args.gain_pitch,
+            deadzone_yaw=args.deadzone_yaw,
+            deadzone_pitch=args.deadzone_pitch,
+            max_yaw=args.max_yaw,
+            max_pitch=args.max_pitch,
             expo=args.expo,
             tau=args.tau,
             min_confidence=args.min_confidence,
@@ -121,7 +134,7 @@ def run(args: argparse.Namespace) -> int:
             invert_pitch=args.invert_pitch,
         )
     )
-    state = SharedState(args.deadzone, args.max_angle)
+    state = SharedState(controller.config, args.smooth_time)
 
     print("loading the gaze bundle ...")
     tracker = GazeTracker(

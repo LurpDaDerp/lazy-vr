@@ -1,8 +1,10 @@
 /* Equirectangular 360 playback steered by gaze.
  *
- * The server sends pan RATES, never angles.  Position is integrated here, in
- * requestAnimationFrame, so a late packet perturbs only the setpoint and the
- * motion stays smooth at the display's refresh rate.
+ * The server sends the angle the view should point at.  This file eases
+ * towards it every animation frame with a critically damped spring, which is
+ * what turns 30 Hz of gaze into 60 Hz of motion: the target moves in steps,
+ * the view moves continuously.  Critically damped means it never overshoots
+ * and never oscillates, so it settles cleanly however hard the target jumps.
  *
  * Rendering is a fullscreen quad plus a fragment shader that turns each pixel
  * into a view ray and samples the equirectangular frame.  No sphere mesh, no
@@ -53,12 +55,29 @@ if (!gl) {
 /* ---------- view state ---------- */
 
 const view = { yaw: 0, pitch: 0, fov: 75 * Math.PI / 180 };
-const command = { yawRate: 0, pitchRate: 0 };
-const PITCH_LIMIT = 85 * Math.PI / 180;
+const target = { yaw: 0, pitch: 0 };
+const velocity = { yaw: 0, pitch: 0 };
 const DEG = Math.PI / 180;
+
+/* Seconds to close most of the gap to the target. Low enough to feel
+ * immediate, high enough to absorb the gaze estimate's jitter. */
+let smoothTime = 0.13;
 
 let started = false;
 let calibrated = false;
+
+/* Critically damped spring (the standard SmoothDamp formulation).  Solved
+ * per step rather than Euler-integrated, so it stays stable no matter how
+ * long a frame takes -- a dropped frame must not make the view explode. */
+function ease(current, goal, axis, dt) {
+  const omega = 2 / Math.max(smoothTime, 1e-4);
+  const x = omega * dt;
+  const decay = 1 / (1 + x + 0.48 * x * x + 0.235 * x * x * x);
+  const gap = current - goal;
+  const temp = (velocity[axis] + omega * gap) * dt;
+  velocity[axis] = (velocity[axis] - omega * temp) * decay;
+  return goal + (gap + temp) * decay;
+}
 
 /* ---------- GL setup ---------- */
 
@@ -157,12 +176,9 @@ function frame(now) {
   last = now;
 
   if (started && calibrated) {
-    view.yaw += command.yawRate * DEG * dt;
-    view.pitch += command.pitchRate * DEG * dt;
-    // Yaw wraps freely for a full 360; pitch stops short of the poles.
-    if (view.yaw > Math.PI) view.yaw -= 2 * Math.PI;
-    if (view.yaw < -Math.PI) view.yaw += 2 * Math.PI;
-    view.pitch = Math.max(-PITCH_LIMIT, Math.min(PITCH_LIMIT, view.pitch));
+    // Both axes ease independently and simultaneously.
+    view.yaw = ease(view.yaw, target.yaw, "yaw", dt);
+    view.pitch = ease(view.pitch, target.pitch, "pitch", dt);
   }
 
   resize();
@@ -188,23 +204,23 @@ const el = {
   marks: document.getElementById("compassmarks"),
 };
 
-let packet = { deadzone: 6, max_angle: 26 };
+let packet = { deadzone_yaw: 2, deadzone_pitch: 1, span_yaw: 12, span_pitch: 12 };
 let lastPacketAt = 0;
 
 const source = new EventSource("/gaze");
 source.onmessage = (event) => {
   packet = JSON.parse(event.data);
   lastPacketAt = performance.now();
-  command.yawRate = packet.yaw_rate;
-  command.pitchRate = packet.pitch_rate;
+  target.yaw = packet.yaw * DEG;
+  target.pitch = packet.pitch * DEG;
+  if (packet.smooth_time) smoothTime = packet.smooth_time;
   render(packet);
 };
 
-/* If Python dies the last rate would pan forever.  Stop on silence. */
+/* An absolute target is safe to hold if the tracker goes quiet -- unlike a
+ * rate, it cannot run away -- so this only reports the silence. */
 setInterval(() => {
   if (lastPacketAt && performance.now() - lastPacketAt > 400) {
-    command.yawRate = 0;
-    command.pitchRate = 0;
     el.state.textContent = "no signal";
     el.state.className = "val bad";
   }
@@ -228,8 +244,9 @@ function render(p) {
   el.gaze.textContent =
     `${p.yaw_error >= 0 ? "+" : ""}${p.yaw_error.toFixed(1)}, ` +
     `${p.pitch_error >= 0 ? "+" : ""}${p.pitch_error.toFixed(1)}`;
-  const speed = Math.hypot(p.yaw_rate, p.pitch_rate);
-  el.rate.textContent = `${speed.toFixed(0)} °/s`;
+  el.rate.textContent =
+    `${p.yaw >= 0 ? "+" : ""}${p.yaw.toFixed(0)}, ` +
+    `${p.pitch >= 0 ? "+" : ""}${p.pitch.toFixed(0)}°`;
   el.perf.textContent = `${p.gaze_fps.toFixed(0)} Hz  ${p.latency_ms.toFixed(0)} ms`;
   drawStick(p);
 }
@@ -243,23 +260,25 @@ function updateCompass() {
 
 const stick = document.getElementById("stick").getContext("2d");
 
+/* The axes are geared and dead-zoned independently, so the widget draws
+ * rectangles, not circles: the dead area really is a box, and it is wider
+ * than it is tall because pitch is the more sensitive axis. */
 function drawStick(p) {
-  const size = 150, c = size / 2;
-  const scale = (c - 12) / Math.max(p.max_angle, 1);
+  const size = 150, c = size / 2, pad = 10;
+  const sx = (c - pad) / Math.max(p.span_yaw, 1);
+  const sy = (c - pad) / Math.max(p.span_pitch, 1);
   stick.clearRect(0, 0, size, size);
 
   stick.strokeStyle = "rgba(255,255,255,.16)";
   stick.lineWidth = 1;
-  stick.beginPath();
-  stick.arc(c, c, p.max_angle * scale, 0, 2 * Math.PI);
-  stick.stroke();
+  stick.strokeRect(c - p.span_yaw * sx, c - p.span_pitch * sy,
+                   2 * p.span_yaw * sx, 2 * p.span_pitch * sy);
 
-  // Inside this ring nothing moves.
+  // Inside this box nothing moves.
   stick.strokeStyle = "rgba(255,255,255,.30)";
   stick.setLineDash([3, 3]);
-  stick.beginPath();
-  stick.arc(c, c, p.deadzone * scale, 0, 2 * Math.PI);
-  stick.stroke();
+  stick.strokeRect(c - p.deadzone_yaw * sx, c - p.deadzone_pitch * sy,
+                   2 * p.deadzone_yaw * sx, 2 * p.deadzone_pitch * sy);
   stick.setLineDash([]);
 
   stick.strokeStyle = "rgba(255,255,255,.10)";
@@ -269,22 +288,21 @@ function drawStick(p) {
   stick.stroke();
 
   // Mirrored in x to agree with the mirrored webcam preview above it.
-  const x = c - clamp(p.yaw_error, p.max_angle) * scale;
-  const y = c - clamp(p.pitch_error, p.max_angle) * scale;
-  const live = p.yaw_rate !== 0 || p.pitch_rate !== 0;
-  stick.fillStyle = live ? "#6ee7b7" : "rgba(255,255,255,.55)";
-  stick.beginPath();
-  stick.arc(x, y, 5, 0, 2 * Math.PI);
-  stick.fill();
-
+  const x = c - clamp(p.yaw_error, p.span_yaw) * sx;
+  const y = c - clamp(p.pitch_error, p.span_pitch) * sy;
+  const live = p.yaw !== 0 || p.pitch !== 0;
   if (live) {
-    stick.strokeStyle = "#6ee7b7";
+    stick.strokeStyle = "rgba(110,231,183,.55)";
     stick.lineWidth = 2;
     stick.beginPath();
     stick.moveTo(c, c);
     stick.lineTo(x, y);
     stick.stroke();
   }
+  stick.fillStyle = live ? "#6ee7b7" : "rgba(255,255,255,.55)";
+  stick.beginPath();
+  stick.arc(x, y, 5, 0, 2 * Math.PI);
+  stick.fill();
 }
 
 function clamp(value, limit) {
@@ -303,6 +321,9 @@ function send(action) {
 
 function beginCalibration(message) {
   calibrated = false;
+  velocity.yaw = velocity.pitch = 0;
+  target.yaw = target.pitch = 0;
+  view.yaw = view.pitch = 0;
   command.yawRate = 0;
   command.pitchRate = 0;
   el.overlay.classList.remove("gone");

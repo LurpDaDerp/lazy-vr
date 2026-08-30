@@ -1,8 +1,8 @@
 # gaze360 — steer a 360 video with your eyes
 
 Play an equirectangular 360 video and move the camera by looking. Look left and
-the view pans left; look back to the centre and it stops. No mouse, no
-headset, no per-user training.
+the view turns left; look back at the centre of the screen and it comes back to
+where it started. No mouse, no headset, no per-user training.
 
 Gaze comes from the `gaze-direct` model: 478 MediaPipe landmarks into one ONNX
 graph, out comes a camera-frame gaze vector. No head-pose solver and no
@@ -38,44 +38,63 @@ modified; the file is read where it lies.
 
 ## How it steers
 
-Rate control, the way a joystick works. Gaze angle past a deadzone sets the pan
-*speed*, not the pan *position*:
+Absolute mapping. Your gaze offset from centre sets the view *angle*, so
+looking back to the middle of the screen brings the view back to where it
+started — the view is an extension of where you are looking, not a joystick
+you have to re-centre.
 
 ```
-e    = smoothed gaze angle − calibrated centre
-u    = clamp((|e| − deadzone) / (max_angle − deadzone), 0, 1)
-rate = sign(e) · max_speed · u²
+e     = smoothed gaze angle − calibrated centre
+view  = sign(e) · gain · (|e| − deadzone)      clamped to the axis limit
 ```
 
-Position mapping was the obvious alternative and it does not work here. You can
-only look about ±35° before leaving the screen, so a 1:1 mapping can never
-show you what is behind you, and multiplying it up to reach 360° multiplies the
-model's error with it. Rate control reaches every direction and turns gaze
-noise into something the integral averages away.
-
-The squared response gives fine control near the centre and a fast pan at the
-extremes. The 6° deadzone is sized against the model's 6.5° error, so a still
-gaze drifts exactly zero.
+The two axes are independent and deliberately not equally geared. A viewer
+sweeps their eyes much further horizontally than vertically, so an even gain
+leaves the vertical axis feeling dead: pitch gets nearly twice the gain and
+half the deadzone, and eight degrees of upward glance is worth a 49° look up.
 
 | Flag | Default | |
 |---|---|---|
-| `--deadzone` | 6° | gaze error that commands no motion |
-| `--max-angle` | 26° | error at which the pan reaches full speed |
-| `--max-speed` | 120°/s | a full turn in three seconds |
-| `--expo` | 2.0 | response curve; `1` is linear |
-| `--tau` | 0.08 s | gaze smoothing time constant |
-| `--min-confidence` | 0.5 | in-frame landmark fraction below which the view freezes |
+| `--gain-yaw` | 4 | degrees of view per degree of gaze, left/right |
+| `--gain-pitch` | 7 | degrees of view per degree of gaze, up/down |
+| `--deadzone-yaw` | 2° | gaze error that commands no motion, left/right |
+| `--deadzone-pitch` | 1° | gaze error that commands no motion, up/down |
+| `--max-yaw` | 180° | furthest the view may turn |
+| `--max-pitch` | 85° | furthest the view may look up or down |
+| `--smooth-time` | 0.13 s | how long the view takes to reach a new target |
+| `--expo` | 1 | response curve; 1 is proportional |
+| `--tau` | 0.03 s | gaze smoothing, before the easing |
 
-`--max-speed` is the one most worth tuning to taste.
+Turn the gains up for more reach per glance, `--smooth-time` down for a
+snappier feel and up for a calmer one.
 
-Three behaviours that matter more than they sound:
+### Smoothness and lag
 
-- **Losing your face freezes the view.** No face, or too much of it out of
-  frame, forces the rate to zero. Otherwise glancing away would spin the world
-  forever.
-- **The browser stops on silence.** If the tracker dies, the last rate would
-  keep panning. The page zeroes the rate after 400 ms without a packet, and the
-  server sends zero once a reading goes stale.
+Gaze arrives at 30 Hz; the display runs at 60 or more. The browser eases
+towards each new target with a **critically damped spring**, which is what
+turns stepped readings into continuous motion — critically damped meaning it
+converges without ever overshooting or oscillating, however hard the target
+jumps. Both axes ease independently, so a diagonal glance traces a straight
+diagonal.
+
+Latency is dominated by things with hard floors: the webcam delivers 30.5
+frames per second whatever mode is requested, and detection plus inference
+costs about 14 ms. What is left to spend is the smoothing, so `--tau` is short
+(30 ms) and the easing does the rest of the work where it can run at display
+rate rather than gaze rate.
+
+Absolute mapping cannot show you what is directly behind you — reaching 180°
+would take a 47° glance. That is the price of having the view come home when
+you look back at the centre, which is the behaviour worth having.
+
+Three details that matter more than they sound:
+
+- **Losing your face holds the view.** A blink or a hand across the face must
+  not throw the view back to centre, so the last target is kept until tracking
+  returns. An absolute target cannot run away, unlike a pan speed.
+- **Calibration eases home.** Pressing `C` returns the view to the origin
+  while you are being asked to look at the centre, rather than snapping when
+  the countdown ends.
 - **Startup calibration.** Where your webcam sits relative to your screen is a
   real per-setup bias. The centring pass removes it; `C` redoes it if you move.
 
@@ -86,21 +105,20 @@ The browser is the whole interface, so keystrokes land in the window you are
 already looking at.
 
 ```
-webcam thread  ->  MediaPipe landmarker  ->  mailbox
-                                                |
-                    inference thread: gaze_direct.onnx  ->  GazeSample
-                                                |
-                              GazeController  ->  (yaw_rate, pitch_rate)
-                                                |
-                        SSE  ->  browser: yaw += yaw_rate·dt  ->  WebGL
+capture thread  ->  MediaPipe landmarker  ->  mailbox
+                                                 |
+                     inference thread: gaze_direct.onnx  ->  GazeSample
+                                                 |
+                               GazeController  ->  (yaw, pitch) target
+                                                 |
+                    SSE  ->  browser: spring towards it  ->  WebGL
 ```
 
-**Python sends velocity; the browser integrates position.** Gaze arrives at
-20–40 Hz but the view must move at the display's refresh rate. Sending absolute
-angles would turn every late packet into visible stutter; sending rates
-confines network jitter to the setpoint, and `requestAnimationFrame` integrates
-smoothly regardless. It also puts every decision in pure Python where it can be
-tested, leaving the browser two lines of arithmetic.
+**Python decides, the browser eases.** Python sends the angle the view should
+point at; the browser springs towards it every animation frame. Every decision
+— gains, deadzones, calibration, what to do when tracking drops — stays in pure
+Python where it can be tested without hardware, while the interpolation that
+has to run at display rate runs there.
 
 **Server-Sent Events, not WebSockets.** A hand-rolled RFC 6455 server is a
 handshake plus frame masking; SSE is a long-lived `text/event-stream` response,
@@ -167,16 +185,19 @@ anyway.
 .\test.bat
 ```
 
-105 tests, all stdlib. The control law is pure and covered directly — deadzone
-boundaries, saturation, the quadratic shape, frame-rate independence of the
-smoother, gating, recentring. The MP4 rearrangement is checked against
+123 tests, all stdlib. The control law is pure and covered directly — per-axis
+deadzones and gains, saturation, that a held gaze holds the view still, that
+looking back to centre returns it, that both axes move together and neither
+scales the other, and frame-rate independence of the smoother. The MP4 rearrangement is checked against
 byte-built fixtures on the invariant that every corrected chunk offset must
 still address its own bytes. The server is booted for real and every route
 exercised, including 206, 416 and a declined multi-range.
 
 ## Camera
 
-Defaults to DirectShow, MJPEG, 1280×720 at 60 FPS.
+Defaults to DirectShow, MJPEG, 1280×720 at 60 FPS requested — though the
+webcam this was built against returns 30.5 FPS in every mode offered, and that
+input rate, not the pipeline, is what sets the gaze rate.
 
 ```powershell
 .\run.bat --camera 1            # another camera index
@@ -193,8 +214,12 @@ browser tab that may own it.
 **The video stays black.** Chrome does not load media in a background tab.
 Bring the window to the front and reload.
 
-**The view drifts on its own.** Press `C` and hold still. If it persists, widen
-the deadzone: `--deadzone 8`.
+**The view wobbles when you hold still.** Press `C` and hold still while it
+recalibrates. If it persists, widen the deadzones: `--deadzone-yaw 3
+--deadzone-pitch 2`.
 
-**Panning feels twitchy or sluggish.** `--max-speed` sets the top rate and
-`--tau` the smoothing; raise `--tau` to 0.15 for a calmer feel.
+**It moves too far, or not far enough.** `--gain-yaw` and `--gain-pitch` are
+the sensitivity of each axis independently.
+
+**It feels twitchy, or laggy.** `--smooth-time` is the trade: 0.08 is snappy
+and shows more of the estimate's jitter, 0.2 is calm and trails further behind.

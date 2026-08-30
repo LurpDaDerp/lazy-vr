@@ -332,9 +332,17 @@ class GazeTracker:
         self.stop_event = threading.Event()
         self.on_reading = lambda reading: None
         self.on_preview = lambda jpeg: None
-        self._thread = threading.Thread(
-            target=self._loop, name="gaze-tracker", daemon=True
-        )
+        self._mailbox: LandmarkMailbox | None = None
+        # Capture and inference are split so a prediction never delays the next
+        # frame's submission.  Measured on the development webcam this changed
+        # nothing -- that camera delivers 30.5 fps whatever mode is requested,
+        # so the input, not the pipeline, sets the gaze rate.  The split is
+        # kept because it is the honest structure and it stops being free the
+        # moment a faster camera is attached.
+        self._threads = [
+            threading.Thread(target=self._capture_loop, name="gaze-capture", daemon=True),
+            threading.Thread(target=self._infer_loop, name="gaze-infer", daemon=True),
+        ]
 
     @property
     def settings(self) -> tuple[int, int, float, str]:
@@ -342,59 +350,67 @@ class GazeTracker:
 
     def start(self) -> None:
         self.camera.start()
-        self._thread.start()
+        for thread in self._threads:
+            thread.start()
 
     def stop(self) -> None:
         self.stop_event.set()
-        if self._thread.is_alive():
-            self._thread.join(timeout=2)
+        for thread in self._threads:
+            if thread.is_alive():
+                thread.join(timeout=2)
         self.camera.close()
         self.pipeline.mirror_extractor.close()
 
-    def _loop(self) -> None:
+    def _capture_loop(self) -> None:
+        """Pull frames, hand them to the detector, publish the preview."""
         last_sequence = -1
         submitted = -1
-        last_result = -1
         last_preview = 0.0
-        mailbox: LandmarkMailbox | None = None
         landmarker: vision.FaceLandmarker | None = None
         try:
             while not self.stop_event.is_set():
                 last_sequence, frame = self.camera.latest(last_sequence)
-                if frame is not None:
-                    # The detector sees the RAW frame; the sign convention
-                    # depends on it.
-                    small = resize_for_detector(frame, self.detector_width)
-                    if mailbox is None:
-                        mailbox = LandmarkMailbox(small.shape[1], small.shape[0])
-                        landmarker = build_landmarker(self.landmarker_path, mailbox)
-                    timestamp = int(time.perf_counter() * 1000)
-                    if timestamp > submitted:
-                        submitted = timestamp
-                        landmarker.detect_async(
-                            mp.Image(
-                                image_format=mp.ImageFormat.SRGB,
-                                data=np.ascontiguousarray(
-                                    cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
-                                ),
-                            ),
-                            timestamp,
-                        )
-                    now = time.perf_counter()
-                    if now - last_preview > 0.08:
-                        last_preview = now
-                        self._publish_preview(frame)
-
-                packet = mailbox.after(last_result) if mailbox else None
-                if packet is None:
-                    time.sleep(0.002)
+                if frame is None:
+                    time.sleep(0.001)
                     continue
-                last_result = packet.timestamp_ms
-                self.on_reading(self._read(packet))
-                self.gaze_rate.tick()
+                # The detector sees the RAW frame; the sign convention depends
+                # on it.
+                small = resize_for_detector(frame, self.detector_width)
+                if landmarker is None:
+                    self._mailbox = LandmarkMailbox(small.shape[1], small.shape[0])
+                    landmarker = build_landmarker(self.landmarker_path, self._mailbox)
+                timestamp = int(time.perf_counter() * 1000)
+                if timestamp > submitted:
+                    submitted = timestamp
+                    landmarker.detect_async(
+                        mp.Image(
+                            image_format=mp.ImageFormat.SRGB,
+                            data=np.ascontiguousarray(
+                                cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+                            ),
+                        ),
+                        timestamp,
+                    )
+                now = time.perf_counter()
+                if now - last_preview > 0.08:
+                    last_preview = now
+                    self._publish_preview(frame)
         finally:
             if landmarker is not None:
                 landmarker.close()
+
+    def _infer_loop(self) -> None:
+        """Turn landmark packets into gaze readings, off the capture thread."""
+        last_result = -1
+        while not self.stop_event.is_set():
+            mailbox = self._mailbox
+            packet = mailbox.after(last_result) if mailbox else None
+            if packet is None:
+                time.sleep(0.001)
+                continue
+            last_result = packet.timestamp_ms
+            self.on_reading(self._read(packet))
+            self.gaze_rate.tick()
 
     def _read(self, packet: LandmarkPacket) -> GazeReading:
         if packet.landmarks is None:

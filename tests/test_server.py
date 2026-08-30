@@ -11,7 +11,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from gaze360.control import ControlOutput
+from gaze360.control import ControlConfig, ControlOutput
 from gaze360.server import GazeServer, SharedState
 
 BODY = bytes(range(256)) * 40  # 10240 bytes, every byte value, easy to verify
@@ -30,7 +30,7 @@ class ServerTests(unittest.TestCase):
         cls.video.write_bytes(BODY)
 
         cls.recentred = []
-        cls.state = SharedState(deadzone=6.0, max_angle=26.0)
+        cls.state = SharedState(ControlConfig())
         cls.server = GazeServer(
             ("127.0.0.1", 0),
             cls.state,
@@ -160,9 +160,9 @@ class ServerTests(unittest.TestCase):
     def test_gaze_stream_emits_sse_packets(self):
         self.state.publish(
             ControlOutput(
-                yaw_rate=42.0,
-                pitch_rate=-7.0,
-                state="panning",
+                yaw=42.0,
+                pitch=-7.0,
+                state="looking",
                 yaw_error=12.0,
                 pitch_error=-3.0,
                 centre=(0.0, 0.0),
@@ -179,15 +179,15 @@ class ServerTests(unittest.TestCase):
         self.assertTrue(line.startswith("data: "), line)
         packet = json.loads(line[len("data: "):])
         response.close()
-        self.assertEqual(packet["yaw_rate"], 42.0)
-        self.assertEqual(packet["state"], "panning")
-        self.assertEqual(packet["deadzone"], 6.0)
+        self.assertEqual(packet["yaw"], 42.0)
+        self.assertEqual(packet["state"], "looking")
+        self.assertEqual(packet["deadzone_yaw"], ControlConfig().deadzone_yaw)
 
-    def test_stale_tracker_commands_a_stop(self):
-        """A tracker that went quiet must not leave the browser panning."""
-        state = SharedState(6.0, 26.0)
+    def test_stale_tracker_is_labelled_but_holds_its_angle(self):
+        """An absolute target cannot run away, so it is safe to keep."""
+        state = SharedState(ControlConfig())
         state.publish(
-            ControlOutput(90.0, 0.0, "panning", 20.0, 0.0, (0.0, 0.0), 1.0),
+            ControlOutput(90.0, 0.0, "looking", 20.0, 0.0, (0.0, 0.0), 1.0),
             calibration=1.0,
             gaze_fps=30.0,
             latency_ms=5.0,
@@ -195,24 +195,35 @@ class ServerTests(unittest.TestCase):
         )
         state._updated -= 10.0  # pretend the last reading was 10 s ago
         snapshot = state.snapshot()
-        self.assertEqual(snapshot["yaw_rate"], 0.0)
         self.assertEqual(snapshot["state"], "stalled")
+        self.assertEqual(snapshot["yaw"], 90.0)
 
-    def test_fresh_tracker_keeps_its_rate(self):
-        state = SharedState(6.0, 26.0)
+    def test_fresh_tracker_keeps_its_angle_and_label(self):
+        state = SharedState(ControlConfig())
         state.publish(
-            ControlOutput(90.0, 0.0, "panning", 20.0, 0.0, (0.0, 0.0), 1.0),
+            ControlOutput(90.0, 0.0, "looking", 20.0, 0.0, (0.0, 0.0), 1.0),
             calibration=1.0,
             gaze_fps=30.0,
             latency_ms=5.0,
             eye_visibility=(1.0, 1.0),
         )
-        self.assertEqual(state.snapshot()["yaw_rate"], 90.0)
+        snapshot = state.snapshot()
+        self.assertEqual(snapshot["yaw"], 90.0)
+        self.assertEqual(snapshot["state"], "looking")
 
     def test_state_before_any_reading_is_inert(self):
-        snapshot = SharedState(6.0, 26.0).snapshot()
-        self.assertEqual(snapshot["yaw_rate"], 0.0)
-        self.assertEqual(snapshot["pitch_rate"], 0.0)
+        snapshot = SharedState(ControlConfig()).snapshot()
+        self.assertEqual(snapshot["yaw"], 0.0)
+        self.assertEqual(snapshot["pitch"], 0.0)
+
+    def test_widget_spans_are_derived_from_gain_and_limit(self):
+        """The HUD box must show where the view actually saturates."""
+        config = ControlConfig(gain_pitch=7.0, deadzone_pitch=1.0, max_pitch=85.0)
+        snapshot = SharedState(config).snapshot()
+        self.assertAlmostEqual(snapshot["span_pitch"], 1.0 + 85.0 / 7.0, places=6)
+
+    def test_smooth_time_reaches_the_page(self):
+        self.assertEqual(SharedState(ControlConfig(), 0.2).snapshot()["smooth_time"], 0.2)
 
 
 if __name__ == "__main__":
