@@ -209,6 +209,12 @@ export class GazeController {
     this.height = h;
   }
 
+  /* Live tuning: a settings panel changes the base numbers and the getters
+   * carry the change into the very next sample. */
+  configure(partial) {
+    Object.assign(this.config, partial);
+  }
+
   /* Where the viewport's centre sits on the monitor, in the same pixels
    * the viewport is measured in. */
   setScreenCentre(x, y) {

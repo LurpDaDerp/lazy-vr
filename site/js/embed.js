@@ -86,6 +86,7 @@ export class EmbedPlayer {
     this.sent = null;
     this.handlers = {};
     this.maxHeight = Infinity;
+    this.fov = EMBED_FOV;
     window.addEventListener("resize", () => this.fit());
   }
 
@@ -184,6 +185,7 @@ export class EmbedPlayer {
   steer(view) {
     if (!this.player || typeof this.player.setSphericalProperties !== "function") return;
     const props = sphericalFromView(view);
+    props.fov = Math.max(30, Math.min(120, this.fov));
     if (!movedEnough(this.sent, props)) return;
     this.sent = props;
     this.player.setSphericalProperties({ ...props, enableOrientationSensor: false });

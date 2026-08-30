@@ -343,6 +343,14 @@ test("scale: nonsense viewport reports change nothing", () => {
   }
 });
 
+test("configure: live tuning takes hold on the very next sample", () => {
+  const c = new GazeController(config());
+  const t = calibrated(c);
+  near(holdGaze(c, 15, 0, t, 0.4).yawRate, (15 - 6) * 9, 1e-9);
+  c.configure({ rateYaw: 18, deadzoneYaw: 3, invertYaw: true, maxRateYaw: 1e6 });
+  near(holdGaze(c, 15, 0, t + 0.5, 0.4).yawRate, -(15 - 3) * 18, 1e-9);
+});
+
 // -- two dots: what a screen pixel is worth ------------------------------
 // The second fixation sits a known number of pixels from the first, so the
 // difference between the two measures degrees-of-gaze per pixel, sign

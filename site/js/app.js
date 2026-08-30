@@ -12,7 +12,7 @@
 
 import { AVSync } from "./avsync.js";
 import { Body, YAW_LIMIT } from "./body.js";
-import { GazeController } from "./control.js";
+import { DEFAULTS, GazeController } from "./control.js";
 import { EmbedPlayer } from "./embed.js";
 import { GazeTracker } from "./gaze.js";
 import { fetchHome, fetchSearch, fetchStreams, renderResults, renderShelves } from "./library.js";
@@ -33,6 +33,7 @@ const el = {
   searchForm: $("search"), query: $("query"),
   grid: $("grid"), notice: $("libnotice"), empty: $("libempty"), loading: $("libloading"),
   touchbar: $("touchbar"),
+  settings: $("settings"), gear: $("gear"), setsclose: $("setsclose"), setsreset: $("setsreset"),
 };
 
 const body = new Body();
@@ -63,6 +64,56 @@ const prefs = (() => {
     max: screenTier(screen.width, screen.height, window.devicePixelRatio || 1),
   };
 })();
+
+/* ---------- settings ---------- */
+
+const SETTINGS_KEY = "lazyvr.settings";
+const SETTINGS_DEFAULTS = Object.freeze({
+  sens: 1, deadzone: DEFAULTS.deadzoneYaw, fov: 75, blur: true,
+  invx: false, invy: false, quality: "auto",
+});
+
+let settings = { ...SETTINGS_DEFAULTS };
+try {
+  settings = { ...settings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") };
+} catch { /* a private window, or cleared storage */ }
+
+// Old or hand-edited storage must not be able to break the map.
+{
+  const bound = (value, lo, hi, fallback) => {
+    const n = Number(value);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
+  };
+  settings.sens = bound(settings.sens, 0.4, 2.5, 1);
+  settings.deadzone = bound(settings.deadzone, 1, 8, DEFAULTS.deadzoneYaw);
+  settings.fov = bound(settings.fov, 60, 100, 75);
+  settings.blur = settings.blur !== false;
+  settings.invx = settings.invx === true;
+  settings.invy = settings.invy === true;
+  settings.quality = ["1080", "1440", "2160", "4320"].includes(String(settings.quality))
+    ? Number(settings.quality) : "auto";
+}
+
+function saveSettings() {
+  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* ditto */ }
+}
+
+function qualityCap() {
+  return settings.quality === "auto" ? prefs.max : Number(settings.quality);
+}
+
+/* Push the current settings into every part that obeys them. */
+function applySettings() {
+  controller.configure({
+    rateYaw: DEFAULTS.rateYaw * settings.sens,
+    deadzoneYaw: settings.deadzone,
+    invertYaw: settings.invx,
+    invertPitch: settings.invy,
+  });
+  request = { ...request, ...limitsFor(controller) };
+  if (renderer) renderer.fov = settings.fov * DEG;
+  embedPlayer.fov = settings.fov;
+}
 
 /* What the body is currently being asked to do, refreshed on every gaze
  * reading.  Zeroed if the readings stop: a rate repeated forever would spin
@@ -114,6 +165,7 @@ function frame(now) {
     reportScreen();
     reportScreenPosition();
     if (started && calibrated) body.step(request, dt);
+    if (!settings.blur) body.view.blur = 0;
     if (engineMode === "embed") embedPlayer.steer(body.view);
     else renderer.draw(body.view);
   }
@@ -428,7 +480,7 @@ async function selectClip(clip) {
   retryAction = "library";
   engineMode = "stream";
   document.body.classList.remove("embedded");
-  currentMax = prefs.max;
+  currentMax = qualityCap();
   frameMs = 16;
   slowSince = 0;
   el.retry.textContent = "Try again";
@@ -446,7 +498,7 @@ async function selectClip(clip) {
 
   // Resolving the stream takes yt-dlp a few seconds; run it underneath the
   // camera prompt and the calibration countdown rather than before them.
-  fetchStreams(clip.id, prefs)
+  fetchStreams(clip.id, { codecs: prefs.codecs, max: currentMax })
     .then((streams) => {
       if (session !== my) return;
       sync.set(streams.video.src, streams.audio && streams.audio.src);
@@ -627,6 +679,60 @@ el.video.addEventListener("error", () => {
   notify(`“${title}” stopped streaming. The signed stream may have expired — pick it again.`);
 });
 
+/* ---------- the settings panel ---------- */
+
+const setInputs = {
+  sens: $("set-sens"), dz: $("set-dz"), fov: $("set-fov"), qual: $("set-qual"),
+  blur: $("set-blur"), invx: $("set-invx"), invy: $("set-invy"),
+};
+
+function renderSettings() {
+  setInputs.sens.value = settings.sens;
+  setInputs.dz.value = settings.deadzone;
+  setInputs.fov.value = settings.fov;
+  setInputs.qual.value = String(settings.quality);
+  setInputs.blur.checked = settings.blur;
+  setInputs.invx.checked = settings.invx;
+  setInputs.invy.checked = settings.invy;
+  $("sensval").textContent = `×${Number(settings.sens).toFixed(2)}`;
+  $("dzval").textContent = `${Number(settings.deadzone).toFixed(1)}°`;
+  $("fovval").textContent = `${settings.fov}°`;
+}
+
+function settingsChanged() {
+  const capBefore = qualityCap();
+  settings.sens = Number(setInputs.sens.value);
+  settings.deadzone = Number(setInputs.dz.value);
+  settings.fov = Number(setInputs.fov.value);
+  settings.blur = setInputs.blur.checked;
+  settings.invx = setInputs.invx.checked;
+  settings.invy = setInputs.invy.checked;
+  settings.quality = setInputs.qual.value === "auto" ? "auto" : Number(setInputs.qual.value);
+  renderSettings();
+  applySettings();
+  saveSettings();
+  const cap = qualityCap();
+  if (cap !== capBefore) {
+    currentMax = cap;
+    if (started) applyQualityCap(cap);  // swap in place, mid-video
+  }
+}
+
+for (const input of Object.values(setInputs)) input.addEventListener("input", settingsChanged);
+
+function toggleSettings(force) {
+  el.settings.hidden = force === undefined ? !el.settings.hidden : !force;
+}
+
+el.gear.addEventListener("click", () => toggleSettings());
+el.setsclose.addEventListener("click", () => toggleSettings(false));
+el.setsreset.addEventListener("click", () => {
+  settings = { ...SETTINGS_DEFAULTS };
+  renderSettings();
+  applySettings();
+  saveSettings();
+});
+
 /* ---------- calibration ---------- */
 
 let awaitingGeneration = null;
@@ -721,7 +827,11 @@ function recalibrate() {
 document.addEventListener("keydown", (event) => {
   if (browsing) return;
   const key = event.key.toLowerCase();
-  if (event.key === "Escape") returnToLibrary();
+  if (event.key === "Escape") {
+    if (!el.settings.hidden) toggleSettings(false);
+    else returnToLibrary();
+  }
+  else if (key === "s") toggleSettings();
   else if (key === "r") recentre();
   else if (key === "c") recalibrate();
   else if (key === " ") { event.preventDefault(); mediaPaused() ? mediaPlay().catch(() => {}) : mediaPause(); }
@@ -737,6 +847,7 @@ el.touchbar.addEventListener("click", (event) => {
   if (action === "library") returnToLibrary();
   else if (action === "recentre") recentre();
   else if (action === "recalibrate") recalibrate();
+  else if (action === "settings") toggleSettings();
 });
 
 /* Chrome will not fetch media for a tab that is not in the foreground: the
@@ -783,6 +894,8 @@ async function selfTest() {
 
 /* ---------- start ---------- */
 
+renderSettings();
+applySettings();
 if (renderer) requestAnimationFrame(frame);
 loadHome().then(() => {
   const params = new URLSearchParams(location.search);
@@ -793,4 +906,4 @@ loadHome().then(() => {
 });
 
 // For a console or a test harness.
-window.lazyvr = { body, controller, tracker, sync, get request() { return request; }, get reading() { return lastReading; }, YAW_LIMIT };
+window.lazyvr = { body, controller, tracker, sync, get request() { return request; }, get reading() { return lastReading; }, get settings() { return settings; }, YAW_LIMIT };

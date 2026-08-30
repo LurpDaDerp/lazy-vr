@@ -49,6 +49,7 @@
 <div id="keys">
   <span><b>R</b> recentre</span>
   <span><b>C</b> recalibrate</span>
+  <span><b>S</b> settings</span>
   <span><b>Space</b> play/pause</span>
   <span><b>F</b> fullscreen</span>
   <span><b>H</b> hide overlay</span>
@@ -61,6 +62,7 @@
   <button type="button" data-action="library">Library</button>
   <button type="button" data-action="recentre">Recentre</button>
   <button type="button" data-action="recalibrate">Recalibrate</button>
+  <button type="button" data-action="settings">Settings</button>
 </div>
 
 <div id="fixation"></div>
@@ -76,6 +78,7 @@
              autocomplete="off" spellcheck="false" aria-label="Search youtube's 360 videos">
       <button type="submit">Search</button>
     </form>
+    <button id="gear" type="button" aria-label="Settings">settings</button>
   </header>
 
   <p id="libnotice" hidden></p>
@@ -102,6 +105,52 @@
        then reload.</p>
   </div>
 </main>
+
+<!-- Settings: live, saved on this device.  Open with the header button or
+     S during playback. -->
+<aside id="settings" hidden>
+  <div id="setshead">
+    <h2>Settings</h2>
+    <button id="setsclose" type="button" aria-label="Close settings">&times;</button>
+  </div>
+
+  <label class="setrow">
+    <span class="setname">Sensitivity <em id="sensval">&times;1.00</em></span>
+    <input id="set-sens" type="range" min="0.4" max="2.5" step="0.05" value="1">
+    <span class="sethint">How fast the view turns per degree of gaze.</span>
+  </label>
+
+  <label class="setrow">
+    <span class="setname">Deadzone <em id="dzval">3.0&deg;</em></span>
+    <input id="set-dz" type="range" min="1" max="8" step="0.25" value="3">
+    <span class="sethint">Gaze eccentricity that commands no motion.</span>
+  </label>
+
+  <label class="setrow">
+    <span class="setname">Field of view <em id="fovval">75&deg;</em></span>
+    <input id="set-fov" type="range" min="60" max="100" step="1" value="75">
+    <span class="sethint">Wider sees more and moves less; narrower zooms in.</span>
+  </label>
+
+  <label class="setrow">
+    <span class="setname">Max quality</span>
+    <select id="set-qual">
+      <option value="auto">Auto &mdash; match this display</option>
+      <option value="1080">1080p</option>
+      <option value="1440">1440p (2K)</option>
+      <option value="2160">2160p (4K)</option>
+      <option value="4320">4320p (8K)</option>
+    </select>
+    <span class="sethint">A struggling machine still steps itself down.</span>
+  </label>
+
+  <label class="setcheck"><input id="set-blur" type="checkbox" checked> Motion blur on fast turns</label>
+  <label class="setcheck"><input id="set-invx" type="checkbox"> Invert horizontal</label>
+  <label class="setcheck"><input id="set-invy" type="checkbox"> Invert vertical</label>
+
+  <button id="setsreset" type="button">Reset to defaults</button>
+  <p class="setnote">Saved on this device.</p>
+</aside>
 
 <div id="overlay" class="gone">
   <div id="overlaybox">

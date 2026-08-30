@@ -141,7 +141,12 @@ are back in the library.
 | `←` `→` | seek five seconds |
 | `Esc` | back to the library |
 
-On a phone there is no keyboard; the three that matter appear as buttons.
+On a phone there is no keyboard; the buttons that matter appear on screen.
+
+The **settings** button (or `S` while playing) opens a panel: sensitivity,
+deadzone, field of view, motion blur, per-axis inversion, and a max-quality
+override for the display-matched cap. Everything applies live — mid-video
+included — and is saved on the device.
 
 `?selftest` on the URL runs the gaze graph in *your* browser against the
 exporter's eight reference frames and reports the worst deviation, without
