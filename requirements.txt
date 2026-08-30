@@ -1,0 +1,2 @@
+mediapipe==0.10.35
+onnxruntime==1.28.0
