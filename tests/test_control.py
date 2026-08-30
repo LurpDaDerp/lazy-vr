@@ -1,4 +1,4 @@
-"""Unit tests for the pure gaze -> view-angle control law."""
+"""Unit tests for the pure gaze -> requested-turn-rate control law."""
 
 import math
 import sys
@@ -8,6 +8,9 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gaze360.control import (
+    DEFAULT_ASPECT,
+    MAX_ASPECT,
+    MIN_ASPECT,
     CalibrationState,
     ControlConfig,
     GazeController,
@@ -91,299 +94,329 @@ def lost(t):
 
 def config(**kwargs):
     params = dict(
-        gain_yaw=GAIN,
-        gain_pitch=7.0,
-        deadzone_yaw=DEADZONE,
-        deadzone_pitch=1.0,
-        max_yaw=180.0,
-        max_pitch=85.0,
+        deadzone_yaw=6.0,
+        deadzone_pitch=6.0 / DEFAULT_ASPECT,
+        rate_yaw=9.0,
+        rate_pitch=9.0 * DEFAULT_ASPECT,
+        max_rate_yaw=120.0,
+        max_rate_pitch=90.0,
+        onset=0.12,
         expo=1.0,
         tau=0.0,
         min_confidence=0.5,
-        calibration_samples=4,
+        calibration_hold=0.3,
+        calibration_tolerance=2.5,
     )
     params.update(kwargs)
     return ControlConfig(**params)
 
 
+STEP = 0.03  # a 33 Hz camera, near enough
+
+
 def calibrated(controller, yaw=0.0, pitch=0.0, start=0.0):
-    for index in range(controller.config.calibration_samples):
-        controller.update(tracked(yaw, pitch, start + 0.01 * index))
-    return start + 0.01 * controller.config.calibration_samples
+    """Hold one spot until the fixation test is satisfied."""
+    limit = start + controller.config.calibration_hold * 10 + 1.0
+    t = start
+    while controller.calibration is not CalibrationState.DONE:
+        t += STEP
+        controller.update(tracked(yaw, pitch, t))
+        if t > limit:
+            raise AssertionError("calibration never finished")
+    return t
+
+
+def hold_gaze(controller, yaw, pitch, start, duration, confidence=1.0):
+    """Look somewhere for a while; return the last output."""
+    output = None
+    t = start
+    while t < start + duration - 1e-12:
+        t += STEP
+        output = controller.update(tracked(yaw, pitch, t, confidence))
+    return output
 
 
 class CalibrationTests(unittest.TestCase):
+    """Calibration is a fixation test, not a sample count."""
+
     def test_starts_in_calibration(self):
         controller = GazeController(config())
-        self.assertEqual(controller.update(tracked(0.0, 0.0, 0.0)).state, "calibrating")
+        self.assertEqual(controller.update(tracked(0.0, 0.0, 0.0)).state,
+                         "calibrating")
 
-    def test_no_motion_while_calibrating(self):
+    def test_nothing_moves_while_calibrating(self):
         controller = GazeController(config())
         output = controller.update(tracked(30.0, 30.0, 0.0))
-        self.assertEqual(output.yaw, 0.0)
-        self.assertEqual(output.pitch, 0.0)
+        self.assertEqual(output.yaw_rate, 0.0)
+        self.assertEqual(output.pitch_rate, 0.0)
 
-    def test_completes_after_enough_samples(self):
+    def test_holding_still_long_enough_finishes_it(self):
         controller = GazeController(config())
-        after = calibrated(controller)
-        self.assertEqual(controller.update(tracked(0.0, 0.0, after)).state, "centred")
+        calibrated(controller)
+        self.assertIs(controller.calibration, CalibrationState.DONE)
 
-    def test_centre_is_the_mean_of_calibration_samples(self):
-        controller = GazeController(config(calibration_samples=4))
-        for index, yaw in enumerate((8.0, 10.0, 12.0, 14.0)):
-            controller.update(tracked(yaw, 0.0, 0.01 * index))
-        self.assertAlmostEqual(controller.centre[0], 11.0, places=9)
+    def test_a_gaze_that_keeps_moving_never_finishes(self):
+        """The whole point: it ends on stillness, not on elapsed time."""
+        controller = GazeController(config())
+        for index in range(200):
+            controller.update(tracked(20.0 * (index % 2), 0.0, STEP * index))
+        self.assertIs(controller.calibration, CalibrationState.COLLECTING)
+        self.assertEqual(controller.calibration_progress, 0.0)
 
-    def test_biased_centre_cancels_the_bias(self):
-        controller = GazeController(config(calibration_samples=4))
+    def test_looking_away_restarts_the_hold(self):
+        controller = GazeController(config())
+        hold_gaze(controller, 0.0, 0.0, 0.0, 0.15)
+        self.assertGreater(controller.calibration_progress, 0.0)
+        controller.update(tracked(40.0, 0.0, 0.2))  # looked away
+        self.assertEqual(controller.calibration_progress, 0.0)
+        self.assertIs(controller.calibration, CalibrationState.COLLECTING)
+
+    def test_looking_away_is_counted_so_the_page_can_say_so(self):
+        controller = GazeController(config())
+        controller.update(tracked(0.0, 0.0, 0.0))
+        before = controller.resets
+        controller.update(tracked(40.0, 0.0, 0.03))
+        self.assertEqual(controller.resets, before + 1)
+
+    def test_a_wander_inside_the_tolerance_is_forgiven(self):
+        """Tracker noise must not make calibration impossible."""
+        controller = GazeController(config(calibration_tolerance=2.5))
+        t = 0.0
+        for index in range(40):
+            t += STEP
+            controller.update(tracked(1.0 if index % 2 else -1.0, 0.0, t))
+        self.assertIs(controller.calibration, CalibrationState.DONE)
+
+    def test_progress_climbs_with_the_time_held(self):
+        controller = GazeController(config(calibration_hold=1.0))
+        seen = []
+        for index in range(1, 5):
+            controller.update(tracked(0.0, 0.0, 0.1 * index))
+            seen.append(round(controller.calibration_progress, 6))
+        self.assertEqual(seen, sorted(seen))
+        self.assertGreater(seen[-1], seen[0])
+
+    def test_a_slow_drift_off_the_dot_is_caught(self):
+        """Compared against the streak's mean, so drift accumulates."""
+        controller = GazeController(config(calibration_hold=5.0))
+        t = 0.0
+        for index in range(60):
+            t += STEP
+            controller.update(tracked(index * 0.5, 0.0, t))
+        self.assertIs(controller.calibration, CalibrationState.COLLECTING)
+        self.assertGreater(controller.resets, 0)
+
+    def test_centre_is_the_mean_of_the_held_samples(self):
+        controller = GazeController(config())
+        calibrated(controller, yaw=11.0, pitch=-4.0)
+        self.assertAlmostEqual(controller.centre[0], 11.0, places=6)
+        self.assertAlmostEqual(controller.centre[1], -4.0, places=6)
+
+    def test_a_biased_centre_cancels_the_bias(self):
+        controller = GazeController(config())
         after = calibrated(controller, yaw=11.0)
-        self.assertEqual(controller.update(tracked(11.0, 0.0, after)).yaw, 0.0)
+        self.assertEqual(
+            controller.update(tracked(11.0, 0.0, after + STEP)).yaw_error, 0.0
+        )
 
     def test_untracked_samples_do_not_count(self):
-        controller = GazeController(config(calibration_samples=4))
-        for index in range(10):
-            controller.update(lost(0.01 * index))
-        self.assertEqual(controller.calibration, CalibrationState.COLLECTING)
+        controller = GazeController(config())
+        for index in range(100):
+            controller.update(lost(STEP * index))
+        self.assertIs(controller.calibration, CalibrationState.COLLECTING)
 
-    def test_recalibrate_restarts_collection(self):
+    def test_recalibrate_restarts_the_pass(self):
         controller = GazeController(config())
         after = calibrated(controller)
         controller.recalibrate()
-        self.assertEqual(controller.update(tracked(0.0, 0.0, after)).state, "calibrating")
-
-    def test_generation_starts_at_zero(self):
-        self.assertEqual(GazeController(config()).generation, 0)
+        self.assertIs(controller.calibration, CalibrationState.COLLECTING)
+        self.assertEqual(controller.calibration_progress, 0.0)
+        self.assertEqual(
+            controller.update(tracked(0.0, 0.0, after + STEP)).state, "calibrating"
+        )
 
     def test_recalibrate_bumps_the_generation(self):
-        """The page tells this pass from the previous one by its generation.
-
-        Python begins collecting at construction, so by the time a browser
-        connects the stream already reports a finished pass.  Without this the
-        first packet after the countdown satisfies the progress bar and the
-        whole step disappears before it is seen.
-        """
+        """The page tells this pass from the previous one by its generation."""
         controller = GazeController(config())
         before = controller.generation
         self.assertEqual(controller.recalibrate(), before + 1)
-        self.assertEqual(controller.generation, before + 1)
 
-    def test_generation_increases_every_pass(self):
-        controller = GazeController(config())
-        seen = [controller.recalibrate() for _ in range(5)]
-        self.assertEqual(seen, sorted(set(seen)))
-        self.assertEqual(len(seen), 5)
-
-    def test_recalibrate_resets_progress_to_zero(self):
+    def test_progress_is_one_when_done(self):
         controller = GazeController(config())
         calibrated(controller)
         self.assertEqual(controller.calibration_progress, 1.0)
-        controller.recalibrate()
-        self.assertEqual(controller.calibration_progress, 0.0)
-
-    def test_progress_climbs_while_collecting(self):
-        controller = GazeController(config(calibration_samples=4))
-        seen = []
-        for index in range(4):
-            controller.update(tracked(0.0, 0.0, 0.01 * index))
-            seen.append(controller.calibration_progress)
-        self.assertEqual(seen, [0.25, 0.5, 0.75, 1.0])
-
-    def test_recalibrate_brings_the_view_home(self):
-        """The view eases back while the viewer is asked to look at the dot."""
-        controller = GazeController(config())
-        after = calibrated(controller)
-        controller.update(tracked(25.0, 15.0, after))
-        controller.recalibrate()
-        held = controller.update(lost(after + 0.1))
-        self.assertEqual(held.yaw, 0.0)
-        self.assertEqual(held.pitch, 0.0)
-
-    def test_recalibrating_adopts_a_new_centre(self):
-        controller = GazeController(config(calibration_samples=4))
-        after = calibrated(controller, yaw=0.0)
-        controller.recalibrate()
-        calibrated(controller, yaw=20.0, start=after)
-        self.assertAlmostEqual(controller.centre[0], 20.0, places=9)
 
 
-class AbsoluteMappingTests(unittest.TestCase):
-    """The behaviour the viewer actually described: look away, look back."""
+class OnsetGateTests(unittest.TestCase):
+    """The eye saccades and the head follows a moment later."""
 
     def setUp(self):
         self.controller = GazeController(config())
         self.t = calibrated(self.controller)
 
-    def test_centre_gaze_points_at_the_origin(self):
-        output = self.controller.update(tracked(0.0, 0.0, self.t))
-        self.assertEqual(output.yaw, 0.0)
-        self.assertEqual(output.pitch, 0.0)
-        self.assertEqual(output.state, "centred")
+    def test_a_brief_glance_moves_nothing(self):
+        """Flick your eyes to a corner and back; the world stays put."""
+        seen = hold_gaze(self.controller, 25.0, 0.0, self.t, 0.09)
+        self.assertEqual(seen.yaw_rate, 0.0)
+        self.assertFalse(seen.committed)
 
-    def test_looking_back_to_centre_returns_the_view(self):
-        """The defining property of absolute mapping."""
-        self.controller.update(tracked(20.0, 12.0, self.t))
-        moved = self.controller.update(tracked(20.0, 12.0, self.t + 0.1))
-        self.assertNotEqual(moved.yaw, 0.0)
-        self.assertNotEqual(moved.pitch, 0.0)
-        home = self.controller.update(tracked(0.0, 0.0, self.t + 0.2))
-        self.assertEqual(home.yaw, 0.0)
-        self.assertEqual(home.pitch, 0.0)
-
-    def test_holding_a_gaze_holds_the_view_still(self):
-        """Unlike rate control, a steady gaze must not keep moving."""
-        seen = {
-            self.controller.update(tracked(15.0, 0.0, self.t + 0.05 * step)).yaw
-            for step in range(1, 12)
-        }
-        self.assertEqual(len(seen), 1, f"view drifted while gaze was held: {seen}")
-
-    def test_view_angle_is_gain_times_error(self):
-        output = self.controller.update(tracked(DEADZONE + 10.0, 0.0, self.t))
-        self.assertAlmostEqual(output.yaw, GAIN * 10.0, places=9)
-
-    def test_looking_left_turns_left(self):
-        self.assertGreater(self.controller.update(tracked(20.0, 0.0, self.t)).yaw, 0.0)
-
-    def test_looking_right_turns_right(self):
-        self.assertLess(self.controller.update(tracked(-20.0, 0.0, self.t)).yaw, 0.0)
-
-    def test_looking_up_pitches_up(self):
-        self.assertGreater(self.controller.update(tracked(0.0, 20.0, self.t)).pitch, 0.0)
-
-    def test_looking_down_pitches_down(self):
-        self.assertLess(self.controller.update(tracked(0.0, -20.0, self.t)).pitch, 0.0)
-
-
-class BothAxesTests(unittest.TestCase):
-    """The axes are independent and must move together."""
-
-    def setUp(self):
-        self.controller = GazeController(config())
-        self.t = calibrated(self.controller)
-
-    def test_diagonal_gaze_moves_both_axes(self):
-        output = self.controller.update(tracked(14.0, 9.0, self.t))
-        self.assertGreater(output.yaw, 0.0)
-        self.assertGreater(output.pitch, 0.0)
-
-    def test_all_four_diagonals(self):
-        for yaw_sign in (1, -1):
-            for pitch_sign in (1, -1):
-                output = self.controller.update(
-                    tracked(yaw_sign * 14.0, pitch_sign * 9.0, self.t)
-                )
-                self.assertEqual(math.copysign(1, output.yaw), yaw_sign)
-                self.assertEqual(math.copysign(1, output.pitch), pitch_sign)
-
-    def test_pitch_moves_while_yaw_sits_in_its_deadzone(self):
-        output = self.controller.update(tracked(0.0, 9.0, self.t))
-        self.assertEqual(output.yaw, 0.0)
-        self.assertNotEqual(output.pitch, 0.0)
-
-    def test_yaw_moves_while_pitch_sits_in_its_deadzone(self):
-        output = self.controller.update(tracked(14.0, 0.0, self.t))
-        self.assertNotEqual(output.yaw, 0.0)
-        self.assertEqual(output.pitch, 0.0)
-
-    def test_one_axis_does_not_scale_the_other(self):
-        alone = self.controller.update(tracked(14.0, 0.0, self.t)).yaw
-        together = self.controller.update(tracked(14.0, 20.0, self.t)).yaw
-        self.assertAlmostEqual(alone, together, places=12)
-
-
-class SensitivityTests(unittest.TestCase):
-    """Pitch is geared harder than yaw on purpose."""
-
-    def setUp(self):
-        self.controller = GazeController(config())
-        self.t = calibrated(self.controller)
-
-    def test_pitch_is_more_sensitive_than_yaw(self):
-        output = self.controller.update(tracked(10.0, 10.0, self.t))
-        self.assertGreater(abs(output.pitch), abs(output.yaw))
-
-    def test_pitch_deadzone_is_smaller_than_yaw(self):
-        output = self.controller.update(tracked(1.5, 1.5, self.t))
-        self.assertEqual(output.yaw, 0.0, "1.5 deg is inside the yaw deadzone")
-        self.assertNotEqual(output.pitch, 0.0, "1.5 deg must clear the pitch deadzone")
-
-    def test_a_small_upward_glance_reaches_a_useful_angle(self):
-        """8 degrees of eye movement should be worth a real look upward."""
-        self.assertGreater(self.controller.update(tracked(0.0, 8.0, self.t)).pitch, 40.0)
-
-    def test_pitch_saturates_at_its_own_limit(self):
-        output = self.controller.update(tracked(0.0, 90.0, self.t))
-        self.assertAlmostEqual(output.pitch, 85.0, places=9)
-
-    def test_yaw_saturates_at_its_own_limit(self):
-        output = self.controller.update(tracked(400.0, 0.0, self.t))
-        self.assertAlmostEqual(output.yaw, 180.0, places=9)
-
-
-class HoldTests(unittest.TestCase):
-    """Losing the face must hold, never snap home and never run away."""
-
-    def setUp(self):
-        self.controller = GazeController(config())
-        self.t = calibrated(self.controller)
-
-    def test_lost_tracking_holds_the_last_target(self):
-        held = self.controller.update(tracked(20.0, 10.0, self.t))
-        output = self.controller.update(lost(self.t + 0.1))
-        self.assertEqual(output.state, "lost")
-        self.assertAlmostEqual(output.yaw, held.yaw, places=12)
-        self.assertAlmostEqual(output.pitch, held.pitch, places=12)
-
-    def test_low_confidence_holds_the_last_target(self):
-        held = self.controller.update(tracked(20.0, 10.0, self.t))
-        output = self.controller.update(
-            tracked(-30.0, -30.0, self.t + 0.1, confidence=0.2)
+    def test_the_state_says_it_is_waiting(self):
+        self.assertEqual(
+            hold_gaze(self.controller, 25.0, 0.0, self.t, 0.06).state, "committing"
         )
-        self.assertEqual(output.state, "low confidence")
-        self.assertAlmostEqual(output.yaw, held.yaw, places=12)
 
-    def test_confidence_at_the_threshold_is_accepted(self):
-        output = self.controller.update(tracked(25.0, 0.0, self.t, confidence=0.5))
-        self.assertNotEqual(output.yaw, 0.0)
+    def test_holding_the_look_commits_and_the_view_turns(self):
+        seen = hold_gaze(self.controller, 25.0, 0.0, self.t, 0.3)
+        self.assertTrue(seen.committed)
+        self.assertGreater(seen.yaw_rate, 0.0)
+        self.assertEqual(seen.state, "steering")
 
-    def test_recovery_resumes_tracking(self):
-        self.controller.update(lost(self.t))
-        output = self.controller.update(tracked(25.0, 0.0, self.t + 0.1))
-        self.assertGreater(output.yaw, 0.0)
-        self.assertEqual(output.state, "looking")
+    def test_the_gate_does_not_retrigger_mid_turn(self):
+        """Once committed it stays committed until the eyes come back in."""
+        hold_gaze(self.controller, 25.0, 0.0, self.t, 0.3)
+        after = self.controller.update(tracked(-25.0, 0.0, self.t + 0.33))
+        self.assertTrue(after.committed)
+        self.assertLess(after.yaw_rate, 0.0)
 
-    def test_non_finite_gaze_is_treated_as_lost(self):
-        output = self.controller.update(tracked(float("nan"), 0.0, self.t))
-        self.assertEqual(output.state, "lost")
+    def test_coming_back_inside_shuts_the_gate_again(self):
+        hold_gaze(self.controller, 25.0, 0.0, self.t, 0.3)
+        back = self.controller.update(tracked(0.0, 0.0, self.t + 0.33))
+        self.assertFalse(back.committed)
+        self.assertEqual(back.yaw_rate, 0.0)
+        # And the next excursion has to wait all over again.
+        again = hold_gaze(self.controller, 25.0, 0.0, self.t + 0.36, 0.06)
+        self.assertEqual(again.yaw_rate, 0.0)
 
-    def test_nothing_is_held_before_the_first_reading(self):
-        controller = GazeController(config())
-        output = controller.update(lost(0.0))
-        self.assertEqual(output.yaw, 0.0)
-        self.assertEqual(output.pitch, 0.0)
+    def test_a_zero_onset_commits_at_once(self):
+        controller = GazeController(config(onset=0.0))
+        start = calibrated(controller)
+        self.assertGreater(
+            controller.update(tracked(25.0, 0.0, start + STEP)).yaw_rate, 0.0
+        )
+
+
+class RateMapTests(unittest.TestCase):
+    def setUp(self):
+        self.controller = GazeController(config())
+        self.t = calibrated(self.controller)
+
+    def committed(self, yaw, pitch=0.0, confidence=1.0):
+        return hold_gaze(self.controller, yaw, pitch, self.t, 0.4, confidence)
+
+    def test_inside_the_deadzone_asks_for_nothing(self):
+        seen = self.committed(4.0, 1.0)
+        self.assertEqual(seen.yaw_rate, 0.0)
+        self.assertEqual(seen.pitch_rate, 0.0)
+        self.assertEqual(seen.state, "holding")
+
+    def test_rate_is_proportional_beyond_the_deadzone(self):
+        # 15 degrees of gaze, 6 of deadzone, 9 deg/s per degree -- and short
+        # of the 120 deg/s ceiling, which 20 degrees would already have hit.
+        self.assertAlmostEqual(self.committed(15.0).yaw_rate, 9.0 * 9.0, places=6)
+
+    def test_sign_follows_the_gaze(self):
+        self.assertLess(self.committed(-20.0).yaw_rate, 0.0)
+
+    def test_rate_saturates_at_the_limit(self):
+        self.assertAlmostEqual(self.committed(200.0).yaw_rate, 120.0, places=6)
+        self.assertAlmostEqual(self.committed(0.0, 200.0).pitch_rate, 90.0, places=6)
+
+    def test_pitch_is_geared_by_the_screen_aspect(self):
+        """A 16:9 screen gives the eyes less room up and down."""
+        seen = self.committed(0.0, 7.0)
+        beyond = 7.0 - 6.0 / DEFAULT_ASPECT
+        self.assertAlmostEqual(seen.pitch_rate, beyond * 9.0 * DEFAULT_ASPECT,
+                               places=6)
+
+    def test_both_axes_reach_the_same_speed_at_the_same_share_of_their_travel(self):
+        """The property the aspect gearing exists to produce.
+
+        Measured below both ceilings, where the gearing alone decides: an
+        eccentricity and the same fraction of it vertically must ask for the
+        same speed.
+        """
+        sideways = self.committed(14.0).yaw_rate
+        upward = self.committed(0.0, 14.0 / DEFAULT_ASPECT).pitch_rate
+        self.assertAlmostEqual(sideways, upward, places=6)
+
+    def test_the_pitch_ceiling_is_deliberately_lower(self):
+        """Geometry sets the gearing; comfort sets the cap.
+
+        Vertical motion is the more provocative axis and has only 180 degrees
+        end to end, so it saturates sooner than the gearing alone would.
+        """
+        self.assertLess(self.controller.config.max_rate_pitch,
+                        self.controller.config.max_rate_yaw)
+        self.assertAlmostEqual(self.committed(0.0, 200.0).pitch_rate, 90.0,
+                               places=6)
+
+    def test_both_axes_move_at_once(self):
+        seen = self.committed(20.0, 10.0)
+        self.assertGreater(seen.yaw_rate, 0.0)
+        self.assertGreater(seen.pitch_rate, 0.0)
+
+    def test_errors_are_reported_for_the_hud(self):
+        seen = self.committed(20.0, 10.0)
+        self.assertAlmostEqual(seen.yaw_error, 20.0, places=6)
+        self.assertAlmostEqual(seen.pitch_error, 10.0, places=6)
+
+
+class StopTests(unittest.TestCase):
+    """Anything that is not a clear reading has to ask for a stop.
+
+    Holding the last rate would keep the viewer turning through a blink.
+    """
+
+    def setUp(self):
+        self.controller = GazeController(config())
+        self.t = calibrated(self.controller)
+        hold_gaze(self.controller, 25.0, 0.0, self.t, 0.4)
+
+    def test_a_lost_face_asks_for_a_stop(self):
+        seen = self.controller.update(lost(self.t + 0.5))
+        self.assertEqual(seen.yaw_rate, 0.0)
+        self.assertEqual(seen.pitch_rate, 0.0)
+        self.assertEqual(seen.state, "lost")
+
+    def test_low_confidence_asks_for_a_stop(self):
+        seen = hold_gaze(self.controller, 25.0, 0.0, self.t + 0.5, 0.1,
+                         confidence=0.1)
+        self.assertEqual(seen.yaw_rate, 0.0)
+        self.assertEqual(seen.state, "low confidence")
+
+    def test_a_lost_face_shuts_the_onset_gate(self):
+        """Coming back has to earn the turn again."""
+        self.controller.update(lost(self.t + 0.5))
+        back = hold_gaze(self.controller, 25.0, 0.0, self.t + 0.53, 0.06)
+        self.assertEqual(back.yaw_rate, 0.0)
 
 
 class InversionTests(unittest.TestCase):
-    def test_invert_yaw_flips_the_sign(self):
-        controller = GazeController(config(invert_yaw=True))
-        after = calibrated(controller)
-        self.assertLess(controller.update(tracked(20.0, 0.0, after)).yaw, 0.0)
+    def rate(self, **kwargs):
+        controller = GazeController(config(**kwargs))
+        start = calibrated(controller)
+        return hold_gaze(controller, 20.0, 10.0, start, 0.4)
 
-    def test_invert_pitch_flips_the_sign(self):
-        controller = GazeController(config(invert_pitch=True))
-        after = calibrated(controller)
-        self.assertLess(controller.update(tracked(0.0, 20.0, after)).pitch, 0.0)
+    def test_yaw_inversion_flips_only_yaw(self):
+        seen = self.rate(invert_yaw=True)
+        self.assertLess(seen.yaw_rate, 0.0)
+        self.assertGreater(seen.pitch_rate, 0.0)
 
-    def test_inversion_does_not_disturb_calibration(self):
-        controller = GazeController(config(invert_yaw=True))
-        after = calibrated(controller, yaw=9.0)
-        self.assertEqual(controller.update(tracked(9.0, 0.0, after)).yaw, 0.0)
+    def test_pitch_inversion_flips_only_pitch(self):
+        seen = self.rate(invert_pitch=True)
+        self.assertGreater(seen.yaw_rate, 0.0)
+        self.assertLess(seen.pitch_rate, 0.0)
 
 
 class SmoothingTests(unittest.TestCase):
     def make(self, tau):
-        controller = GazeController(config(tau=tau, calibration_samples=1))
-        controller.update(tracked(0.0, 0.0, 0.0))
+        controller = GazeController(
+            config(tau=tau, calibration_hold=0.001, calibration_tolerance=1e9)
+        )
+        # Calibrated before the clock this test cares about, so the first
+        # reading it takes is not compared against a later timestamp.
+        controller.update(tracked(0.0, 0.0, -0.01))
+        controller.update(tracked(0.0, 0.0, -0.008))
         return controller
 
     def test_zero_tau_passes_through(self):
@@ -398,12 +431,6 @@ class SmoothingTests(unittest.TestCase):
         self.assertGreater(error, 0.0)
         self.assertLess(error, 20.0)
 
-    def test_ema_matches_the_analytic_time_constant(self):
-        tau = 0.1
-        controller = self.make(tau)
-        error = controller.update(tracked(10.0, 0.0, tau)).yaw_error
-        self.assertAlmostEqual(error, 10.0 * (1.0 - math.exp(-1.0)), places=9)
-
     def test_frame_rate_independence(self):
         coarse = self.make(0.1)
         coarse.update(tracked(10.0, 0.0, 0.1))
@@ -417,7 +444,7 @@ class SmoothingTests(unittest.TestCase):
         )
 
     def test_default_tau_is_short_enough_to_feel_immediate(self):
-        """Lag here is felt directly; the browser does the smoothing."""
+        """Lag here is felt directly; the browser's body does the smoothing."""
         self.assertLessEqual(ControlConfig().tau, 0.04)
 
     def test_long_gap_snaps_to_the_new_value(self):
@@ -433,14 +460,138 @@ class SmoothingTests(unittest.TestCase):
         self.assertTrue(math.isfinite(error))
 
 
-class DefaultsTests(unittest.TestCase):
-    def test_pitch_is_geared_harder_than_yaw(self):
-        defaults = ControlConfig()
-        self.assertGreater(defaults.gain_pitch, defaults.gain_yaw)
+class AspectTests(unittest.TestCase):
+    """The gearing between the axes follows the shape of the screen."""
 
-    def test_pitch_deadzone_is_smaller_than_yaw(self):
-        defaults = ControlConfig()
-        self.assertLess(defaults.deadzone_pitch, defaults.deadzone_yaw)
+    def control(self, aspect=None, **kwargs):
+        # Derived from the screen unless the caller pins one deliberately.
+        settings = dict(deadzone_pitch=None, rate_pitch=None)
+        settings.update(kwargs)
+        control = GazeController(config(**settings))
+        if aspect is not None:
+            control.set_aspect(aspect)
+        return control
+
+    def test_it_assumes_16_by_9_until_the_page_says_otherwise(self):
+        self.assertAlmostEqual(self.control().aspect, DEFAULT_ASPECT, places=9)
+
+    def test_a_wider_screen_gears_pitch_harder(self):
+        """21:9 leaves even less room to look up, so pitch works harder."""
+        wide = self.control(21 / 9)
+        normal = self.control(16 / 9)
+        self.assertGreater(wide.rate_pitch, normal.rate_pitch)
+        self.assertLess(wide.deadzone_pitch, normal.deadzone_pitch)
+
+    def test_a_square_screen_gears_the_axes_alike(self):
+        square = self.control(1.0)
+        self.assertAlmostEqual(square.rate_pitch, square.config.rate_yaw, places=9)
+        self.assertAlmostEqual(square.deadzone_pitch, square.config.deadzone_yaw,
+                               places=9)
+
+    def test_a_screen_taller_than_it_is_wide_gears_the_other_way(self):
+        """A rotated tablet has more room up and down than sideways."""
+        portrait = self.control(9 / 16)
+        self.assertLess(portrait.rate_pitch, portrait.config.rate_yaw)
+        self.assertGreater(portrait.deadzone_pitch, portrait.config.deadzone_yaw)
+
+    def test_both_axes_reach_the_same_speed_at_their_own_edge_whatever_the_shape(self):
+        """The property the whole scheme exists to produce, generalised.
+
+        An eccentricity sideways and the same share of the screen vertically
+        must ask for the same speed, on any screen.
+        """
+        for aspect in (1.0, 4 / 3, 16 / 10, 16 / 9, 21 / 9, 32 / 9, 9 / 16):
+            with self.subTest(aspect=aspect):
+                control = self.control(aspect, max_rate_yaw=1e6,
+                                       max_rate_pitch=1e6)
+                start = calibrated(control)
+                edge = 15.0
+                sideways = hold_gaze(control, edge, 0.0, start, 0.4).yaw_rate
+                upward = hold_gaze(control, 0.0, edge / aspect, start, 0.4).pitch_rate
+                self.assertAlmostEqual(sideways, upward, places=6)
+
+    def test_an_explicit_setting_pins_the_axis_against_the_screen(self):
+        control = self.control(21 / 9, rate_pitch=42.0, deadzone_pitch=7.0)
+        self.assertEqual(control.rate_pitch, 42.0)
+        self.assertEqual(control.deadzone_pitch, 7.0)
+
+    def test_nonsense_reports_leave_the_shape_alone(self):
+        """A page laying itself out is at liberty to report rubbish."""
+        control = self.control(16 / 9)
+        before = control.aspect
+        for bad in (0.0, -2.0, float("nan"), float("inf"), None, "wide", ""):
+            with self.subTest(bad=bad):
+                control.set_aspect(bad)
+                self.assertAlmostEqual(control.aspect, before, places=9)
+
+    def test_absurd_shapes_are_folded_back_to_something_possible(self):
+        self.assertLessEqual(self.control(500.0).aspect, MAX_ASPECT)
+        self.assertGreaterEqual(self.control(0.001).aspect, MIN_ASPECT)
+
+    def test_a_numeric_string_is_accepted(self):
+        """JSON from the page may not have bothered with the type."""
+        self.assertAlmostEqual(self.control("1.5").aspect, 1.5, places=9)
+
+    def test_set_aspect_returns_what_it_settled_on(self):
+        self.assertAlmostEqual(self.control().set_aspect(2.0), 2.0, places=9)
+
+    def test_the_limits_the_hud_draws_follow_the_screen(self):
+        control = self.control(16 / 9)
+        narrow = control.limits["deadzone_pitch"]
+        control.set_aspect(32 / 9)
+        self.assertLess(control.limits["deadzone_pitch"], narrow)
+        self.assertAlmostEqual(control.limits["aspect"], 32 / 9, places=9)
+
+
+class DefaultsTests(unittest.TestCase):
+    """The screen-shape reasoning, pinned so it cannot drift."""
+
+    def test_pitch_is_geared_by_the_aspect_ratio(self):
+        control = GazeController(ControlConfig())
+        self.assertAlmostEqual(control.rate_pitch / control.config.rate_yaw,
+                               DEFAULT_ASPECT, places=9)
+
+    def test_the_pitch_deadzone_gives_the_gain_back(self):
+        control = GazeController(ControlConfig())
+        self.assertAlmostEqual(
+            control.config.deadzone_yaw / control.deadzone_pitch,
+            DEFAULT_ASPECT, places=9)
+
+    def test_pitch_moves_faster_than_yaw_on_a_screen_wider_than_it_is_tall(self):
+        control = GazeController(ControlConfig())
+        self.assertGreater(control.rate_pitch, control.config.rate_yaw)
+
+    def test_the_deadzone_is_below_the_physiological_ceiling(self):
+        """People do not recruit the head below roughly 18 degrees."""
+        self.assertLess(ControlConfig().deadzone_yaw, 18.0)
+
+    def test_the_onset_gate_still_gates_something(self):
+        """A real head follows the eye by 60-120 ms; this is under that.
+
+        Tuned for responsiveness rather than fidelity, on the grounds that a
+        viewer sitting at a screen cannot turn their real head to help.  It
+        still has to be a gate, though: at zero it would pass single-sample
+        noise straight through to the view.
+        """
+        self.assertGreater(ControlConfig().onset, 0.0)
+        self.assertLess(ControlConfig().onset, 0.06)
+
+    def test_the_felt_delay_holds_across_plausible_frame_rates(self):
+        """The gate can only open on a gaze sample, so it moves in jumps.
+
+        What matters is the wall-clock delay, not the number of samples: a
+        faster camera simply fits more of them into the same window.  What
+        must not happen is the delay quietly doubling -- a camera at 30.5 FPS,
+        which is what this one returns whatever mode is asked of it, has a
+        32.8 ms step, so an onset of 0.033 would need two samples and cost
+        twice what it reads as.
+        """
+        onset = ControlConfig().onset
+        for fps in (30.0, 30.5, 33.0, 60.0):
+            with self.subTest(fps=fps):
+                step = 1.0 / fps
+                felt = math.ceil(onset / step - 1e-9) * step
+                self.assertLessEqual(felt, 0.035)
 
     def test_mapping_is_proportional_by_default(self):
         self.assertEqual(ControlConfig().expo, 1.0)

@@ -19,9 +19,10 @@ from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Callable
+from urllib.parse import unquote
 
 from .control import ControlOutput
-from .mp4 import open_video
+from .library import VideoLibrary
 
 
 # How long a reading may go unrefreshed before the HUD calls it stalled.
@@ -32,6 +33,15 @@ BLOCK = 256 * 1024
 DROPPED = (BrokenPipeError, ConnectionAbortedError, ConnectionResetError)
 
 _RANGE = re.compile(r"^bytes=(\d*)-(\d*)$")
+# Ids are made by gaze360.library.slug, so anything else is not worth looking
+# up -- and refusing them here keeps a path separator out of a lookup key.
+_ID = re.compile(r"^[a-z0-9-]{1,80}$")
+
+
+def route_id(route: str, prefix: str) -> str | None:
+    """The clip id in ``/video/<id>``, or None if it could not be one."""
+    identifier = unquote(route[len(prefix):])
+    return identifier if _ID.match(identifier) else None
 
 
 class RangeNotSatisfiable(Exception):
@@ -80,19 +90,30 @@ def parse_range(header: str | None, size: int) -> tuple[int, int] | None:
 class GazePacket:
     """What the browser needs each tick."""
 
-    yaw: float = 0.0
-    pitch: float = 0.0
+    # Degrees per second the viewer is asking for.  Not an angle: the browser
+    # owns where the view actually points, because the body that carries this
+    # out has to be simulated at display rate.
+    yaw_rate: float = 0.0
+    pitch_rate: float = 0.0
     state: str = "starting"
+    committed: bool = False
     yaw_error: float = 0.0
     pitch_error: float = 0.0
     confidence: float = 0.0
     calibration: float = 0.0
+    # How many times the viewer has looked away mid-pass, so the page can say
+    # so instead of showing a bar that quietly went backwards.
+    calibration_resets: int = 0
     generation: int = 0
     deadzone_yaw: float = 2.0
     deadzone_pitch: float = 1.0
     span_yaw: float = 12.0
     span_pitch: float = 12.0
-    smooth_time: float = 0.13
+    max_rate_yaw: float = 120.0
+    max_rate_pitch: float = 90.0
+    # The screen shape the gearing is currently derived from, echoed back so
+    # the page can see its own report was understood.
+    aspect: float = 16.0 / 9.0
     gaze_fps: float = 0.0
     latency_ms: float = 0.0
     eye_visibility: tuple[float, float] = (1.0, 1.0)
@@ -101,18 +122,16 @@ class GazePacket:
 class SharedState:
     """The handoff between the tracker thread and every HTTP responder."""
 
-    def __init__(self, config, smooth_time: float = 0.13) -> None:
+    def __init__(self, geometry) -> None:
+        """``geometry`` is the controller.
+
+        Its limits are read afresh on every packet rather than copied once,
+        because the gearing between the axes follows the shape of the screen
+        and the page can change that at any moment by resizing.
+        """
         self._lock = threading.Lock()
-        self._limits = dict(
-            deadzone_yaw=config.deadzone_yaw,
-            deadzone_pitch=config.deadzone_pitch,
-            # How far off centre the HUD widget should draw as full deflection.
-            span_yaw=config.deadzone_yaw + config.max_yaw / max(config.gain_yaw, 1e-6),
-            span_pitch=config.deadzone_pitch
-            + config.max_pitch / max(config.gain_pitch, 1e-6),
-            smooth_time=smooth_time,
-        )
-        self._packet = GazePacket(**self._limits)
+        self._geometry = geometry
+        self._packet = GazePacket(**geometry.limits)
         self._updated = 0.0
         self._preview: bytes | None = None
 
@@ -124,12 +143,15 @@ class SharedState:
         gaze_fps: float,
         latency_ms: float,
         eye_visibility: tuple[float, float],
+        calibration_resets: int = 0,
     ) -> None:
         with self._lock:
             self._packet = GazePacket(
-                yaw=output.yaw,
-                pitch=output.pitch,
+                yaw_rate=output.yaw_rate,
+                pitch_rate=output.pitch_rate,
                 state=output.state,
+                committed=output.committed,
+                calibration_resets=calibration_resets,
                 yaw_error=output.yaw_error,
                 pitch_error=output.pitch_error,
                 confidence=output.confidence,
@@ -138,7 +160,7 @@ class SharedState:
                 gaze_fps=gaze_fps,
                 latency_ms=latency_ms,
                 eye_visibility=eye_visibility,
-                **self._limits,
+                **self._geometry.limits,
             )
             self._updated = time.monotonic()
 
@@ -157,15 +179,19 @@ class SharedState:
             age = time.monotonic() - self._updated if self._updated else None
         data = asdict(packet)
         if age is not None and age > STALE_AFTER:
-            # An absolute target is safe to hold -- unlike a rate, it cannot
-            # run away -- so only the label changes.
+            # A rate is not safe to hold.  An angle could be repeated forever
+            # and the view would simply sit there, but a turn speed repeated
+            # forever spins the viewer round and round, so a tracker that has
+            # gone quiet has to be read as "stop", not as "carry on".
             data["state"] = "stalled"
+            data["yaw_rate"] = 0.0
+            data["pitch_rate"] = 0.0
         return data
 
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "gaze360"
+    server_version = "LazyVR"
 
     # Silence the per-request access log; SSE and MJPEG would flood it.
     def log_message(self, format: str, *args) -> None:
@@ -188,8 +214,12 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_error(405)
             elif route == "/gaze":
                 self._gaze_stream()
-            elif route == "/video":
-                self._video()
+            elif route == "/library":
+                self._json(self.server.library.describe())
+            elif route.startswith("/video/"):
+                self._video(route_id(route, "/video/"))
+            elif route.startswith("/thumb/"):
+                self._thumb(route_id(route, "/thumb/"))
             elif route == "/preview.mjpg":
                 self._preview_stream()
             else:
@@ -212,7 +242,9 @@ class Handler(BaseHTTPRequestHandler):
         if handler is None:
             self.send_error(404, f"unknown action {action!r}")
             return
-        self._json({"ok": True, "action": action, "result": handler()})
+        # Every handler takes the whole payload; most ignore it, but the ones
+        # that carry a value -- the screen shape, say -- need it.
+        self._json({"ok": True, "action": action, "result": handler(payload)})
 
     # -- routes ---------------------------------------------------------
 
@@ -231,8 +263,34 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _video(self) -> None:
-        source = self.server.source
+    def _thumb(self, identifier: str | None) -> None:
+        path = self.server.library.thumb(identifier) if identifier else None
+        if path is None:
+            # Not an error: the worker has simply not reached this clip yet,
+            # and the card is drawing a placeholder until it does.
+            self.send_error(404)
+            return
+        body = path.read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "image/jpeg")
+        self.send_header("Content-Length", str(len(body)))
+        # Named after the file's size and mtime, so it can be cached hard.
+        self.send_header("Cache-Control", "public, max-age=86400")
+        self.end_headers()
+        if self.command != "HEAD":
+            self.wfile.write(body)
+
+    def _video(self, identifier: str | None) -> None:
+        entry = self.server.library.entry(identifier) if identifier else None
+        if entry is not None and not entry.settled:
+            # Still downloading: it has no index yet and no end, so a player
+            # handed it would stall rather than fail.  Say so instead.
+            self.send_error(409, "still downloading")
+            return
+        source = self.server.library.source(identifier) if entry else None
+        if entry is None or source is None:
+            self.send_error(404, "no such clip")
+            return
         size = source.size
         try:
             span = parse_range(self.headers.get("Range"), size)
@@ -246,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
         start, end = span if span else (0, size - 1)
         length = end - start + 1
         self.send_response(206 if span else 200)
-        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Content-Type", entry.content_type)
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if span:
@@ -328,14 +386,13 @@ class GazeServer(ThreadingHTTPServer):
         address: tuple[str, int],
         state: SharedState,
         web_root: Path,
-        video: Path,
-        commands: dict[str, Callable[[], None]],
+        library: VideoLibrary,
+        commands: dict[str, Callable[[dict], object]],
     ) -> None:
         super().__init__(address, Handler)
         self.state = state
         self.web_root = Path(web_root).resolve()
-        self.video = Path(video).resolve()
-        self.source = open_video(self.video)
+        self.library = library
         self.commands = commands
         self.stopping = threading.Event()
 
