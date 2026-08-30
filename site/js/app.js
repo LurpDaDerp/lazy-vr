@@ -1,28 +1,34 @@
-/* LazyVR: a library of 360 clips, steered by gaze, entirely in the browser.
+/* LazyVR: youtube's 360 videos, steered by gaze, entirely in the browser.
  *
  * gaze.js reads the camera and turns each frame into gaze angles; control.js
  * turns those into the turn rate the viewer is asking for; body.js carries
  * that request out at display rate as a head would; render.js draws the
- * sphere.  This file is the page: the grid, the calibration step, the HUD,
- * the keys, and the wiring between them.
+ * sphere.  The clips come from this site's own server: /api/home and
+ * /api/search list youtube's 360-filtered uploads, /api/streams resolves
+ * one into proxied tracks, and avsync.js keeps the separate audio on the
+ * video's clock.  This file is the page: the shelves, the search, the
+ * calibration step, the HUD, the keys, and the wiring between them.
  */
 
+import { AVSync } from "./avsync.js";
 import { Body, YAW_LIMIT } from "./body.js";
 import { GazeController } from "./control.js";
 import { GazeTracker } from "./gaze.js";
-import { loadManifest, renderLibrary } from "./library.js";
+import { fetchHome, fetchSearch, fetchStreams, renderResults, renderShelves } from "./library.js";
 import { Renderer } from "./render.js";
 
 const DEG = Math.PI / 180;
 const $ = (id) => document.getElementById(id);
 
 const el = {
-  canvas: $("view"), video: $("video"), cam: $("cam"),
+  canvas: $("view"), video: $("video"), sound: $("sound"), cam: $("cam"),
   state: $("state"), heading: $("heading"), gaze: $("gaze"), rate: $("rate"),
   turn: $("turn"), neck: $("neck"), perf: $("perf"),
   overlay: $("overlay"), overlaytext: $("overlaytext"), progress: $("progress"),
   progresswrap: $("progresswrap"), retry: $("retry"),
   marks: $("compassmarks"), north: $("compassnorth"), dot: $("fixation"), toast: $("toast"),
+  home: $("home"), results: $("results"), resultline: $("resultline"), backhome: $("backhome"),
+  searchForm: $("search"), query: $("query"),
   grid: $("grid"), notice: $("libnotice"), count: $("libcount"), empty: $("libempty"),
   touchbar: $("touchbar"),
 };
@@ -30,6 +36,7 @@ const el = {
 const body = new Body();
 const controller = new GazeController();
 const tracker = new GazeTracker({ models: "models", onStatus: showStatus, onReading: onReading });
+const sync = new AVSync(el.video, el.sound);
 
 let renderer = null;
 try {
@@ -37,6 +44,19 @@ try {
 } catch (error) {
   fail(error.message);
 }
+
+/* What this browser can decode, asked once; the server picks within it. */
+const prefs = (() => {
+  const probe = document.createElement("video");
+  const codecs = [];
+  if (probe.canPlayType('video/webm; codecs="vp09.00.50.08"')) codecs.push("vp9");
+  if (probe.canPlayType('video/mp4; codecs="av01.0.16M.08"')) codecs.push("av01");
+  if (probe.canPlayType('video/mp4; codecs="avc1.640033"')) codecs.push("avc1");
+  return {
+    codecs: codecs.join(",") || "avc1",
+    max: matchMedia("(pointer: coarse)").matches ? 2160 : 4320,
+  };
+})();
 
 /* What the body is currently being asked to do, refreshed on every gaze
  * reading.  Zeroed if the readings stop: a rate repeated forever would spin
@@ -51,6 +71,14 @@ let calibrated = false;
 let everCalibrated = false;
 let playing = null;
 let engine = "idle";  // idle | loading | ready | failed
+
+/* Picking a clip is a little journey -- resolve, camera, calibration -- and
+ * pressing Esc half-way through must strand every step still in flight. */
+let session = 0;
+let streamsReady = false;
+let pendingPlay = false;
+let retryAction = "library";
+let qualityLine = null;
 
 function limitsFor(control) {
   const limits = control.limits;
@@ -195,8 +223,8 @@ let libraryLine = "";
 let loading = null;
 
 /* Loading the models takes a few seconds and needs no permission, so it
- * starts as soon as the grid is up, and is usually done before a card is
- * picked. */
+ * starts as soon as the shelves are up, and is usually done before a card
+ * is picked. */
 function ensureEngine() {
   if (!loading) {
     engine = "loading";
@@ -217,21 +245,56 @@ async function ensureCamera() {
 
 /* ---------- the library ---------- */
 
-async function showLibrary() {
-  let manifest;
+async function loadHome() {
+  let data;
   try {
-    manifest = await loadManifest();
+    data = await fetchHome();
   } catch (error) {
-    el.count.textContent = "Cannot read the library";
+    el.count.textContent = "Cannot reach the server";
     el.empty.hidden = false;
     return;
   }
-  const count = renderLibrary(el.grid, manifest, selectClip);
-  el.empty.hidden = count > 0;
-  libraryLine = count ? `${count} clip${count === 1 ? "" : "s"}` : "No clips";
-  el.count.textContent = libraryLine;
-  if (count) ensureEngine().catch((error) => notify(`The gaze engine could not load: ${error.message}`));
+  const total = renderShelves(el.home, data.categories, selectClip);
+  el.empty.hidden = total > 0;
+  libraryLine = total ? `youtube 360 · ${total} videos on the shelves` : "";
+  el.count.textContent = total ? libraryLine : "youtube gave nothing back";
+  const dead = data.categories.filter((c) => c.error);
+  if (dead.length && total) {
+    notify(`Some shelves came back empty (${dead.map((c) => c.title).join(", ")}): ${dead[0].error}`);
+  }
+  if (total) ensureEngine().catch((error) => notify(`The gaze engine could not load: ${error.message}`));
 }
+
+let searching = false;
+
+el.searchForm.addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const query = el.query.value.trim();
+  if (!query || searching) return;
+  searching = true;
+  el.query.blur();
+  el.results.hidden = false;
+  el.home.hidden = true;
+  el.grid.textContent = "";
+  el.resultline.textContent = `Searching youtube's 360 videos for “${query}”…`;
+  try {
+    const data = await fetchSearch(query);
+    const count = renderResults(el.grid, data.clips, selectClip);
+    el.resultline.textContent = count
+      ? `${count} result${count === 1 ? "" : "s"} for “${query}”`
+      : `Nothing in 360 for “${query}” — try broader words`;
+    if (count) ensureEngine().catch(() => {});
+  } catch (error) {
+    el.resultline.textContent = `Search failed: ${error.message}`;
+  }
+  searching = false;
+});
+
+el.backhome.addEventListener("click", () => {
+  el.results.hidden = true;
+  el.home.hidden = false;
+  el.query.value = "";
+});
 
 function notify(message) {
   el.notice.textContent = message;
@@ -249,46 +312,93 @@ function toast(message) {
 
 async function selectClip(clip) {
   if (!browsing || !renderer) return;
+  const my = ++session;
   browsing = false;
   started = true;
   playing = clip;
+  streamsReady = false;
+  pendingPlay = false;
+  retryAction = "library";
+  el.retry.textContent = "Try again";
   el.notice.hidden = true;
   document.body.classList.remove("browsing");
 
-  el.video.loop = false;
-  el.video.src = clip.src;
+  // Wake both media elements inside the click, so the browser will let a
+  // later, programmatic play() through once calibration is done.
   el.video.load();
-  // Only a click may start media on most browsers, so start it here, inside
-  // the click, and hold it on the first frame until the centring pass is
-  // done.
-  const gesture = el.video.play();
-  if (gesture) gesture.then(() => { if (!calibrated) el.video.pause(); }).catch(() => {});
+  el.sound.load();
 
-  // The camera prompt also wants the click's activation.  Ask for it now,
-  // while the models finish loading in parallel.
   el.overlay.classList.remove("gone");
   el.retry.hidden = true;
   el.overlaytext.textContent = "Starting the gaze tracker…";
+
+  // Resolving the stream takes yt-dlp a few seconds; run it underneath the
+  // camera prompt and the calibration countdown rather than before them.
+  fetchStreams(clip.id, prefs)
+    .then((streams) => {
+      if (session !== my) return;
+      sync.set(streams.video.src, streams.audio && streams.audio.src);
+      const fps = streams.video.fps > 40 ? Math.round(streams.video.fps) : "";
+      qualityLine = `${streams.video.height}p${fps} ${streams.video.codec}`;
+      streamsReady = true;
+      if (pendingPlay) {
+        pendingPlay = false;
+        el.overlay.classList.add("gone");
+        tryPlay();
+      }
+    })
+    .catch((error) => {
+      if (session !== my) return;
+      returnToLibrary();
+      notify(`“${clip.title}” would not stream: ${error.message}`);
+    });
+
+  // The camera prompt also wants the click's activation.  Ask for it now,
+  // while the models finish loading in parallel.
   const camera = ensureCamera();
   try {
     await ensureEngine();
     await camera;
   } catch (error) {
-    fail(error.message, true);
+    if (session === my) fail(error.message, true);
     return;
   }
+  if (session !== my) return;
 
   if (everCalibrated) {
     calibrated = true;
     body.rest();
-    el.overlay.classList.add("gone");
-    el.video.currentTime = 0;
-    el.video.play().catch(() => {});
     toast("Using the calibration from earlier — press C to redo it");
+    maybePlay();
   } else {
     runCalibration("Look at the dot.");
   }
   watchForBackgroundedTab();
+}
+
+/* Playback starts when the slower of the two journeys finishes: the stream
+ * resolving, or the viewer calibrating. */
+function maybePlay() {
+  if (streamsReady) {
+    el.overlay.classList.add("gone");
+    tryPlay();
+  } else {
+    pendingPlay = true;
+    el.overlay.classList.remove("gone");
+    el.overlaytext.textContent = "Fetching the stream from youtube…";
+  }
+}
+
+function tryPlay() {
+  el.video.play().then(() => {
+    if (qualityLine) { toast(qualityLine); qualityLine = null; }
+  }).catch(() => {
+    // The click that started all this has gone stale for this browser;
+    // one fresh click fixes it.
+    retryAction = "play";
+    fail("The browser wants a click before it will play sound.", true);
+    el.retry.textContent = "Play";
+  });
 }
 
 function fail(message, retryable = false) {
@@ -300,25 +410,34 @@ function fail(message, retryable = false) {
   el.retry.hidden = !retryable;
 }
 
-el.retry.addEventListener("click", () => returnToLibrary());
+el.retry.addEventListener("click", () => {
+  if (retryAction === "play") {
+    retryAction = "library";
+    el.retry.textContent = "Try again";
+    el.overlay.classList.add("gone");
+    tryPlay();
+  } else {
+    returnToLibrary();
+  }
+});
 
 function returnToLibrary() {
+  session += 1;
   browsing = true;
   started = false;
   calibrated = false;
   playing = null;
   awaitingGeneration = null;
-  el.video.pause();
-  // Drop the range request as well as the picture; a 10 GB clip should not
-  // keep streaming behind the grid.
-  el.video.removeAttribute("src");
-  el.video.load();
+  pendingPlay = false;
+  retryAction = "library";
+  sync.clear();
   body.rest();
   el.overlay.classList.add("gone");
   el.overlay.classList.remove("calibrating");
   el.progresswrap.classList.remove("on");
   el.dot.classList.remove("on");
   el.retry.hidden = true;
+  el.retry.textContent = "Try again";
   document.body.classList.add("browsing");
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
@@ -326,9 +445,9 @@ function returnToLibrary() {
 el.video.addEventListener("ended", returnToLibrary);
 el.video.addEventListener("error", () => {
   if (browsing || !el.video.getAttribute("src")) return;
-  const title = playing ? playing.title : "That clip";
+  const title = playing ? playing.title : "That video";
   returnToLibrary();
-  notify(`${title} would not play. The file may be missing from the host, or this device cannot decode it.`);
+  notify(`“${title}” stopped streaming. The signed stream may have expired — pick it again.`);
 });
 
 /* ---------- calibration ---------- */
@@ -384,10 +503,7 @@ function finishCalibration() {
   el.overlay.classList.remove("calibrating");
   el.progresswrap.classList.remove("on");
   el.dot.classList.remove("on");
-  if (!browsing) {
-    el.video.currentTime = 0;
-    el.video.play().catch(() => {});
-  }
+  if (!browsing) maybePlay();
 }
 
 /* ---------- keys and touch ---------- */
@@ -408,7 +524,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") returnToLibrary();
   else if (key === "r") recentre();
   else if (key === "c") recalibrate();
-  else if (key === " ") { event.preventDefault(); el.video.paused ? el.video.play() : el.video.pause(); }
+  else if (key === " ") { event.preventDefault(); el.video.paused ? el.video.play().catch(() => {}) : el.video.pause(); }
   else if (key === "f") {
     document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
   } else if (key === "h") document.body.classList.toggle("hidden-hud");
@@ -468,9 +584,13 @@ async function selfTest() {
 /* ---------- start ---------- */
 
 if (renderer) requestAnimationFrame(frame);
-showLibrary().then(() => {
-  if (new URLSearchParams(location.search).has("selftest")) selfTest();
+loadHome().then(() => {
+  const params = new URLSearchParams(location.search);
+  if (params.has("selftest")) selfTest();
+  // ?video=<id> jumps straight to one upload; playback will ask for the
+  // one click the browser insists on before it plays sound.
+  else if (params.get("video")) selectClip({ id: params.get("video"), title: "Direct link" });
 });
 
 // For a console or a test harness.
-window.lazyvr = { body, controller, tracker, get request() { return request; }, get reading() { return lastReading; }, YAW_LIMIT };
+window.lazyvr = { body, controller, tracker, sync, get request() { return request; }, get reading() { return lastReading; }, YAW_LIMIT };

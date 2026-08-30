@@ -1,18 +1,31 @@
-/* The start screen: the manifest, and a grid of cards drawn from it.
+/* The start screen: shelves of youtube's 360 uploads, and a search box.
  *
- * The site is static, so the library is a file -- library.json, written by
- * tools/build_library.py -- rather than a folder scanned on demand.  Each
- * card's picture is the horizon band of the sphere, left unrolled and four
- * times wider than the card shows, so hovering pans across the whole turn.
+ * Everything comes from this site's own server -- /api/home for the
+ * shelves, /api/search for the box -- which asks youtube's search with the
+ * 360° feature filter, so every card is a real equirectangular upload.
  */
 
-export async function loadManifest(url = "library.json") {
-  const response = await fetch(url, { cache: "no-cache" });
-  if (!response.ok) throw new Error(`library.json: ${response.status}`);
-  const data = await response.json();
-  if (!Array.isArray(data.clips)) throw new Error("library.json has no clips");
+async function getJson(url) {
+  let response;
+  try {
+    response = await fetch(url, { cache: "no-store" });
+  } catch {
+    throw new Error("the LazyVR server is not answering");
+  }
+  let data = null;
+  try {
+    data = await response.json();
+  } catch { /* an error page, not JSON */ }
+  if (!response.ok || (data && data.error)) {
+    throw new Error((data && data.error) || `the server said ${response.status}`);
+  }
   return data;
 }
+
+export const fetchHome = () => getJson("api/home");
+export const fetchSearch = (query) => getJson(`api/search?q=${encodeURIComponent(query)}`);
+export const fetchStreams = (id, prefs) =>
+  getJson(`api/streams/${encodeURIComponent(id)}?codecs=${prefs.codecs}&max=${prefs.max}`);
 
 export function formatDuration(seconds) {
   if (!seconds || !isFinite(seconds)) return null;
@@ -22,23 +35,29 @@ export function formatDuration(seconds) {
   return parts.map((part, index) => (index ? String(part).padStart(2, "0") : String(part))).join(":");
 }
 
+export function formatViews(views) {
+  if (views == null || !isFinite(views)) return null;
+  return `${Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(views)} views`;
+}
+
 export function makeCard(clip, onPick) {
   const root = document.createElement("button");
   root.className = "card";
   root.type = "button";
-  root.setAttribute("aria-label", `Play ${clip.title}${clip.quality ? `, ${clip.quality}` : ""}`);
+  root.setAttribute("aria-label", `Play ${clip.title}`);
 
   const strip = document.createElement("span");
-  strip.className = "strip" + (clip.thumb ? "" : " waiting");
+  strip.className = "strip";
   const image = document.createElement("img");
   image.alt = "";
   image.loading = "lazy";
   image.decoding = "async";
-  if (clip.thumb) image.src = clip.thumb;
+  image.src = clip.thumb;
   const badge = document.createElement("span");
   badge.className = "badge";
-  badge.hidden = !clip.quality;
-  if (clip.quality) badge.textContent = clip.quality;
+  const length = formatDuration(clip.duration);
+  badge.hidden = !length;
+  if (length) badge.textContent = length;
   strip.append(image, badge);
 
   const title = document.createElement("span");
@@ -46,17 +65,43 @@ export function makeCard(clip, onPick) {
   title.textContent = clip.title;
 
   const meta = document.createElement("span");
-  meta.className = "cardmeta mono";
-  const length = formatDuration(clip.duration);
-  if (length) meta.textContent = length;
+  meta.className = "cardmeta";
+  const bits = [clip.channel, formatViews(clip.views)].filter(Boolean);
+  bits.forEach((text, index) => {
+    if (index) meta.appendChild(document.createElement("i"));
+    const span = document.createElement("span");
+    span.textContent = text;
+    meta.appendChild(span);
+  });
 
   root.append(strip, title, meta);
   root.addEventListener("click", () => onPick(clip));
   return root;
 }
 
-export function renderLibrary(grid, manifest, onPick) {
+/* The home page: one horizontal shelf per category. */
+export function renderShelves(container, categories, onPick) {
+  container.textContent = "";
+  let total = 0;
+  for (const category of categories) {
+    if (!category.clips || !category.clips.length) continue;
+    total += category.clips.length;
+    const section = document.createElement("section");
+    section.className = "shelf";
+    const head = document.createElement("h2");
+    head.textContent = category.title;
+    const row = document.createElement("div");
+    row.className = "shelfrow";
+    for (const clip of category.clips) row.appendChild(makeCard(clip, onPick));
+    section.append(head, row);
+    container.appendChild(section);
+  }
+  return total;
+}
+
+/* Search results: a plain grid. */
+export function renderResults(grid, clips, onPick) {
   grid.textContent = "";
-  for (const clip of manifest.clips) grid.appendChild(makeCard(clip, onPick));
-  return manifest.clips.length;
+  for (const clip of clips) grid.appendChild(makeCard(clip, onPick));
+  return clips.length;
 }

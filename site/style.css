@@ -46,6 +46,8 @@ body.hidden-hud #keys { opacity: 0; pointer-events: none; }
   z-index: -1;
 }
 
+#sound { display: none; }
+
 #hud, #compass, #keys { transition: opacity 220ms ease; }
 
 #hud {
@@ -263,10 +265,7 @@ body.hidden-hud #keys { opacity: 0; pointer-events: none; }
    split is the type system: sans for what you read, mono for what was
    measured.
 
-   Each card's picture is the horizon band of the equirectangular
-   frame, left unrolled and four times wider than the card shows.
-   Hovering pans across it, so the thumbnail does the one thing a flat
-   thumbnail cannot: show that the frame goes all the way around.
+   Each card's picture is youtube's own thumbnail for the upload.
 */
 
 :root {
@@ -377,29 +376,21 @@ body:not(.browsing) #library { opacity: 0; pointer-events: none; }
   outline-offset: 3px;
 }
 
-/* The picture is 4:1 and the window is 16:9, so at full height a little
-   over half of it is off-card on each side.  27% of the image width is
-   exactly that overhang, which is how far the sweep may travel. */
+/* The pictures are youtube's own 16:9 thumbnails: filled to the card,
+   and breathing slightly under the pointer. */
 .strip img {
   position: absolute;
-  top: 0;
-  left: 50%;
+  inset: 0;
+  width: 100%;
   height: 100%;
-  width: auto;
-  max-width: none;
-  transform: translateX(-50%);
+  object-fit: cover;
   display: block;
+  transition: transform 400ms ease;
 }
 
 .card:hover .strip img,
 .card:focus-visible .strip img {
-  animation: sweep 16s cubic-bezier(.4, 0, .6, 1) infinite;
-}
-
-@keyframes sweep {
-  0%, 100% { transform: translateX(-50%); }
-  25%      { transform: translateX(calc(-50% + 27%)); }
-  75%      { transform: translateX(calc(-50% - 27%)); }
+  transform: scale(1.05);
 }
 
 /* Until ffmpeg reaches this clip there is no picture; say so quietly
@@ -488,27 +479,14 @@ body:not(.browsing) #library { opacity: 0; pointer-events: none; }
 /* -- quieter motion ------------------------------------------------ */
 
 @media (prefers-reduced-motion: reduce) {
-  .card:hover .strip img,
-  .card:focus-visible .strip img,
   .strip.waiting::after,
   #fixation.on { animation: none; }
   .card:hover .strip,
-  .card:focus-visible .strip { transform: none; }
+  .card:focus-visible .strip,
+  .card:hover .strip img,
+  .card:focus-visible .strip img { transform: none; }
   #library, .strip { transition: none; }
 }
-
-/* A clip still being written is listed, so the grid shows what is coming,
-   but it cannot be picked until the file stops growing. */
-.card.downloading { cursor: default; }
-.card.downloading .strip { border-style: dashed; }
-.card.downloading .cardtitle { color: var(--dim); }
-.card.downloading:hover .strip {
-  transform: none;
-  border-color: var(--edge);
-  box-shadow: none;
-}
-.card.downloading:hover .strip img { animation: none; }
-.card.downloading .cardmeta span:first-child { color: var(--warn); }
 
 #libnotice {
   margin: 0 clamp(20px, 5vw, 56px) 18px;
@@ -660,3 +638,122 @@ body:not(.browsing) #library { opacity: 0; pointer-events: none; }
 }
 
 body.browsing #touchbar { display: none; }
+
+/* ==================================================================
+   Search and shelves
+   ==================================================================
+   The header is a topbar: the wordmark on the left, the search over
+   youtube's 360-filtered index on the right.  The home page is one
+   horizontal shelf per category; a search swaps the shelves for a grid.
+*/
+
+#libhead {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 14px 32px;
+}
+
+#libintro { flex-basis: 100%; margin: 0; }
+#libcount { flex-basis: 100%; margin-top: 0; }
+
+#search {
+  display: flex;
+  flex: 1;
+  min-width: 240px;
+  max-width: 640px;
+  margin-left: auto;
+  gap: 8px;
+}
+
+#query {
+  flex: 1;
+  min-width: 0;
+  font: 14px/1.4 var(--sans);
+  color: var(--ink);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  padding: 10px 18px;
+  outline: none;
+  transition: border-color 150ms ease, background 150ms ease;
+}
+
+#query::placeholder { color: var(--dim); }
+
+#query:focus {
+  border-color: rgba(110, 231, 183, .6);
+  background: rgba(255, 255, 255, .07);
+}
+
+#search button {
+  font: 600 13px/1 var(--sans);
+  color: #05070a;
+  background: var(--accent);
+  border: 0;
+  border-radius: 999px;
+  padding: 0 20px;
+  cursor: pointer;
+}
+
+#search button:hover { filter: brightness(1.1); }
+
+/* -- shelves ------------------------------------------------------- */
+
+#home { padding-bottom: 48px; }
+
+.shelf { padding: 6px 0 18px; }
+
+.shelf h2 {
+  margin: 0 0 12px;
+  padding: 0 clamp(20px, 5vw, 56px);
+  font-size: 16px;
+  font-weight: 600;
+  letter-spacing: .01em;
+  color: var(--ink);
+}
+
+.shelfrow {
+  display: grid;
+  grid-auto-flow: column;
+  grid-auto-columns: clamp(240px, 23vw, 330px);
+  gap: 18px;
+  overflow-x: auto;
+  padding: 4px clamp(20px, 5vw, 56px) 14px;
+  scroll-snap-type: x proximity;
+  scrollbar-width: thin;
+  scrollbar-color: rgba(255, 255, 255, .18) transparent;
+}
+
+.shelfrow .card { scroll-snap-align: start; }
+
+/* -- search results ------------------------------------------------ */
+
+#resulthead {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  padding: 2px clamp(20px, 5vw, 56px) 16px;
+}
+
+#backhome {
+  font: 13px/1 var(--sans);
+  color: var(--ink);
+  background: rgba(255, 255, 255, .06);
+  border: 1px solid var(--edge);
+  border-radius: 999px;
+  padding: 8px 16px;
+  cursor: pointer;
+}
+
+#backhome:hover { border-color: rgba(110, 231, 183, .5); }
+
+#resultline {
+  color: var(--dim);
+  font-size: 12px;
+  letter-spacing: .03em;
+}
+
+@media (max-width: 700px) {
+  #search { order: 3; flex-basis: 100%; max-width: none; margin-left: 0; }
+}

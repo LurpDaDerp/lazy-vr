@@ -10,7 +10,10 @@
 <body class="browsing">
 
 <canvas id="view"></canvas>
-<video id="video" playsinline crossorigin="anonymous"></video>
+<video id="video" playsinline preload="auto"></video>
+<!-- High resolutions come from youtube as separate video and audio tracks;
+     avsync.js keeps this shadow element on the video's clock. -->
+<audio id="sound" preload="auto"></audio>
 
 <div id="hud">
   <div class="panel" id="readout">
@@ -60,23 +63,37 @@
 <div id="fixation"></div>
 <div id="toast"></div>
 
-<!-- The start screen.  Every card's picture is the horizon band of the
-     sphere, left unrolled, so hovering one sweeps the whole turn. -->
+<!-- The start screen: youtube's 360 uploads, shelved by category, with a
+     search over the same 360-filtered index. -->
 <main id="library">
   <header id="libhead">
     <div class="wordmark">Lazy<span>VR</span></div>
-    <p id="libintro">Pick a clip. You'll centre your gaze first, then look around to steer.</p>
-    <div id="libcount" class="mono">Reading the library&hellip;</div>
+    <form id="search" role="search">
+      <input id="query" type="search" placeholder="Search youtube's 360 videos&hellip;"
+             autocomplete="off" spellcheck="false" aria-label="Search youtube's 360 videos">
+      <button type="submit">Search</button>
+    </form>
+    <p id="libintro">Pick a video. You'll centre your gaze first, then look around to steer.</p>
+    <div id="libcount" class="mono">Asking youtube&hellip;</div>
   </header>
 
   <p id="libnotice" hidden></p>
 
-  <div id="grid"></div>
+  <div id="home"></div>
+
+  <div id="results" hidden>
+    <div id="resulthead">
+      <button id="backhome" type="button">&larr; All categories</button>
+      <span id="resultline" class="mono"></span>
+    </div>
+    <div id="grid"></div>
+  </div>
 
   <div id="libempty" hidden>
-    <h2>Nothing to play yet</h2>
-    <p>The library is empty. Run <span class="mono">tools/build_library.py</span> over a folder of
-       equirectangular clips to fill it.</p>
+    <h2>Nothing came back</h2>
+    <p>The server could not fetch youtube's 360 listings. Check that
+       <span class="mono">server/app.py</span> is running and can reach the internet,
+       then reload.</p>
   </div>
 </main>
 
