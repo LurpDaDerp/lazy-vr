@@ -237,6 +237,19 @@ async def index(request: web.Request) -> web.FileResponse:
     return web.FileResponse(SITE / "index.html")
 
 
+def tailscale_ipv4() -> str:
+    """This machine's Tailscale IPv4, from the tailscale CLI."""
+    import subprocess
+    try:
+        result = subprocess.run(["tailscale", "ip", "-4"], capture_output=True, timeout=10, check=True)
+    except (OSError, subprocess.SubprocessError):
+        raise SystemExit("could not ask tailscale for an IP -- is Tailscale installed and up?")
+    for line in result.stdout.decode(errors="replace").splitlines():
+        if line.strip():
+            return line.strip()
+    raise SystemExit("tailscale reported no IPv4 address")
+
+
 async def client_session(app: web.Application):
     app["session"] = ClientSession(timeout=ClientTimeout(total=None, connect=20, sock_read=45))
     yield
@@ -259,9 +272,23 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="run the LazyVR server")
     parser.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to serve beyond this machine")
     parser.add_argument("--port", type=int, default=8360)
+    parser.add_argument("--tailscale", action="store_true",
+                        help="also bind this machine's Tailscale IP, so devices on the "
+                             "tailnet can open the site; the LAN stays closed")
     args = parser.parse_args()
-    print(f"LazyVR on http://{args.host}:{args.port}/")
-    web.run_app(build_app(), host=args.host, port=args.port, print=None)
+    hosts = [args.host]
+    if args.tailscale and args.host != "0.0.0.0":
+        address = tailscale_ipv4()
+        if address not in hosts:
+            hosts.append(address)
+    print("LazyVR on:")
+    for host in hosts:
+        print(f"  http://{host}:{args.port}/")
+    if len(hosts) > 1 or args.host == "0.0.0.0":
+        print("note: browsers only give the CAMERA to a secure page, so on a remote")
+        print("      device an http:// address browses but cannot start gaze steering.")
+        print(f"      For that, publish it with TLS:  tailscale serve --bg {args.port}")
+    web.run_app(build_app(), host=hosts if len(hosts) > 1 else hosts[0], port=args.port, print=None)
     return 0
 
 

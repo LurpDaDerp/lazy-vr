@@ -43,6 +43,24 @@ every video byte a viewer watches flows **through the server**, so give it
 bandwidth; and `yt-dlp` rots as YouTube changes, so redeploy with a fresh
 one when streams stop resolving.
 
+### From another device on your tailnet
+
+```
+python server/app.py --tailscale
+```
+
+binds localhost plus this machine's Tailscale IP, so any device signed into
+your tailnet can open `http://<tailscale-ip>:8360/` — the exact URL is
+printed at startup. The LAN stays closed; only the tailnet is let in. If a
+remote device cannot connect, Windows' firewall is blocking inbound Python —
+accept the prompt it shows on first bind, or allow the port once.
+
+One catch: browsers hand the camera only to a **secure** page, and
+`http://100.x…` is not one, so a remote device can browse the library but
+cannot start gaze steering. `tailscale serve --bg 8360` is the proper fix:
+it publishes the same server at `https://<machine>.<tailnet>.ts.net/` with a
+real certificate, camera included (`tailscale serve reset` undoes it).
+
 Chrome will ask for the camera the first time you pick a video. A green dot
 appears: three seconds to settle, then hold still until the bar fills. Look
 away and it starts over. That pass teaches the player where your neutral
