@@ -20,6 +20,7 @@ and they do it lazily.
 
 from __future__ import annotations
 
+import os
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
@@ -192,13 +193,61 @@ class TTLCache:
 
 _QUIET = {"quiet": True, "no_warnings": True, "skip_download": True}
 
+# youtube sometimes challenges an unfamiliar IP -- datacenter ranges above
+# all -- with "Sign in to confirm you're not a bot", and yt-dlp's answer is
+# cookies.  They must belong to wherever *this process* runs (a site can
+# never read a visitor's own youtube cookies, and must not want to), so the
+# host says how through the environment:
+#
+#   LAZYVR_COOKIES_FROM_BROWSER=chrome        read a browser profile on this
+#                                             machine (chrome, edge, firefox,
+#                                             optionally browser:profile)
+#   LAZYVR_COOKIES_FILE=/path/cookies.txt     a Netscape-format export
+#   LAZYVR_COOKIES=<file content>             the same, passed by value --
+#                                             the shape a platform secret
+#                                             takes; written to a temp file
+#
+# Cookies mean the requests count against that google account; the yt-dlp
+# wiki recommends a throwaway.
+
+_cookie_path: str | None = None
+
+
+def _materialized(content: str) -> str:
+    """The passed-by-value cookies, as the file yt-dlp insists on."""
+    global _cookie_path
+    if _cookie_path is None:
+        import tempfile
+        handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+        handle.write(content)
+        handle.close()
+        _cookie_path = handle.name
+    return _cookie_path
+
+
+def cookie_options(env=os.environ) -> dict:
+    """The yt-dlp options the environment asks for; {} when it asks nothing."""
+    content = env.get("LAZYVR_COOKIES")
+    if content and content.strip():
+        return {"cookiefile": _materialized(content)}
+    path = env.get("LAZYVR_COOKIES_FILE")
+    if path:
+        return {"cookiefile": path}
+    browser = env.get("LAZYVR_COOKIES_FROM_BROWSER")
+    if browser:
+        return {"cookiesfrombrowser": tuple(browser.split(":"))}
+    return {}
+
+
+def ydl_options(**extra) -> dict:
+    return {**_QUIET, **cookie_options(), **extra}
+
 
 def search_360(query: str, limit: int = 24) -> list[dict]:
     """Flat search entries -> clip dicts, already filtered.  Blocking."""
     from yt_dlp import YoutubeDL
 
-    options = {**_QUIET, "extract_flat": "in_playlist",
-               "playlistend": max(limit * 2, 30)}
+    options = ydl_options(extract_flat="in_playlist", playlistend=max(limit * 2, 30))
     with YoutubeDL(options) as ydl:
         info = ydl.extract_info(search_url(query), download=False)
     clips = []
@@ -215,5 +264,5 @@ def resolve(video_id: str) -> dict:
     """The full format list for one video.  Blocking, a few seconds."""
     from yt_dlp import YoutubeDL
 
-    with YoutubeDL({**_QUIET, "noplaylist": True}) as ydl:
+    with YoutubeDL(ydl_options(noplaylist=True)) as ydl:
         return ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)

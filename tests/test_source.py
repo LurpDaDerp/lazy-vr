@@ -180,6 +180,50 @@ class TTLCacheTests(unittest.TestCase):
         self.assertIsNone(cache.get("k"))
 
 
+class CookieTests(unittest.TestCase):
+    """yt-dlp authentication comes from the server's environment -- a site
+    can never read a visitor's own youtube cookies, and must not try."""
+
+    def test_no_configuration_asks_for_nothing(self):
+        self.assertEqual(source.cookie_options({}), {})
+
+    def test_a_cookie_file_path(self):
+        self.assertEqual(source.cookie_options({"LAZYVR_COOKIES_FILE": "/x/c.txt"}),
+                         {"cookiefile": "/x/c.txt"})
+
+    def test_a_browser_with_and_without_a_profile(self):
+        self.assertEqual(source.cookie_options({"LAZYVR_COOKIES_FROM_BROWSER": "chrome"}),
+                         {"cookiesfrombrowser": ("chrome",)})
+        self.assertEqual(source.cookie_options({"LAZYVR_COOKIES_FROM_BROWSER": "chrome:Profile 1"}),
+                         {"cookiesfrombrowser": ("chrome", "Profile 1")})
+
+    def test_cookies_by_value_become_one_real_file(self):
+        source._cookie_path = None
+        try:
+            options = source.cookie_options({"LAZYVR_COOKIES": "# Netscape HTTP Cookie File\n"})
+            path = Path(options["cookiefile"])
+            self.assertTrue(path.is_file())
+            self.assertIn("Netscape", path.read_text(encoding="utf-8"))
+            again = source.cookie_options({"LAZYVR_COOKIES": "ignored the second time"})
+            self.assertEqual(Path(again["cookiefile"]), path)
+        finally:
+            if source._cookie_path:
+                Path(source._cookie_path).unlink(missing_ok=True)
+            source._cookie_path = None
+
+    def test_by_value_wins_over_a_path_wins_over_a_browser(self):
+        env = {"LAZYVR_COOKIES_FILE": "/x/c.txt", "LAZYVR_COOKIES_FROM_BROWSER": "chrome"}
+        self.assertEqual(source.cookie_options(env), {"cookiefile": "/x/c.txt"})
+
+    def test_blank_content_is_no_configuration(self):
+        self.assertEqual(source.cookie_options({"LAZYVR_COOKIES": "  \n"}), {})
+
+    def test_the_options_ride_into_every_ydl_call(self):
+        options = source.ydl_options(noplaylist=True)
+        self.assertTrue(options["quiet"])
+        self.assertTrue(options["noplaylist"])
+
+
 class CategoryTests(unittest.TestCase):
     def test_shelves_are_distinct_and_complete(self):
         ids = [c["id"] for c in source.CATEGORIES]
