@@ -326,7 +326,39 @@ el.begin.addEventListener("click", () => {
     "Hold still and look at the <b>centre</b> of the screen.<br>" +
     "This learns where your neutral gaze sits."
   );
+  watchForBackgroundedTab();
 });
+
+/* Chrome will not fetch media for a tab that is not in the foreground: the
+ * request is simply never issued, so the sphere stays black with no error
+ * anywhere. Say so instead of leaving a blank screen, and retry the moment the
+ * tab is looked at. */
+function watchForBackgroundedTab() {
+  const hint = document.createElement("div");
+  hint.id = "bghint";
+  hint.textContent =
+    "Bring this tab to the front — the browser will not load video in a background tab.";
+  Object.assign(hint.style, {
+    position: "fixed", bottom: "64px", left: "50%", transform: "translateX(-50%)",
+    padding: "10px 18px", borderRadius: "8px", background: "rgba(251,191,36,.15)",
+    border: "1px solid rgba(251,191,36,.5)", color: "#fbbf24", display: "none",
+    backdropFilter: "blur(14px)",
+  });
+  document.body.appendChild(hint);
+
+  setInterval(() => {
+    const stuck = video.readyState === 0 && started;
+    hint.style.display = stuck && document.visibilityState === "hidden" ? "" : "none";
+  }, 1000);
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && video.readyState === 0) {
+      video.load();
+      video.play().catch(() => {});
+      watchFrames();
+    }
+  });
+}
 
 document.addEventListener("keydown", (event) => {
   const key = event.key.toLowerCase();

@@ -32,14 +32,18 @@ body.hidden-hud #keys { opacity: 0; pointer-events: none; }
   display: block;
 }
 
-/* The source frames go to a texture, never to the screen. */
+/* The source frames go to a texture, never to the screen.  Kept inside the
+   viewport and never display:none -- Chrome stops decoding a video it thinks
+   nobody is looking at, and a stalled decoder means a black sphere. */
 #video {
   position: fixed;
+  left: 0;
+  top: 0;
   width: 1px;
   height: 1px;
-  opacity: 0.001;
+  opacity: 0.01;
   pointer-events: none;
-  left: -10px;
+  z-index: -1;
 }
 
 #hud, #compass, #keys { transition: opacity 220ms ease; }
