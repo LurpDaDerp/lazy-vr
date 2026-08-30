@@ -25,16 +25,26 @@ const REFUSALS = {
 };
 
 /* body.view (radians) -> the player's spherical properties (degrees).
- * The player's yaw is mapped to our compass heading -- the same number the
- * HUD shows -- and pitch is up-positive on both sides.  If a player build
- * ever pans mirrored, this mapping is the one line to flip. */
+ * The yaw sign was settled empirically against a live player -- the
+ * compass-heading mapping panned mirrored -- so the player's yaw takes
+ * body yaw directly.  Pitch is up-positive on both sides.  If a future
+ * player build pans mirrored again, this is the one line to flip. */
 export function sphericalFromView(view) {
   return {
-    yaw: (((-view.yaw / DEG) % 360) + 360) % 360,
+    yaw: (((view.yaw / DEG) % 360) + 360) % 360,
     pitch: Math.max(-90, Math.min(90, view.pitch / DEG)),
     roll: Math.max(-180, Math.min(180, -view.roll / DEG)),
     fov: EMBED_FOV,
   };
+}
+
+/* youtube's player picks its quality tier from how big it believes it is,
+ * and the quality-setting API has been a no-op for years.  So the iframe
+ * is created larger than the window -- impersonating a 4K-class viewport,
+ * or the display's real pixel density if that asks for more -- and scaled
+ * back down to fit.  Same picture size on screen; a much better tier. */
+export function overscanFor(width, height, dpr = 1) {
+  return Math.min(3, Math.max(1, dpr, 2160 / Math.max(1, height)));
 }
 
 /* Steering is a postMessage per call; only bother when the view moved. */
@@ -73,6 +83,7 @@ export class EmbedPlayer {
     this.player = null;
     this.sent = null;
     this.handlers = {};
+    window.addEventListener("resize", () => this.fit());
   }
 
   /* Create the player on one video.  Resolves when it is ready to obey;
@@ -83,6 +94,9 @@ export class EmbedPlayer {
     this.handlers = handlers;
     const mount = document.createElement("div");
     this.container.appendChild(mount);
+    const width = this.container.clientWidth || window.innerWidth;
+    const height = this.container.clientHeight || window.innerHeight;
+    const overscan = overscanFor(width, height, window.devicePixelRatio || 1);
     await new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
@@ -91,8 +105,8 @@ export class EmbedPlayer {
       }, 15000);
       this.player = new YT.Player(mount, {
         videoId,
-        width: "100%",
-        height: "100%",
+        width: Math.round(width * overscan),
+        height: Math.round(height * overscan),
         playerVars: {
           autoplay: 1, controls: 0, rel: 0, iv_load_policy: 3,
           playsinline: 1, disablekb: 1, fs: 0, origin: location.origin,
@@ -120,6 +134,24 @@ export class EmbedPlayer {
         },
       });
     });
+    this.fit();
+  }
+
+  /* Scale the oversized iframe down onto the window, centred, covering. */
+  fit() {
+    const iframe = this.player && typeof this.player.getIframe === "function"
+      ? this.player.getIframe() : null;
+    if (!iframe) return;
+    const width = this.container.clientWidth || window.innerWidth;
+    const height = this.container.clientHeight || window.innerHeight;
+    const innerW = parseInt(iframe.getAttribute("width"), 10) || iframe.offsetWidth || 1;
+    const innerH = parseInt(iframe.getAttribute("height"), 10) || iframe.offsetHeight || 1;
+    const scale = Math.max(width / innerW, height / innerH);
+    iframe.style.position = "absolute";
+    iframe.style.left = `${(width - innerW * scale) / 2}px`;
+    iframe.style.top = `${(height - innerH * scale) / 2}px`;
+    iframe.style.transformOrigin = "top left";
+    iframe.style.transform = `scale(${scale})`;
   }
 
   steer(view) {

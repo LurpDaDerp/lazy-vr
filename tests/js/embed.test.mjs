@@ -3,17 +3,16 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { EMBED_FOV, movedEnough, sphericalFromView } from "../../site/js/embed.js";
+import { EMBED_FOV, movedEnough, overscanFor, sphericalFromView } from "../../site/js/embed.js";
 
 const DEG = Math.PI / 180;
 const near = (a, b, tol = 1e-9) => assert.ok(Math.abs(a - b) <= tol, `${a} vs ${b}`);
 
-test("mapping: the player's yaw is the compass heading the HUD shows", () => {
-  // The HUD computes heading as ((-view.yaw/DEG) % 360 + 360) % 360.
+test("mapping: the player's yaw takes body yaw directly (settled on a live player)", () => {
   for (const yawDeg of [0, 30, -30, 180, 359, -359, 720.5]) {
     const view = { yaw: yawDeg * DEG, pitch: 0, roll: 0 };
-    const heading = ((-yawDeg % 360) + 360) % 360;
-    near(sphericalFromView(view).yaw, heading, 1e-9);
+    const expected = ((yawDeg % 360) + 360) % 360;
+    near(sphericalFromView(view).yaw, expected, 1e-9);
   }
 });
 
@@ -34,6 +33,19 @@ test("mapping: roll is clamped and the fov rides along", () => {
   const props = sphericalFromView({ yaw: 0, pitch: 0, roll: 2 * DEG });
   assert.ok(Math.abs(props.roll) <= 180);
   assert.equal(props.fov, EMBED_FOV);
+});
+
+test("overscan: a small window impersonates a 4K-class one", () => {
+  near(overscanFor(1920, 1080, 1), 2);
+  near(overscanFor(3840, 2160, 1), 1);
+});
+
+test("overscan: a dense display asks for at least its own pixels", () => {
+  near(overscanFor(2560, 1440, 2), 2);
+});
+
+test("overscan: a tiny window is capped rather than absurd", () => {
+  near(overscanFor(640, 360, 1), 3);
 });
 
 test("gate: the first send always goes", () => {

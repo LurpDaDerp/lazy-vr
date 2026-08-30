@@ -30,7 +30,7 @@ const el = {
   marks: $("compassmarks"), north: $("compassnorth"), dot: $("fixation"), toast: $("toast"),
   home: $("home"), results: $("results"), resultline: $("resultline"), backhome: $("backhome"),
   searchForm: $("search"), query: $("query"),
-  grid: $("grid"), notice: $("libnotice"), empty: $("libempty"),
+  grid: $("grid"), notice: $("libnotice"), empty: $("libempty"), loading: $("libloading"),
   touchbar: $("touchbar"),
 };
 
@@ -300,9 +300,11 @@ async function loadHome() {
   try {
     data = await fetchHome();
   } catch (error) {
+    el.loading.hidden = true;
     el.empty.hidden = false;
     return;
   }
+  el.loading.hidden = true;
   const total = renderShelves(el.home, data.categories, selectClip);
   el.empty.hidden = total > 0;
   const dead = data.categories.filter((c) => c.error);
