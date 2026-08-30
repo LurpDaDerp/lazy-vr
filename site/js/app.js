@@ -90,6 +90,8 @@ function limitsFor(control) {
 let last = performance.now();
 let reportedW = 0;
 let reportedH = 0;
+let reportedCX = Infinity;
+let reportedCY = Infinity;
 
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
@@ -97,6 +99,7 @@ function frame(now) {
   if (renderer) {
     renderer.resize();
     reportScreen();
+    reportScreenPosition();
     if (started && calibrated) body.step(request, dt);
     renderer.draw(body.view);
   }
@@ -119,6 +122,21 @@ function reportScreen() {
   request = { ...request, ...limitsFor(controller) };
 }
 
+/* Where the viewport's centre physically sits on the monitor, in CSS px,
+ * approximating the browser chrome as side borders plus a top bar.  A
+ * window dragged, snapped or fullscreened moves "straight ahead" with it,
+ * and the controller re-aims by what the two-dot pass measured. */
+function reportScreenPosition() {
+  const side = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
+  const top = Math.max(0, window.outerHeight - window.innerHeight - side);
+  const x = window.screenX + side + window.innerWidth / 2;
+  const y = window.screenY + top + window.innerHeight / 2;
+  if (Math.abs(x - reportedCX) < 1 && Math.abs(y - reportedCY) < 1) return;
+  reportedCX = x;
+  reportedCY = y;
+  controller.setScreenCentre(x, y);
+}
+
 /* ---------- gaze readings ---------- */
 
 function onReading(reading) {
@@ -129,16 +147,23 @@ function onReading(reading) {
   renderHud(out, reading);
   if (!calibrated && started && awaitingGeneration !== null && controller.generation >= awaitingGeneration) {
     el.progress.style.width = `${Math.round(controller.calibrationProgress * 100)}%`;
+    if (controller.phase === "offset" && !secondDot) {
+      // The centre is banked; the second dot measures what a screen pixel
+      // is worth, so a moved or fullscreened window can be re-aimed.
+      secondDot = true;
+      moveDot(calibrationOffset);
+      setOverlay(calibrationHeadline, "now the second dot");
+    }
     if (controller.resets !== seenResets) {
       seenResets = controller.resets;
       lookAgain();
     }
-    if (controller.calibrationProgress >= 1) finishCalibration();
+    if (controller.calibrated) finishCalibration();
   }
 }
 
 setInterval(() => {
-  if (lastReadingAt && performance.now() - lastReadingAt > 400) {
+  if (started && lastReadingAt && performance.now() - lastReadingAt > 400) {
     el.state.textContent = "no signal";
     el.state.className = "val bad";
     request = { ...request, yawRate: 0, pitchRate: 0 };
@@ -404,6 +429,7 @@ function fail(message, retryable = false) {
   el.overlay.classList.remove("gone");
   el.overlay.classList.remove("calibrating");
   el.dot.classList.remove("on");
+  moveDot(null);
   el.progresswrap.classList.remove("on");
   el.overlaytext.textContent = message;
   el.retry.hidden = !retryable;
@@ -431,6 +457,13 @@ function returnToLibrary() {
   retryAction = "library";
   sync.clear();
   body.rest();
+  // The camera belongs to a playing session, not to browsing the shelves:
+  // release it, light and all, until the next video is picked.
+  tracker.stop();
+  cameraOpen = false;
+  el.cam.srcObject = null;
+  lastReadingAt = 0;
+  moveDot(null);
   el.overlay.classList.add("gone");
   el.overlay.classList.remove("calibrating");
   el.progresswrap.classList.remove("on");
@@ -454,8 +487,26 @@ el.video.addEventListener("error", () => {
 let awaitingGeneration = null;
 let seenResets = 0;
 let calibrationHeadline = "Look at the dot.";
+let calibrationOffset = null;
+let secondDot = false;
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/* The second dot sits up and to the right of the first, so one extra hold
+ * measures both axes. */
+const DOT_OFFSET = { x: 0.30, y: -0.25 };
+
+function dotOffset() {
+  return {
+    dx: Math.round(el.canvas.clientWidth * DOT_OFFSET.x),
+    dy: Math.round(el.canvas.clientHeight * DOT_OFFSET.y),
+  };
+}
+
+function moveDot(offset) {
+  el.dot.style.left = offset ? `calc(50% + ${offset.dx}px)` : "50%";
+  el.dot.style.top = offset ? `calc(50% + ${offset.dy}px)` : "50%";
+}
 
 function lookAgain() {
   setOverlay(calibrationHeadline, "You looked away", "away");
@@ -491,13 +542,17 @@ async function runCalibration(headline) {
   setOverlay(headline, "hold still…");
   el.progress.style.width = "0%";
   el.progresswrap.classList.add("on");
-  awaitingGeneration = controller.recalibrate();
+  calibrationOffset = dotOffset();
+  secondDot = false;
+  moveDot(null);
+  awaitingGeneration = controller.recalibrate(calibrationOffset);
 }
 
 function finishCalibration() {
   calibrated = true;
   everCalibrated = true;
   awaitingGeneration = null;
+  moveDot(null);
   el.overlay.classList.add("gone");
   el.overlay.classList.remove("calibrating");
   el.progresswrap.classList.remove("on");

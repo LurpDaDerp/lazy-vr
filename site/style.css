@@ -229,7 +229,8 @@ body.hidden-hud #keys { opacity: 0; pointer-events: none; }
   box-shadow: 0 0 0 5px rgba(110, 231, 183, .18), 0 0 22px 6px rgba(110, 231, 183, .45);
   opacity: 0;
   transform: scale(.4);
-  transition: opacity 240ms ease, transform 240ms ease;
+  transition: opacity 240ms ease, transform 240ms ease,
+              left 360ms ease, top 360ms ease;
   pointer-events: none;
   z-index: 20;
 }

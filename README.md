@@ -72,9 +72,35 @@ Three hosting realities:
 - `yt-dlp` rots as YouTube changes; redeploy with a fresh one when streams
   stop resolving.
 - YouTube sometimes challenges **datacenter IPs** ("confirm you're not a
-  bot"). If shelves die on a cloud host but work from home, that is what
-  happened; a home box (or a tailnet host) does not get challenged, and
-  yt-dlp can be fed cookies as a last resort.
+  bot"). If searches or streams die on a cloud host but work from home,
+  that is what happened; a home or tailnet host is rarely challenged, and
+  cookies are the cure when it strikes (next section).
+
+### When youtube challenges the server ("confirm you're not a bot")
+
+Give yt-dlp cookies. They must belong to the machine the **server** runs on
+— a site can never read a visitor's own youtube cookies, and must not try.
+Three ways in, by environment variable:
+
+| Variable | Meaning |
+|---|---|
+| `LAZYVR_COOKIES_FROM_BROWSER` | read a browser profile on the server's own machine: `chrome`, `edge`, `firefox`, or `chrome:Profile 1` |
+| `LAZYVR_COOKIES_FILE` | path to a Netscape-format `cookies.txt` |
+| `LAZYVR_COOKIES` | the file's *content*, passed by value — the shape a platform secret takes |
+
+For Vercel, export cookies on your own machine and hand them over as a
+secret. **Close the browser first** — a running Chrome locks its cookie
+database and the export fails — then:
+
+```
+yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+vercel env add LAZYVR_COOKIES        # paste the content of cookies.txt
+vercel deploy
+```
+
+Cookies make every request count against that google account, and accounts
+used this way can be rate-limited or flagged; the yt-dlp wiki recommends a
+throwaway account, and it is good advice.
 
 ### From another device on your tailnet
 
@@ -95,10 +121,13 @@ it publishes the same server at `https://<machine>.<tailnet>.ts.net/` with a
 real certificate, camera included (`tailscale serve reset` undoes it).
 
 Chrome will ask for the camera the first time you pick a video. A green dot
-appears: three seconds to settle, then hold still until the bar fills. Look
-away and it starts over. That pass teaches the player where your neutral
-gaze sits, happens once a visit, and `C` runs it again whenever you shift in
-your seat.
+appears: three seconds to settle, then hold still until the bar fills — and
+the dot then hops up-right for one more short hold. The first dot teaches
+the player where your neutral gaze sits; the second measures what a screen
+pixel is worth to your eyes, which is what lets a moved or resized window
+stay aimed (see below). Look away and the current dot starts over. It runs
+once a visit, `C` reruns it whenever you shift in your seat, and the camera
+is released — light off — whenever you are back in the library.
 
 | Key | |
 |---|---|
@@ -180,9 +209,18 @@ centring pass remembers its viewport, and every deadzone and gain rescales
 by how much each axis has grown since — deadzones multiplied by it, gains
 divided — keeping one thing invariant: the same **fraction** of the view
 always asks for the same turn. At the calibrated size the scales are 1 and
-nothing changes. (A moved window can still bias the calibrated *centre* —
-the dot physically sits somewhere else on the monitor — which the deadzone
-absorbs when small; `C` re-centres in one hold if it is not.)
+nothing changes.
+
+A moved window needs more than a ratio: a side-snapped window taken
+fullscreen puts "straight ahead" somewhere physically different on the
+monitor. That is what the second calibration dot is for. It sits a known
+number of pixels from the first, so the difference between the two
+fixations measures degrees-of-gaze per screen pixel — magnitude *and* sign,
+per axis — and whenever the viewport's centre moves on the monitor, the
+calibrated centre is shifted by exactly what those pixels are worth. An
+implausible measurement (a botched second fixation) is discarded rather
+than believed. The one assumption is one monitor at one viewing distance;
+after dragging to a different monitor, press `C`.
 
 | screen | pitch deadzone | pitch rate |
 |---|---|---|
