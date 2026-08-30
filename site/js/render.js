@@ -112,8 +112,11 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    // A black frame until the first video frame arrives.
-    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, 1, 1, 0, gl.RGB, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0]));
+    // A black frame until the first video frame arrives.  RGBA rather than
+    // RGB: it is the fast path for video uploads on most drivers.
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
+    this.texWidth = 1;
+    this.texHeight = 1;
 
     this.uniforms = {
       res: gl.getUniformLocation(program, "uRes"),
@@ -151,10 +154,19 @@ export class Renderer {
 
   draw(view) {
     const gl = this.gl;
-    if (this.pendingFrame && this.video.readyState >= 2) {
+    if (this.pendingFrame && this.video.readyState >= 2 && this.video.videoWidth) {
       gl.bindTexture(gl.TEXTURE_2D, this.texture);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, this.video);
+      // Re-specify storage only when the frame size changes; a plain
+      // sub-image update is markedly cheaper for the 4K-and-up frames
+      // that dominate this library.
+      if (this.texWidth !== this.video.videoWidth || this.texHeight !== this.video.videoHeight) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
+        this.texWidth = this.video.videoWidth;
+        this.texHeight = this.video.videoHeight;
+      } else {
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
+      }
       if (this.video.requestVideoFrameCallback) this.pendingFrame = false;
     }
     gl.uniform2f(this.uniforms.res, this.canvas.width, this.canvas.height);

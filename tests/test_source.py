@@ -179,6 +179,16 @@ class TTLCacheTests(unittest.TestCase):
         cache.drop("k")
         self.assertIsNone(cache.get("k"))
 
+    def test_a_crowded_cache_sweeps_its_dead_on_put(self):
+        clock = [0.0]
+        cache = source.TTLCache(clock=lambda: clock[0])
+        for i in range(source.TTLCache.SWEEP_AT):
+            cache.put(f"old{i}", i, 5)
+        clock[0] = 10.0  # everything above is now expired
+        cache.put("fresh", "v", 5)
+        self.assertEqual(len(cache._values), 1)
+        self.assertEqual(cache.get("fresh"), "v")
+
 
 class CookieTests(unittest.TestCase):
     """yt-dlp authentication comes from the server's environment -- a site

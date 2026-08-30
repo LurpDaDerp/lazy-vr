@@ -96,12 +96,22 @@ export class EmbedPlayer {
     this.forceBest();
   }
 
-  /* Create the player on one video.  Resolves when it is ready to obey;
-   * `onEnded` and `onError` fire for everything after that. */
+  /* Point the player at one video.  Resolves when it is ready to obey;
+   * `onEnded` and `onError` fire for everything after that.
+   *
+   * ONE player for the life of the page.  Creating and destroying youtube
+   * players per video leaks message listeners and workers -- each pick made
+   * the page a little heavier until only a reload cured it -- so the first
+   * open builds the player and every later one just loads into it. */
   async open(videoId, handlers = {}) {
-    const YT = await iframeApi();
-    this.close();
     this.handlers = handlers;
+    this.sent = null;
+    if (this.player) {
+      this.player.loadVideoById(videoId);
+      this.fit();
+      return;
+    }
+    const YT = await iframeApi();
     const mount = document.createElement("div");
     this.container.appendChild(mount);
     const width = this.container.clientWidth || window.innerWidth;
@@ -148,15 +158,22 @@ export class EmbedPlayer {
     this.fit();
   }
 
-  /* Scale the oversized iframe down onto the window, centred, covering. */
+  /* Size the reused iframe for the current window and pixel density, and
+   * scale it down onto the window, centred, covering. */
   fit() {
     const iframe = this.player && typeof this.player.getIframe === "function"
       ? this.player.getIframe() : null;
     if (!iframe) return;
     const width = this.container.clientWidth || window.innerWidth;
     const height = this.container.clientHeight || window.innerHeight;
-    const innerW = parseInt(iframe.getAttribute("width"), 10) || iframe.offsetWidth || 1;
-    const innerH = parseInt(iframe.getAttribute("height"), 10) || iframe.offsetHeight || 1;
+    const overscan = overscanFor(width, height, window.devicePixelRatio || 1);
+    const innerW = Math.round(width * overscan);
+    const innerH = Math.round(height * overscan);
+    if (typeof this.player.setSize === "function"
+        && (parseInt(iframe.getAttribute("width"), 10) !== innerW
+            || parseInt(iframe.getAttribute("height"), 10) !== innerH)) {
+      this.player.setSize(innerW, innerH);
+    }
     const scale = Math.max(width / innerW, height / innerH);
     iframe.style.position = "absolute";
     iframe.style.left = `${(width - innerW * scale) / 2}px`;
@@ -222,13 +239,12 @@ export class EmbedPlayer {
     this.player.seekTo(Math.max(0, this.player.getCurrentTime() + delta), true);
   }
 
+  /* Stand down, keeping the player for the next video (see open). */
   close() {
-    if (this.player) {
-      try { this.player.destroy(); } catch { /* already gone */ }
-    }
-    this.player = null;
-    this.sent = null;
     this.handlers = {};
-    this.container.textContent = "";
+    this.sent = null;
+    if (this.player) {
+      try { this.player.stopVideo(); } catch { /* mid-load; it will stop */ }
+    }
   }
 }

@@ -225,10 +225,18 @@ function considerDownshift(now) {
     return;
   }
   if (now - slowSince < SLOW_FOR_MS || now - lastDropAt < DROP_COOLDOWN_MS) return;
-  const lower = tierBelow(currentMax);
-  if (!lower || lower < 1080) return;
   lastDropAt = now;
   slowSince = 0;
+  // First relief valve: the mirrored second gaze pass costs a whole extra
+  // landmarker run on the main thread every frame.  Cheaper to lose than
+  // pixels, and the tracker would shed it itself eventually anyway.
+  if (tracker.mirror) {
+    tracker.mirror = false;
+    toast("Dropping the second gaze pass to stay smooth");
+    return;
+  }
+  const lower = tierBelow(currentMax);
+  if (!lower || lower < 1080) return;
   currentMax = lower;
   toast(`Struggling to keep up — capping at ${lower}p`);
   applyQualityCap(lower);
@@ -325,8 +333,15 @@ function renderHud(out, reading) {
   drawStick(out);
 }
 
+let compassShown = "";
+
 function updateCompass() {
   const heading = ((-body.view.yaw / DEG) % 360 + 360) % 360;
+  // Touching the DOM sixty times a second for an unchanged number is
+  // layout work for nothing; a tenth of a degree is finer than the eye.
+  const key = heading.toFixed(1);
+  if (key === compassShown) return;
+  compassShown = key;
   el.heading.textContent = `${heading.toFixed(0)}°`;
   el.marks.style.backgroundPositionX = `${-heading / 360 * 4 * el.marks.clientWidth}px`;
   // The strip shows a quarter turn across its width; mark where the clip
@@ -642,6 +657,7 @@ el.retry.addEventListener("click", () => {
 
 function returnToLibrary() {
   session += 1;
+  calibrationRun += 1;
   browsing = true;
   started = false;
   calibrated = false;
@@ -774,7 +790,12 @@ function setOverlay(headline, sub, subClass = "") {
   el.overlaytext.appendChild(span);
 }
 
+let calibrationRun = 0;
+
 async function runCalibration(headline) {
+  // A pass superseded mid-countdown -- Esc, another video, a second resize
+  // -- must not wake up later and fight the pass that replaced it.
+  const run = ++calibrationRun;
   mediaPause();
   calibrated = false;
   awaitingGeneration = null;
@@ -790,6 +811,7 @@ async function runCalibration(headline) {
   for (let count = 3; count > 0; count--) {
     setOverlay(headline, String(count));
     await wait(1000);
+    if (run !== calibrationRun || browsing) return;
   }
   setOverlay(headline, "hold still…");
   el.progress.style.width = "0%";

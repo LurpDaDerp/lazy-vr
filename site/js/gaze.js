@@ -40,8 +40,10 @@ export const FOCAL_SCALE = 0.75;
  * normalised, so only the aspect ratio has to be honest. */
 const MIRROR_WIDTH = 640;
 /* If a frame takes longer than this on average the mirror pass is dropped:
- * a single pass at a usable rate beats two passes at a crawl. */
-const MIRROR_BUDGET_MS = 70;
+ * a single pass at a usable rate beats two passes at a crawl.  Kept tight,
+ * because every extraction runs on the main thread, and main-thread time is
+ * exactly what smooth camera motion is made of. */
+const MIRROR_BUDGET_MS = 45;
 
 export class GazeTracker {
   /* `models`: URL of the folder with gaze_direct.onnx, the .task file, the
@@ -113,6 +115,11 @@ export class GazeTracker {
 
     this.flipCanvas = document.createElement("canvas");
     this.flipContext = this.flipCanvas.getContext("2d", { willReadFrequently: false });
+    // One set of batch buffers for the life of the tracker: allocating
+    // ~12 KB of Float32Arrays thirty times a second is pure GC churn.
+    this.cloudBatch = new Float32Array(2 * NUM_LANDMARKS * 3);
+    this.contextBatch = new Float32Array(2 * this.contextWidth);
+    this.validityBatch = new Float32Array(2 * NUM_LANDMARKS);
     await this.warmUp();
     this.onStatus("Ready");
   }
@@ -181,8 +188,13 @@ export class GazeTracker {
     this.running = true;
     this.busy = false;
     this.lastVideoTime = -1;
+    // The token retires the previous session's tick chain.  Without it, a
+    // stopped chain's still-pending frame callback sees `running` true
+    // again after a restart and keeps rescheduling itself -- one extra
+    // chain per stop/start cycle, forever, until a reload.
+    const run = this.runId = (this.runId || 0) + 1;
     const tick = () => {
-      if (!this.running) return;
+      if (!this.running || this.runId !== run) return;
       this.schedule(tick);
       if (this.busy) return;
       if (this.video.currentTime === this.lastVideoTime) return;
@@ -265,17 +277,13 @@ export class GazeTracker {
    * and the validity permuted; its gaze is un-mirrored and averaged with the
    * direct row. */
   async predict(cloud, context, validity) {
-    const mirrored = mirrorCloud(cloud, this.permutation);
-    const cloudBatch = new Float32Array(2 * NUM_LANDMARKS * 3);
-    cloudBatch.set(cloud, 0);
-    cloudBatch.set(mirrored, NUM_LANDMARKS * 3);
-    const contextBatch = new Float32Array(2 * this.contextWidth);
-    contextBatch.set(context, 0);
-    contextBatch.set(mirrorContext(context), this.contextWidth);
-    const validityBatch = new Float32Array(2 * NUM_LANDMARKS);
-    validityBatch.set(validity, 0);
-    validityBatch.set(mirrorValidity(validity, this.permutation), NUM_LANDMARKS);
-    const { gaze } = await this.run(cloudBatch, contextBatch, validityBatch);
+    this.cloudBatch.set(cloud, 0);
+    this.cloudBatch.set(mirrorCloud(cloud, this.permutation), NUM_LANDMARKS * 3);
+    this.contextBatch.set(context, 0);
+    this.contextBatch.set(mirrorContext(context), this.contextWidth);
+    this.validityBatch.set(validity, 0);
+    this.validityBatch.set(mirrorValidity(validity, this.permutation), NUM_LANDMARKS);
+    const { gaze } = await this.run(this.cloudBatch, this.contextBatch, this.validityBatch);
     return combineGaze(gaze.subarray(0, 3), gaze.subarray(3, 6));
   }
 

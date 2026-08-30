@@ -166,7 +166,13 @@ def stream_expiry(url: str, now: float | None = None) -> float:
 # ---------------------------------------------------------------- cache
 
 class TTLCache:
-    """The smallest cache that can say no: value or None, never stale."""
+    """The smallest cache that can say no: value or None, never stale.
+
+    Expired entries are dropped when read; entries never read again would
+    otherwise pile up for the life of the process, so a put on a cache past
+    SWEEP_AT sweeps the dead ones out first."""
+
+    SWEEP_AT = 512
 
     def __init__(self, clock=time.time):
         self._values: dict = {}
@@ -183,6 +189,10 @@ class TTLCache:
         return value
 
     def put(self, key, value, ttl: float):
+        if len(self._values) >= self.SWEEP_AT:
+            now = self._clock()
+            for stale in [k for k, (_, expires) in self._values.items() if expires <= now]:
+                self._values.pop(stale, None)
         self._values[key] = (value, self._clock() + ttl)
 
     def drop(self, key):
