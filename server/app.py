@@ -23,6 +23,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import mimetypes
+import os
 import re
 import sys
 import time
@@ -271,7 +272,8 @@ def build_app() -> web.Application:
 def main() -> int:
     parser = argparse.ArgumentParser(description="run the LazyVR server")
     parser.add_argument("--host", default="127.0.0.1", help="0.0.0.0 to serve beyond this machine")
-    parser.add_argument("--port", type=int, default=8360)
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8360")),
+                        help="port to listen on (default: $PORT if a platform sets it, else 8360)")
     parser.add_argument("--tailscale", action="store_true",
                         help="also bind this machine's Tailscale IP, so devices on the "
                              "tailnet can open the site; the LAN stays closed")

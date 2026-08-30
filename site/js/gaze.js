@@ -145,7 +145,11 @@ export class GazeTracker {
    * refused or absent. */
   async open(videoElement) {
     if (!navigator.mediaDevices?.getUserMedia) {
-      throw new Error("This browser cannot open a camera. It needs a secure (https) page and a modern browser.");
+      throw new Error(window.isSecureContext
+        ? "This browser is too old to open a camera."
+        : `This page was opened over plain http (${location.host}), and browsers `
+          + "only allow the camera on a secure page. Open this site's https "
+          + "address instead.");
     }
     this.onStatus("Waiting for the camera…");
     try {

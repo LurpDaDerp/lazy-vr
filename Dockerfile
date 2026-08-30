@@ -15,5 +15,7 @@ RUN pip install --no-cache-dir -r server/requirements.txt
 COPY server server
 COPY site site
 
+# The port comes from $PORT when the platform injects one (Render, Railway),
+# and falls back to 8360 (which fly.toml's internal_port matches).
 EXPOSE 8360
-CMD ["python", "server/app.py", "--host", "0.0.0.0", "--port", "8360"]
+CMD ["python", "server/app.py", "--host", "0.0.0.0"]

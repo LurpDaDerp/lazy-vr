@@ -1,0 +1,8 @@
+# Render: New -> Blueprint on this repo, and this file does the rest.
+# The free plan sleeps between visits; "starter" stays warm.
+services:
+  - type: web
+    name: lazyvr
+    runtime: docker
+    plan: free
+    healthCheckPath: /

@@ -29,19 +29,45 @@ pip install -r server/requirements.txt
 python server/app.py                    # http://127.0.0.1:8360/
 ```
 
-Or as a container, which is also how you host it:
+Or as a container:
 
 ```
 docker build -t lazyvr .
 docker run -p 8360:8360 lazyvr
 ```
 
-Deploy the container to anything that runs Docker — Fly.io, Railway, a VPS —
-and put HTTPS in front (the platform's ingress usually is already): browsers
-refuse the camera to an insecure page. Two hosting realities to plan for:
-every video byte a viewer watches flows **through the server**, so give it
-bandwidth; and `yt-dlp` rots as YouTube changes, so redeploy with a fresh
-one when streams stop resolving.
+## Host it
+
+The container is the whole product — page, search, proxy — and nothing in it
+refers back to any particular machine. Every visitor's webcam and gaze
+inference belong to *their* browser: the models load onto the visiting
+device and the server never sees a camera frame; it only searches YouTube
+and relays stream bytes. The server listens on `$PORT` when a platform
+injects one (else 8360) and binds `0.0.0.0` inside the container.
+
+Pick a platform — each terminates HTTPS for you, which is exactly what the
+camera needs:
+
+- **Fly.io** — `fly launch --copy-config --name <yours>`, then `fly deploy`
+  (`fly.toml` is committed).
+- **Render** — *New → Blueprint* on the repo; `render.yaml` does the rest.
+  The free plan sleeps between visits.
+- **Railway** — *Deploy from repo*; the Dockerfile is detected.
+- **Any VPS / home server** — `docker run -d --restart unless-stopped -p
+  8360:8360 lazyvr` behind Caddy or nginx for TLS — or `tailscale serve
+  --bg 8360` for a tailnet-only `https://…ts.net` URL with no reverse proxy
+  at all.
+
+Three hosting realities:
+
+- Every video byte a viewer watches flows **through the server**: give it
+  bandwidth — an active 4K–8K viewer pulls tens of Mbit/s.
+- `yt-dlp` rots as YouTube changes; redeploy with a fresh one when streams
+  stop resolving.
+- YouTube sometimes challenges **datacenter IPs** ("confirm you're not a
+  bot"). If shelves die on a cloud host but work from home, that is what
+  happened; a home box (or a tailnet host) does not get challenged, and
+  yt-dlp can be fed cookies as a last resort.
 
 ### From another device on your tailnet
 
