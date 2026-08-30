@@ -1,37 +1,57 @@
-# LazyVR — steer a 360 video with your eyes
+# LazyVR — steer YouTube's 360 videos with your eyes
 
-A web page. Open it, pick a clip, look around: look left and the view turns
-left, look back to the middle and it stops where it is. No headset, no mouse,
-no install. Everything — the webcam, the face landmarks, the gaze model, the
-control law, the rendering — runs in the browser, so the site is static files
-on any host, and it works on a laptop, a desktop or a phone.
+A web page. Open it, pick a 360 video from YouTube — off the shelves or by
+search — look around: look left and the view turns left, look back to the
+middle and it stops where it is. No headset, no mouse, no install, no ads.
 
-Gaze comes from the `gaze-direct` model: 478 MediaPipe landmarks into one ONNX
-graph, out comes a camera-frame gaze vector. No head-pose solver and no
+Two pieces. The **page** does everything perceptual in the browser: the
+webcam, the face landmarks, the gaze model, the control law, the rendering.
+The **server** is small and does only what a browser cannot: it asks
+YouTube's search (through `yt-dlp`, filtered to 360° uploads) and proxies
+the raw video streams, because the stream URLs YouTube signs are bound to
+the server's IP and carry no CORS headers — and the page needs the video as
+a WebGL texture, which is exactly the fetch CORS guards.
+
+Playing the raw stream is also why there are no ads: this player has no ad
+system to inject them. The flip side is worth saying plainly — pulling
+streams this way is against YouTube's terms of service, and it depends on
+`yt-dlp` keeping up with YouTube, so keep it updated and keep this for
+personal use.
+
+Gaze comes from the `gaze-direct` model: 478 MediaPipe landmarks into one
+ONNX graph, out comes a camera-frame gaze vector. No head-pose solver and no
 personal calibration beyond one short centring pass per visit.
 
-## Try it locally
+## Run it
 
 ```
-python tools/build_library.py     # scan ./videos -> site/library.json + thumbnails
-python tools/serve.py             # http://127.0.0.1:8360/
+pip install -r server/requirements.txt
+python server/app.py                    # http://127.0.0.1:8360/
 ```
 
-Put equirectangular `.mp4` or `.webm` files in `videos/` first. The build
-needs `ffmpeg` and `ffprobe` on `PATH`; the preview server needs nothing.
-Both are plain Python 3 scripts, with no packages to install — they are
-development tools, not something a viewer runs. The deployed site has no
-server side at all.
+Or as a container, which is also how you host it:
 
-Chrome will ask for the camera the first time you pick a clip. Click a clip
-and a green dot appears: three seconds to settle, then hold still until the
-bar fills. Look away and it starts over. That pass teaches the player where
-your neutral gaze sits, happens once a visit, and `C` runs it again whenever
-you shift in your seat.
+```
+docker build -t lazyvr .
+docker run -p 8360:8360 lazyvr
+```
+
+Deploy the container to anything that runs Docker — Fly.io, Railway, a VPS —
+and put HTTPS in front (the platform's ingress usually is already): browsers
+refuse the camera to an insecure page. Two hosting realities to plan for:
+every video byte a viewer watches flows **through the server**, so give it
+bandwidth; and `yt-dlp` rots as YouTube changes, so redeploy with a fresh
+one when streams stop resolving.
+
+Chrome will ask for the camera the first time you pick a video. A green dot
+appears: three seconds to settle, then hold still until the bar fills. Look
+away and it starts over. That pass teaches the player where your neutral
+gaze sits, happens once a visit, and `C` runs it again whenever you shift in
+your seat.
 
 | Key | |
 |---|---|
-| `R` | recentre — turn the view back to where the clip started |
+| `R` | recentre — turn the view back to where the video started |
 | `C` | recalibrate — stare at the green dot |
 | `Space` | play / pause |
 | `F` | fullscreen |
@@ -43,49 +63,31 @@ On a phone there is no keyboard; the three that matter appear as buttons.
 
 `?selftest` on the URL runs the gaze graph in *your* browser against the
 exporter's eight reference frames and reports the worst deviation, without
-opening a camera. Use it to check a deployment.
+opening a camera. `?video=<youtube-id>` jumps straight to one upload.
 
-## Hosting it
+## Where the videos come from
 
-The site is the `site/` folder: static files, no build step, no framework.
-Any static host serves it. The only hard requirement is **HTTPS**, because
-browsers refuse the camera to an insecure page — and every host provides it.
+The home page is shelves — Nature, Thrill, Ocean, Wildlife, Cities, Space,
+Flight, Music — and the top bar searches by keyword. Both go through
+`/api/…` on the server, which runs the query against YouTube's own search
+with the **360° feature filter** (the `sp` parameter YouTube's search UI
+sets when you tick that box). Only equirectangular uploads carry the flag,
+so the filter is also the projection check: everything that comes back
+renders correctly on the sphere. No API key is involved. Shelves are cached
+for six hours, searches for fifteen minutes.
 
-The clips are the question. They are hundreds of gigabytes, and a normal
-static host will not take them: GitHub Pages caps files at 100 MB. So the
-page and the videos live in different places, joined by `site/library.json`,
-which carries a full URL for every clip:
+Picking a video resolves it with `yt-dlp`. Above 720p YouTube stores video
+and audio separately, so the page plays a `<video>` and an `<audio>` and
+`avsync.js` keeps them honest: state changes are mirrored as they happen,
+small drift is steered out by trimming the audio's playbackRate a few
+percent (inaudible), a stall's worth of drift is snapped.
 
-```
-python tools/build_library.py --video-base https://<your-bucket>/lazyvr/
-```
-
-Then upload `videos/` to the bucket and deploy `site/` anywhere. The natural
-pairing is **Cloudflare Pages** for the site and **Cloudflare R2** for the
-clips (no egress fees, which matters at 10 GB a clip), but any object store
-with range requests works — S3, B2, GCS. Two things the bucket must do:
-
-- **Serve byte ranges.** A browser seeks with them, and cannot start a
-  multi-gigabyte file without them. Every major object store does.
-- **Send CORS headers.** The video is drawn into WebGL, which the browser
-  only allows for a cross-origin resource that says
-  `Access-Control-Allow-Origin` (your page's origin, or `*`). Without it the
-  clip plays but the sphere stays black. Thumbnails do not need it.
-
-The manifest and thumbnails are committed, so a deploy straight from git
-works; rebuild them with `--video-base` set and commit the result. If the
-build reports a clip whose index sits at the end of the file, `--remux` moves
-it to the front in place, without re-encoding — a browser cannot start such a
-file until it has hunted through the whole thing.
-
-### On a phone
-
-It runs, with two caveats. The face landmarker and the gaze graph take real
-compute; a recent phone manages 15–25 gaze readings a second, and if it cannot
-keep up the second (mirrored) extraction pass is dropped automatically to
-protect the frame rate — the HUD then says `1-pass`. And an 8K AV1 clip is
-beyond most phone decoders; keep 4K variants in the library for them. The
-axes re-gear themselves for a portrait screen (see below).
+The page tells the server what it can decode (`vp9`/`av01`/`avc1`, in its
+own preference order) and the server picks the best track within that —
+tallest first, up to 8K on a desktop, capped at 4K on phones. Seeking works
+because the proxy passes byte ranges straight through to YouTube's servers.
+The resolved URLs expire after ~6 hours; the proxy re-resolves on a 403, and
+a video left paused overnight will ask to be picked again.
 
 ## How it steers
 
@@ -205,11 +207,10 @@ and a refound face has to wait out the commit delay before a turn resumes.
 
 ## The gaze pipeline, in the browser
 
-`gaze.js` is the same pipeline the original Python server ran, moved to where
-the camera is. MediaPipe's FaceLandmarker (`@mediapipe/tasks-vision`) reads
-the same `face_landmarker.task`; onnxruntime-web runs the same
-`gaze_direct.onnx`; `geometry.js` builds the model's inputs the same way.
-Both libraries load from jsDelivr with pinned versions; the model files load
+`gaze.js` runs where the camera is. MediaPipe's FaceLandmarker
+(`@mediapipe/tasks-vision`) reads `face_landmarker.task`; onnxruntime-web
+runs `gaze_direct.onnx`; `geometry.js` builds the model's inputs. Both
+libraries load from jsDelivr with pinned versions; the model files load
 from the site.
 
 Per frame: detect landmarks on the raw camera frame, detect again on a
@@ -231,27 +232,39 @@ eight frames, every intermediate quantity, agreement to 1e-12. And
 `?selftest` runs the graph itself against the exporter's reference outputs;
 in Chrome it agrees to 2e-7, the same figure the Python parity check gave.
 
+### On a phone
+
+It runs, with caveats. The face landmarker and the gaze graph take real
+compute; a recent phone manages 15–25 gaze readings a second, and if it cannot
+keep up the second (mirrored) extraction pass is dropped automatically to
+protect the frame rate — the HUD then says `1-pass`. Streams are capped at 4K
+for coarse-pointer devices because most phone decoders stop there. The axes
+re-gear themselves for a portrait screen (see above).
+
 ## Tests
 
 ```
-node --test "tests/js/*.test.mjs"          # geometry parity, control law, body
-python -m unittest discover -s tests       # the manifest builder
+node --test "tests/js/*.test.mjs"          # geometry parity, control law, body, avsync
+python -m unittest discover -s tests       # the youtube source: clips, format picking
 ```
 
 The control law's tests pin its defining properties — a held gaze keeps
 turning, a brief glance moves nothing, both axes reach the same speed at the
 same share of their travel on any screen shape. The body's pin the neck: exact
 limits on each axis, the ellipse never exceeded from any direction, the sweep
-slowing band by band, release free, sliding a crawl.
+slowing band by band, release free, sliding a crawl. The source's pin what
+counts as a clip and which format each browser is handed; they run without
+yt-dlp or the network.
 
 ## Layout
 
 ```
-site/            the deployable page: index.html, style.css, js/, models/,
-                 library.json and thumbs/ (generated)
-tools/           build_library.py, serve.py, export_fixtures.py
+site/            the page: index.html, style.css, js/, models/
+server/          app.py (aiohttp: static + api + stream proxy), source.py
+                 (search, format picking), requirements.txt
+tools/           export_fixtures.py (regenerates the parity fixtures)
 tests/           JS tests (node --test) and Python tests (unittest), fixtures
-videos/          your clips; ignored by git
+Dockerfile       page + server as one deployable container
 ```
 
 ## Troubleshooting
@@ -260,12 +273,19 @@ videos/          your clips; ignored by git
 browser's site settings and reload. On a page served over plain `http` that
 is not `localhost`, the browser will not even ask.
 
-**The sphere is black but the clip is playing.** The video is cross-origin
-and the bucket is not sending `Access-Control-Allow-Origin`. Add a CORS rule
-that allows your page's origin.
+**A shelf or search says youtube gave nothing back.** Almost always a stale
+`yt-dlp`: `pip install -U yt-dlp` (or rebuild the container) and restart.
+
+**"Would not stream" on every video.** Same cure. If only one video, it is
+usually age-restricted or region-locked — those resolve for no one.
 
 **The video stays black in a background tab.** Chrome does not load media in
 a tab that is not in front. Bring it forward; the page reloads it.
+
+**Sound drifts out of step.** It should be steered back within a second or
+two; a persistent offset means the browser is throttling the audio element —
+check that power saving is not aggressive. `Esc` and re-pick resets both
+clocks.
 
 **The view drifts when you hold still.** Press `C` and hold still while it
 recalibrates. A rate map cannot tolerate a biased centre the way a position
