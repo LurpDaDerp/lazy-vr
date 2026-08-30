@@ -20,12 +20,23 @@
  *     (E - dz) * g   ==   (E/a - dz/a) * g*a
  *
  * Gear them equally instead and the vertical axis feels dead, because the
- * eye runs out of screen long before the map runs out of gain.  The page
- * measures the viewport it is actually filling; this is only what is assumed
- * until it does. */
+ * eye runs out of screen long before the map runs out of gain.
+ *
+ * Size matters as much as shape.  Calibration happens in some viewport, and
+ * the tuning is only true there: shrink the window afterwards and the same
+ * screen-edge glance is fewer degrees of eye travel; go fullscreen and it
+ * is more.  So a finished centring pass remembers the viewport it happened
+ * in, and every deadzone and gain is rescaled by how much each axis has
+ * grown since -- deadzones multiplied by it, gains divided -- which keeps
+ * one thing invariant: the same *fraction* of the view always asks for the
+ * same turn.  At the calibrated size the scales are 1 and this is exactly
+ * the aspect law above. */
 export const DEFAULT_ASPECT = 16 / 9;
 export const MIN_ASPECT = 0.25;
 export const MAX_ASPECT = 6.0;
+// How far a resize may rescale the map: past this, something is lying.
+export const MIN_SCALE = 0.2;
+export const MAX_SCALE = 5.0;
 
 export const DEFAULTS = Object.freeze({
   // Eye eccentricity that commands no motion, in degrees of visual angle.
@@ -60,11 +71,14 @@ export const DEFAULTS = Object.freeze({
   calibrationTolerance: 2.5,
   invertYaw: false,
   invertPitch: false,
-  aspect: DEFAULT_ASPECT,
 });
 
 export function clampAspect(aspect) {
   return Math.min(MAX_ASPECT, Math.max(MIN_ASPECT, aspect));
+}
+
+export function clampScale(scale) {
+  return Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
 }
 
 /* Shaped response for one axis: zero inside the deadzone, then `gain` per
@@ -112,7 +126,12 @@ class Ema {
 export class GazeController {
   constructor(config = {}) {
     this.config = { ...DEFAULTS, ...config };
-    this.aspect = clampAspect(this.config.aspect);
+    // The viewport being filled (any units; only ratios matter), and the
+    // one the last centring pass finished in -- the map's reference size.
+    this.width = 16;
+    this.height = 9;
+    this.calWidth = null;
+    this.calHeight = null;
     this.yawEma = new Ema(this.config.tau);
     this.pitchEma = new Ema(this.config.tau);
     this.centre = [0, 0];
@@ -130,37 +149,70 @@ export class GazeController {
 
   // -- geometry ---------------------------------------------------------
 
+  /* How much each axis of the viewport has grown since the viewer
+   * calibrated.  Before any pass completes the current viewport is its own
+   * reference, which is exactly the plain aspect law. */
+  get scaleX() {
+    return this.calWidth ? clampScale(this.width / this.calWidth) : 1;
+  }
+
+  get scaleY() {
+    return this.calHeight ? clampScale(this.height / this.calHeight) : 1;
+  }
+
+  /* The screen shape the pitch gearing is derived at: the calibrated one. */
+  get referenceAspect() {
+    const width = this.calWidth ?? this.width;
+    const height = this.calHeight ?? this.height;
+    return clampAspect(width / Math.max(height, 1e-6));
+  }
+
+  /* Deadzones grow with the view and gains give the growth straight back,
+   * so the same fraction of the view always asks for the same turn. */
+  get deadzoneYaw() {
+    return this.config.deadzoneYaw * this.scaleX;
+  }
+
+  get rateYaw() {
+    return this.config.rateYaw / this.scaleX;
+  }
+
   get deadzonePitch() {
-    return this.config.deadzonePitch ?? this.config.deadzoneYaw / this.aspect;
+    return (this.config.deadzonePitch ?? this.config.deadzoneYaw / this.referenceAspect) * this.scaleY;
   }
 
   get ratePitch() {
-    return this.config.ratePitch ?? this.config.rateYaw * this.aspect;
+    return (this.config.ratePitch ?? this.config.rateYaw * this.referenceAspect) / this.scaleY;
   }
 
-  /* The shape of the viewport.  Anything unusable leaves it alone: a bad
-   * number here would gear one axis into uselessness, and a page is at
-   * liberty to report nonsense while it is still laying itself out. */
-  setAspect(aspect) {
-    const value = Number(aspect);
-    if (!Number.isFinite(value) || value <= 0) return this.aspect;
-    this.aspect = clampAspect(value);
-    return this.aspect;
+  /* The viewport being filled, in any consistent units.  Anything unusable
+   * leaves it alone: a bad number here would gear an axis into uselessness,
+   * and a page is at liberty to report nonsense while it is still laying
+   * itself out. */
+  setViewport(width, height) {
+    const w = Number(width);
+    const h = Number(height);
+    if (!Number.isFinite(w) || !Number.isFinite(h) || w <= 0 || h <= 0) return;
+    this.width = w;
+    this.height = h;
   }
 
-  /* What the HUD needs to draw the axes, at the current screen shape. */
+  /* What the HUD needs to draw the axes, at the current screen size. */
   get limits() {
     const c = this.config;
+    const deadzoneYaw = this.deadzoneYaw;
+    const deadzonePitch = this.deadzonePitch;
     return {
-      deadzoneYaw: c.deadzoneYaw,
-      deadzonePitch: this.deadzonePitch,
+      deadzoneYaw,
+      deadzonePitch,
       // Where the axis saturates: the eccentricity at which the viewer is
       // already asking for the fastest turn on offer.
-      spanYaw: c.deadzoneYaw + c.maxRateYaw / Math.max(c.rateYaw, 1e-6),
-      spanPitch: this.deadzonePitch + c.maxRatePitch / Math.max(this.ratePitch, 1e-6),
+      spanYaw: deadzoneYaw + c.maxRateYaw / Math.max(this.rateYaw, 1e-6),
+      spanPitch: deadzonePitch + c.maxRatePitch / Math.max(this.ratePitch, 1e-6),
       maxRateYaw: c.maxRateYaw,
       maxRatePitch: c.maxRatePitch,
-      aspect: this.aspect,
+      scaleX: this.scaleX,
+      scaleY: this.scaleY,
     };
   }
 
@@ -212,6 +264,10 @@ export class GazeController {
       this.centre = [meanYaw / this.streak.length, meanPitch / this.streak.length];
       this.calibrated = true;
       this.progress = 1;
+      // The map is only tuned for the screen the viewer calibrated on;
+      // remember it, so a later resize rescales instead of mis-aiming.
+      this.calWidth = this.width;
+      this.calHeight = this.height;
     }
   }
 
@@ -249,7 +305,7 @@ export class GazeController {
     // The onset gate: eccentricity has to stay out of the deadzone for a
     // moment before anything moves.  Once it has, the gate stays open until
     // the eyes come back inside, so it cannot re-trigger mid-turn.
-    const outside = Math.abs(yawError) > c.deadzoneYaw || Math.abs(pitchError) > this.deadzonePitch;
+    const outside = Math.abs(yawError) > this.deadzoneYaw || Math.abs(pitchError) > this.deadzonePitch;
     if (!outside) {
       this.release();
     } else {
@@ -260,7 +316,7 @@ export class GazeController {
       return this.still(outside ? "committing" : "holding", yawError, pitchError, sample.confidence);
     }
 
-    let yawRate = responseAngle(yawError, c.deadzoneYaw, c.rateYaw, c.maxRateYaw, c.expo);
+    let yawRate = responseAngle(yawError, this.deadzoneYaw, this.rateYaw, c.maxRateYaw, c.expo);
     let pitchRate = responseAngle(pitchError, this.deadzonePitch, this.ratePitch, c.maxRatePitch, c.expo);
     if (c.invertYaw) yawRate = -yawRate;
     if (c.invertPitch) pitchRate = -pitchRate;

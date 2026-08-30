@@ -173,6 +173,17 @@ re-reads it on every resize and on fullscreen. An ultrawide, a 4:3 monitor and
 a phone held upright each get their own gearing, and on a screen taller than
 it is wide pitch gears *slower* than yaw, which is right.
 
+Size matters as much as shape. Calibration is only true for the viewport it
+happened in: go fullscreen afterwards and the same screen-edge glance is
+*more* degrees of eye travel than the map was tuned for. So a finished
+centring pass remembers its viewport, and every deadzone and gain rescales
+by how much each axis has grown since — deadzones multiplied by it, gains
+divided — keeping one thing invariant: the same **fraction** of the view
+always asks for the same turn. At the calibrated size the scales are 1 and
+nothing changes. (A moved window can still bias the calibrated *centre* —
+the dot physically sits somewhere else on the monitor — which the deadzone
+absorbs when small; `C` re-centres in one hold if it is not.)
+
 | screen | pitch deadzone | pitch rate |
 |---|---|---|
 | 4:3 | 2.25° | 12.8 |

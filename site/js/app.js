@@ -29,7 +29,7 @@ const el = {
   marks: $("compassmarks"), north: $("compassnorth"), dot: $("fixation"), toast: $("toast"),
   home: $("home"), results: $("results"), resultline: $("resultline"), backhome: $("backhome"),
   searchForm: $("search"), query: $("query"),
-  grid: $("grid"), notice: $("libnotice"), count: $("libcount"), empty: $("libempty"),
+  grid: $("grid"), notice: $("libnotice"), empty: $("libempty"),
   touchbar: $("touchbar"),
 };
 
@@ -88,7 +88,8 @@ function limitsFor(control) {
 /* ---------- the loop ---------- */
 
 let last = performance.now();
-let reportedAspect = 0;
+let reportedW = 0;
+let reportedH = 0;
 
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
@@ -103,13 +104,18 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 
-/* The gearing between the axes follows the shape of the screen the eyes are
- * crossing, which changes with a resize or fullscreen. */
+/* The gearing follows the viewport the eyes are crossing -- its shape and
+ * its size, which change with a resize or fullscreen.  The controller
+ * remembers the viewport the viewer calibrated in and rescales the map
+ * against it, so a windowed calibration stays correct in fullscreen. */
 function reportScreen() {
-  const aspect = el.canvas.clientWidth / Math.max(1, el.canvas.clientHeight);
-  if (!isFinite(aspect) || aspect <= 0 || Math.abs(aspect - reportedAspect) < 0.02) return;
-  reportedAspect = aspect;
-  controller.setAspect(aspect);
+  const width = el.canvas.clientWidth;
+  const height = el.canvas.clientHeight;
+  if (width < 2 || height < 2) return;
+  if (Math.abs(width - reportedW) < 2 && Math.abs(height - reportedH) < 2) return;
+  reportedW = width;
+  reportedH = height;
+  controller.setViewport(width, height);
   request = { ...request, ...limitsFor(controller) };
 }
 
@@ -213,13 +219,9 @@ function drawStick(out) {
 /* ---------- the gaze engine ---------- */
 
 function showStatus(text) {
-  if (libraryLine && (engine === "loading" || engine === "ready")) {
-    el.count.textContent = `${libraryLine}  ·  ${text.toLowerCase()}`;
-  }
   if (!browsing && !calibrated) el.overlaytext.textContent = text;
 }
 
-let libraryLine = "";
 let loading = null;
 
 /* Loading the models takes a few seconds and needs no permission, so it
@@ -228,7 +230,7 @@ let loading = null;
 function ensureEngine() {
   if (!loading) {
     engine = "loading";
-    loading = tracker.load().then(() => { engine = "ready"; if (libraryLine) el.count.textContent = libraryLine; })
+    loading = tracker.load().then(() => { engine = "ready"; })
       .catch((error) => { engine = "failed"; loading = null; throw error; });
   }
   return loading;
@@ -250,14 +252,11 @@ async function loadHome() {
   try {
     data = await fetchHome();
   } catch (error) {
-    el.count.textContent = "Cannot reach the server";
     el.empty.hidden = false;
     return;
   }
   const total = renderShelves(el.home, data.categories, selectClip);
   el.empty.hidden = total > 0;
-  libraryLine = total ? `youtube 360 · ${total} videos on the shelves` : "";
-  el.count.textContent = total ? libraryLine : "youtube gave nothing back";
   const dead = data.categories.filter((c) => c.error);
   if (dead.length && total) {
     notify(`Some shelves came back empty (${dead.map((c) => c.title).join(", ")}): ${dead[0].error}`);

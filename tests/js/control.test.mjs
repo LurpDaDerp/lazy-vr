@@ -4,7 +4,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  DEFAULT_ASPECT, MAX_ASPECT, MIN_ASPECT, GazeController, responseAngle,
+  DEFAULT_ASPECT, MAX_SCALE, MIN_SCALE, GazeController, responseAngle,
 } from "../../site/js/control.js";
 
 const near = (a, b, tol, msg) => assert.ok(Math.abs(a - b) <= tol, `${msg ?? ""} ${a} vs ${b}`);
@@ -239,40 +239,108 @@ test("smoothing: frame-rate independent, and a long gap snaps", () => {
   near(make(0.05).update(tracked(20, 0, 30)).yawError, 20, 1e-6);
 });
 
-// -- the screen ----------------------------------------------------------
+// -- the screen: shape --------------------------------------------------
 
-test("aspect: a wider screen gears pitch harder, a portrait one the other way", () => {
-  const wide = new GazeController(config({ deadzonePitch: null, ratePitch: null, aspect: 21 / 9 }));
-  const normal = new GazeController(config({ deadzonePitch: null, ratePitch: null }));
-  const portrait = new GazeController(config({ deadzonePitch: null, ratePitch: null, aspect: 9 / 16 }));
+function viewport(w, h, over = {}) {
+  const c = new GazeController(config({ deadzonePitch: null, ratePitch: null, ...over }));
+  c.setViewport(w, h);
+  return c;
+}
+
+test("shape: a wider screen gears pitch harder, a portrait one the other way", () => {
+  const wide = viewport(2100, 900);
+  const normal = viewport(1600, 900);
+  const portrait = viewport(900, 1600);
   assert.ok(wide.ratePitch > normal.ratePitch && wide.deadzonePitch < normal.deadzonePitch);
   assert.ok(portrait.ratePitch < portrait.config.rateYaw && portrait.deadzonePitch > portrait.config.deadzoneYaw);
 });
 
-test("aspect: the same-speed-at-the-same-share property holds on any screen", () => {
+test("shape: the same-speed-at-the-same-share property holds on any screen", () => {
   for (const aspect of [1, 4 / 3, 16 / 10, 16 / 9, 21 / 9, 32 / 9, 9 / 16]) {
-    const c = new GazeController(config({ deadzonePitch: null, ratePitch: null, maxRateYaw: 1e6, maxRatePitch: 1e6 }));
-    c.setAspect(aspect);
+    const c = viewport(aspect * 1000, 1000, { maxRateYaw: 1e6, maxRatePitch: 1e6 });
     const t = calibrated(c);
     near(holdGaze(c, 15, 0, t, 0.4).yawRate, holdGaze(c, 0, 15 / aspect, t, 0.4).pitchRate, 1e-9, `aspect ${aspect}`);
   }
 });
 
-test("aspect: nonsense reports leave the shape alone, absurd ones are folded back", () => {
-  const c = new GazeController(config());
-  const before = c.aspect;
-  for (const bad of [0, -2, NaN, Infinity, null, "wide", ""]) { c.setAspect(bad); near(c.aspect, before, 1e-12); }
-  assert.ok(c.setAspect(500) <= MAX_ASPECT);
-  assert.ok(c.setAspect(0.001) >= MIN_ASPECT);
-  near(c.setAspect("1.5"), 1.5, 1e-12);
+test("shape: the limits the HUD draws follow the screen", () => {
+  const c = viewport(1600, 900);
+  const narrow = c.limits.deadzonePitch;
+  c.setViewport(3200, 900);
+  assert.ok(c.limits.deadzonePitch < narrow);
 });
 
-test("aspect: the limits the HUD draws follow the screen", () => {
-  const c = new GazeController(config({ deadzonePitch: null, ratePitch: null }));
-  const narrow = c.limits.deadzonePitch;
-  c.setAspect(32 / 9);
-  assert.ok(c.limits.deadzonePitch < narrow);
-  near(c.limits.aspect, 32 / 9, 1e-12);
+// -- the screen: size ----------------------------------------------------
+// Calibration remembers the viewport it happened in; a resize rescales the
+// map against it, so a windowed calibration stays correct in fullscreen.
+
+function calibratedAt(w, h, over = {}) {
+  const c = viewport(w, h, over);
+  return { c, t: calibrated(c) };
+}
+
+test("scale: at the calibrated size the map is exactly the aspect law", () => {
+  const { c, t } = calibratedAt(1600, 900);
+  near(c.deadzoneYaw, c.config.deadzoneYaw, 1e-12);
+  near(c.deadzonePitch, c.config.deadzoneYaw / (16 / 9), 1e-12);
+  near(holdGaze(c, 15, 0, t, 0.4).yawRate, (15 - 6) * 9, 1e-9);
+  near(c.calWidth, 1600, 1e-12);
+  near(c.calHeight, 900, 1e-12);
+});
+
+test("scale: the same fraction of the view asks for the same turn after a resize", () => {
+  // Calibrate windowed, then go 'fullscreen' at double the size.  An error
+  // twice as large -- the same fraction of the doubled view -- must ask
+  // for exactly what the original error asked for before.
+  const { c, t } = calibratedAt(800, 450, { maxRateYaw: 1e6, maxRatePitch: 1e6 });
+  const yawBefore = holdGaze(c, 15, 0, t, 0.4).yawRate;
+  const pitchBefore = holdGaze(c, 0, 10, t + 0.5, 0.4).pitchRate;
+  c.setViewport(1600, 900);
+  near(holdGaze(c, 30, 0, t + 1.0, 0.4).yawRate, yawBefore, 1e-9);
+  near(holdGaze(c, 0, 20, t + 1.5, 0.4).pitchRate, pitchBefore, 1e-9);
+});
+
+test("scale: a grown view grows the deadzone with it", () => {
+  const { c, t } = calibratedAt(800, 450);
+  assert.ok(holdGaze(c, 8, 0, t, 0.4).yawRate > 0);
+  c.setViewport(1600, 900);  // the 6-degree deadzone is now 12
+  const after = holdGaze(c, 8, 0, t + 0.5, 0.4);
+  assert.equal(after.yawRate, 0);
+  assert.equal(after.state, "holding");
+});
+
+test("scale: each axis rescales by its own growth", () => {
+  const { c, t } = calibratedAt(1600, 900, { maxRateYaw: 1e6 });
+  const before = holdGaze(c, 15, 0, t, 0.4).yawRate;
+  c.setViewport(800, 900);  // width halves, height stays
+  near(holdGaze(c, 7.5, 0, t + 0.5, 0.4).yawRate, before, 1e-9);
+  near(c.deadzonePitch, c.config.deadzoneYaw / (16 / 9), 1e-12);
+});
+
+test("scale: recalibrating in the new viewport makes it the reference", () => {
+  const { c, t } = calibratedAt(800, 450);
+  c.setViewport(1600, 900);
+  c.recalibrate();
+  calibrated(c, 0, 0, t + 1);
+  near(c.deadzoneYaw, c.config.deadzoneYaw, 1e-12);
+  near(c.calWidth, 1600, 1e-12);
+});
+
+test("scale: an absurd resize is folded back into range", () => {
+  const { c } = calibratedAt(1000, 1000);
+  c.setViewport(100000, 1000);
+  near(c.deadzoneYaw, c.config.deadzoneYaw * MAX_SCALE, 1e-12);
+  c.setViewport(1, 1000);
+  near(c.deadzoneYaw, c.config.deadzoneYaw * MIN_SCALE, 1e-12);
+});
+
+test("scale: nonsense viewport reports change nothing", () => {
+  const { c } = calibratedAt(1600, 900);
+  const deadzone = c.deadzoneYaw;
+  for (const [w, h] of [[0, 900], [-5, 900], [NaN, 900], [1600, 0], [Infinity, 900], ["wide", 900]]) {
+    c.setViewport(w, h);
+    near(c.deadzoneYaw, deadzone, 1e-12);
+  }
 });
 
 test("defaults: the onset gate opens on one sample at any plausible frame rate", () => {
