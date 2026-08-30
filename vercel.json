@@ -1,13 +1,9 @@
 {
   "version": 2,
-  "builds": [
-    { "src": "api/index.py", "use": "@vercel/python" },
-    { "src": "site/**", "use": "@vercel/static" }
-  ],
+  "builds": [{ "src": "api/index.py", "use": "@vercel/python" }],
   "routes": [
     { "src": "/api/(.*)", "dest": "/api/index.py?vkind=api&vpath=$1" },
     { "src": "/media/(.*)", "dest": "/api/index.py?vkind=media&vpath=$1" },
-    { "src": "/", "dest": "/site/index.html" },
-    { "src": "/(.*)", "dest": "/site/$1" }
+    { "src": "/(.*)", "dest": "/api/index.py" }
   ]
 }
