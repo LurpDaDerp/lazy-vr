@@ -165,8 +165,13 @@ small drift is steered out by trimming the audio's playbackRate a few
 percent (inaudible), a stall's worth of drift is snapped.
 
 The page tells the server what it can decode (`vp9`/`av01`/`avc1`, in its
-own preference order) and the server picks the best track within that —
-tallest first, up to 8K on a desktop, capped at 4K on phones. Seeking works
+own preference order) and the server picks the best track within that,
+capped at what the **display deserves**: the screen's full physical pixels
+(fullscreen-sized, not window-sized) matched to the tier ladder, so a
+1440p monitor gets the 1440p track rather than an 8K decode it cannot
+show. And the renderer votes too — if the frame loop sags for a few
+seconds mid-play, the cap steps down one tier at a time (never below
+1080p) until the machine keeps up, on either engine. Seeking works
 because the proxy passes byte ranges straight through to YouTube's servers.
 The resolved URLs expire after ~6 hours; the proxy re-resolves on a 403, and
 a video left paused overnight will ask to be picked again.
@@ -177,8 +182,8 @@ for that video, steered by the same gaze pipeline through the player's
 spherical API. Playback then always works, at youtube's price: its
 presentation, ads included when a clip carries them (a viewer's own youtube
 premium applies), and no motion blur. The player is pinned to the best
-quality tier the upload offers — re-pinned after every stall — rather than
-left to its own adaptive guessing. A toast says which engine you got.
+tier the display deserves — re-pinned after every stall — rather than left
+to its own adaptive guessing. A toast says which engine you got.
 
 ## How it steers
 

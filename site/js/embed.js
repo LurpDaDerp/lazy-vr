@@ -11,6 +11,8 @@
  * body.view in, camera angles out, every frame the view moved.
  */
 
+import { bestAllowedLevel } from "./quality.js";
+
 const DEG = Math.PI / 180;
 
 export const EMBED_FOV = 75;
@@ -83,7 +85,14 @@ export class EmbedPlayer {
     this.player = null;
     this.sent = null;
     this.handlers = {};
+    this.maxHeight = Infinity;
     window.addEventListener("resize", () => this.fit());
+  }
+
+  /* The quality ceiling, in tier height; forceBest stays under it. */
+  capHeight(maxHeight) {
+    this.maxHeight = maxHeight || Infinity;
+    this.forceBest();
   }
 
   /* Create the player on one video.  Resolves when it is ready to obey;
@@ -155,16 +164,15 @@ export class EmbedPlayer {
     iframe.style.transform = `scale(${scale})`;
   }
 
-  /* Pin the player to the best tier the upload offers.  The documented
+  /* Pin the player to the best tier the display deserves.  The documented
    * quality API has been a no-op for years, but the range form still works
    * in current players; asserted on every PLAYING, so the downshift after
    * a stall is undone as soon as playback resumes. */
   forceBest() {
     const player = this.player;
     if (!player || typeof player.getAvailableQualityLevels !== "function") return;
-    const levels = player.getAvailableQualityLevels() || [];
-    if (!levels.length) return;
-    const best = levels[0];  // youtube lists highest first
+    const best = bestAllowedLevel(player.getAvailableQualityLevels(), this.maxHeight);
+    if (!best) return;
     try {
       if (typeof player.setPlaybackQualityRange === "function") {
         player.setPlaybackQualityRange(best, best);

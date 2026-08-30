@@ -16,6 +16,7 @@ import { GazeController } from "./control.js";
 import { EmbedPlayer } from "./embed.js";
 import { GazeTracker } from "./gaze.js";
 import { fetchHome, fetchSearch, fetchStreams, renderResults, renderShelves } from "./library.js";
+import { screenTier, tierBelow } from "./quality.js";
 import { Renderer } from "./render.js";
 
 const DEG = Math.PI / 180;
@@ -56,7 +57,10 @@ const prefs = (() => {
   if (probe.canPlayType('video/mp4; codecs="avc1.640033"')) codecs.push("avc1");
   return {
     codecs: codecs.join(",") || "avc1",
-    max: matchMedia("(pointer: coarse)").matches ? 2160 : 4320,
+    // The best tier that still fits the *display* -- its full physical
+    // pixels, fullscreen-sized, not the window.  A 1440p monitor gets the
+    // 1440p track, never an 8K decode it cannot show.
+    max: screenTier(screen.width, screen.height, window.devicePixelRatio || 1),
   };
 })();
 
@@ -82,6 +86,10 @@ let pendingPlay = false;
 let retryAction = "library";
 let qualityLine = null;
 let engineMode = "stream";  // stream (raw, ad-free) | embed (the fallback)
+let currentMax = 0;         // the quality cap in force for this video
+let frameMs = 16;           // smoothed frame time: the renderer's own vote
+let slowSince = 0;
+let lastDropAt = 0;
 
 function limitsFor(control) {
   const limits = control.limits;
@@ -99,6 +107,8 @@ let reportedCY = Infinity;
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
+  frameMs += 0.05 * (Math.min(dt * 1000, 100) - frameMs);
+  considerDownshift(now);
   if (renderer) {
     renderer.resize();
     reportScreen();
@@ -143,6 +153,54 @@ function considerRecalibration() {
     if (Math.abs(scaleX - 1) < RECAL_SCALE && Math.abs(scaleY - 1) < RECAL_SCALE) return;
     runCalibration("The screen changed — look at the dot.");
   }, RECAL_SETTLE_MS);
+}
+
+/* The renderer's own vote on quality.  A sustained sag in frame time means
+ * the machine cannot decode and draw what it was given -- an 8K stream on
+ * a software decoder, usually -- so the cap steps down one tier at a time,
+ * at most once every ten seconds, never below 1080. */
+const SLOW_MS = 28;
+const SLOW_FOR_MS = 3000;
+const DROP_COOLDOWN_MS = 10000;
+
+function considerDownshift(now) {
+  if (browsing || !started || !calibrated || frameMs < SLOW_MS) {
+    slowSince = 0;
+    return;
+  }
+  if (!slowSince) {
+    slowSince = now;
+    return;
+  }
+  if (now - slowSince < SLOW_FOR_MS || now - lastDropAt < DROP_COOLDOWN_MS) return;
+  const lower = tierBelow(currentMax);
+  if (!lower || lower < 1080) return;
+  lastDropAt = now;
+  slowSince = 0;
+  currentMax = lower;
+  toast(`Struggling to keep up — capping at ${lower}p`);
+  applyQualityCap(lower);
+}
+
+async function applyQualityCap(maxHeight) {
+  if (engineMode === "embed") {
+    embedPlayer.capHeight(maxHeight);
+    return;
+  }
+  if (!playing) return;
+  const my = session;
+  const at = el.video.currentTime;
+  const wasPaused = el.video.paused;
+  try {
+    const streams = await fetchStreams(playing.id, { codecs: prefs.codecs, max: maxHeight });
+    if (session !== my) return;
+    sync.set(streams.video.src, streams.audio && streams.audio.src);
+    el.video.addEventListener("loadedmetadata", () => {
+      if (session !== my) return;
+      el.video.currentTime = at;
+      if (!wasPaused) el.video.play().catch(() => {});
+    }, { once: true });
+  } catch { /* the swap failed; keep what is playing */ }
 }
 
 /* Where the viewport's centre physically sits on the monitor, in CSS px,
@@ -370,6 +428,9 @@ async function selectClip(clip) {
   retryAction = "library";
   engineMode = "stream";
   document.body.classList.remove("embedded");
+  currentMax = prefs.max;
+  frameMs = 16;
+  slowSince = 0;
   el.retry.textContent = "Try again";
   el.notice.hidden = true;
   document.body.classList.remove("browsing");
@@ -446,6 +507,7 @@ async function embedFallback(clip, my, why) {
       },
     });
     if (session !== my) { embedPlayer.close(); return; }
+    embedPlayer.capHeight(currentMax);
     embedPlayer.pause();  // hold for calibration, like the stream path
     qualityLine = "youtube player fallback — ads possible";
     streamsReady = true;
