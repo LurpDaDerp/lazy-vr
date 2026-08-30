@@ -1,0 +1,9 @@
+.venv
+videos
+tests
+node_modules
+Dockerfile
+fly.toml
+render.yaml
+*.mp4
+*.webm

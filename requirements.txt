@@ -1,0 +1,3 @@
+# What the Vercel serverless function needs (the container reads
+# server/requirements.txt instead; aiohttp is not used on Vercel).
+yt-dlp>=2026.8.19

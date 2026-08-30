@@ -57,6 +57,13 @@ camera needs:
   8360:8360 lazyvr` behind Caddy or nginx for TLS — or `tailscale serve
   --bg 8360` for a tailnet-only `https://…ts.net` URL with no reverse proxy
   at all.
+- **Vercel** — `vercel` deploys a preview, `vercel --prod` the real thing.
+  There is no long-lived server there, so `api/index.py` (wired by
+  `vercel.json`) re-implements the API and relay as one serverless
+  function: shelves and search work the same, and the media relay serves
+  bounded chunks that the `<video>` element's own range requests string
+  together. Serverless caveats: cold starts re-resolve streams, and
+  YouTube's datacenter-IP challenge (below) applies with full force.
 
 Three hosting realities:
 
