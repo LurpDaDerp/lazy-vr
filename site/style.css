@@ -308,23 +308,6 @@ body:not(.browsing) #library { opacity: 0; pointer-events: none; }
 
 .wordmark span { color: var(--accent); }
 
-#libintro {
-  margin: 10px 0 0;
-  max-width: 46ch;
-  color: var(--dim);
-  font-size: 14.5px;
-  line-height: 1.6;
-}
-
-#libcount {
-  margin-top: 14px;
-  color: var(--dim);
-  font-size: 12px;
-  letter-spacing: .04em;
-  text-transform: uppercase;
-  font-variant-numeric: tabular-nums;
-}
-
 .mono { font-family: ui-monospace, "SF Mono", "Cascadia Mono", Consolas, monospace; }
 
 #grid {
@@ -653,9 +636,6 @@ body.browsing #touchbar { display: none; }
   align-items: center;
   gap: 14px 32px;
 }
-
-#libintro { flex-basis: 100%; margin: 0; }
-#libcount { flex-basis: 100%; margin-top: 0; }
 
 #search {
   display: flex;
