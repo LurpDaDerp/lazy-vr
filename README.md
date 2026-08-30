@@ -1,12 +1,13 @@
 # gaze360 — steer a 360 video with your eyes
 
-Play an equirectangular 360 video and move the camera by looking. Look left and
-the view turns left; look back at the centre of the screen and it comes back to
-where it started. No mouse, no headset, no per-user training.
+Pick a clip from a library of equirectangular 360 video and move the camera by
+looking. Look left and the view turns left; look back at the centre of the
+screen and it comes back to where it started. No mouse, no headset, no per-user
+training.
 
 Gaze comes from the `gaze-direct` model: 478 MediaPipe landmarks into one ONNX
 graph, out comes a camera-frame gaze vector. No head-pose solver and no
-personal calibration beyond a two-second centring pass.
+personal calibration beyond one short centring pass per visit.
 
 ## Start
 
@@ -18,93 +19,209 @@ The first launch creates `.venv` and installs the two packages. It then opens
 your webcam, serves the player on `http://127.0.0.1:8360/`, and opens a browser
 tab.
 
-Click **Begin** and a green dot appears in the middle of the screen. Stare at
-it: three seconds of countdown to let your eyes settle on it, then about two
-seconds of sampling while you hold still. That pass is what teaches the player
-where your neutral gaze sits — everything afterwards is measured from it. Press
-`C` any time to run it again.
+Put equirectangular `.mp4` or `.webm` files in `videos\` and they appear on the
+start screen as a scrollable grid. Clips that land while the page is open turn
+up on their own, so a folder that is still downloading fills in as it goes.
+
+Click a clip and a green dot appears in the middle of the screen. Stare at it:
+three seconds of countdown to let your eyes settle, then hold still until the
+bar fills. Look away and it starts over. That pass teaches the player where
+your neutral gaze sits — everything afterwards is measured from it — and it
+only happens once a visit; `C` runs it again whenever you shift in your seat.
+When the clip ends the grid comes back; `Esc` returns to it sooner.
 
 ```powershell
-.\run.bat --video "D:\clips\my360.mp4"   # any equirectangular mp4
+.\run.bat --videos "D:\clips"            # browse a different folder
+.\run.bat --video "D:\clips\my360.mp4"   # skip the library, play one file
+.\run.bat --check                        # will every clip play? no camera
 .\run.bat --self-test                    # validate the model bundle, no camera
 .\run.bat --no-browser                   # do not open a tab
 ```
 
-`--video` defaults to `..\gaze-demo\testvid.mp4`. Nothing is ever copied or
-modified; the file is read where it lies.
+`--videos` defaults to `videos\`. Nothing is ever copied or modified; every
+file is read where it lies.
+
+### Calibration
+
+Where your eyes sit relative to your webcam is a real per-setup bias, and the
+centring pass is what removes it. It is a **fixation test**, not a countdown:
+after three seconds to settle, you have to hold one spot continuously. Wander
+further than `--calibration-tolerance` and the bar goes back to zero, the dot
+flashes amber, and the screen says you looked away. It ends when you have
+genuinely held still for `--calibration-hold`, so it cannot finish on a gaze
+that was still travelling.
+
+It runs **once per visit**. Where your eyes sit does not change between clips,
+so the second clip starts playing immediately. `C` forces a fresh pass whenever
+you shift in your seat.
+
+`R` is the other one, and does something different: it turns the view back to
+where the clip started. `C` moves the reference the view is measured from; `R`
+moves the view. It sweeps rather than cuts — the body still has mass — and any
+steering of your own cancels it, so there is no sweep to sit through if you
+change your mind.
+
+### Thumbnails
+
+Each card's picture is the horizon band of the sphere, unrolled: ffmpeg takes
+one frame a fifth of the way in, keeps the middle half of it and leaves it
+equirectangular. The poles of a 360 frame are stretched to mush and carry
+nothing, while that band is where the clip actually lives — and keeping it
+unrolled is what lets the card pan across the whole turn when you hover it.
+
+They are built in the background into `.thumbs\`, named after each file's size
+and modification time, so the cost is paid once and a re-download rebuilds its
+own picture. Without ffmpeg on `PATH` the library still works; the cards simply
+have no picture and no duration. Delete `.thumbs\` to force a rebuild.
 
 | Key | |
 |---|---|
+| `R` | recentre — turn the view back to where the clip started |
 | `C` | recalibrate — stare at the green dot |
 | `Space` | play / pause |
 | `F` | fullscreen |
 | `H` | hide the overlay |
 | `←` `→` | seek five seconds |
+| `Esc` | back to the library |
 
 ## How it steers
 
-Absolute mapping. Your gaze offset from centre sets the view *angle*, so
-looking back to the middle of the screen brings the view back to where it
-started — the view is an extension of where you are looking, not a joystick
-you have to re-centre.
+Rate control. Your eyes are a stick, not a pointer: how far off centre you
+look sets how fast the view *turns*, and it stays where you left it. Hold your
+eyes to the left and it keeps sweeping left; look back to the middle and it
+stops, exactly there. Nothing returns on its own, so anywhere is reachable —
+including all the way around — at the price of having to steer back.
 
 ```
 e     = smoothed gaze angle − calibrated centre
-view  = sign(e) · gain · (|e| − deadzone)      clamped to the axis limit
+rate  = sign(e) · gain · (|e| − deadzone)      clamped to the axis limit
 ```
 
-The two axes are independent and deliberately not equally geared. A viewer
-sweeps their eyes much further horizontally than vertically, so an even gain
-leaves the vertical axis feeling dead: pitch gets nearly twice the gain and
-half the deadzone, and eight degrees of upward glance is worth a 49° look up.
+Python decides only that much: the speed you are asking for. Where the view
+actually points is worked out in the browser, at display rate, because what
+carries the request out is meant to read as a head rather than a filter.
+
+### Why pitch is geared harder than yaw
+
+A screen `a` times wider than it is tall gives your eyes `a` times as much
+room to travel sideways as up and down. For both axes to reach the same speed
+at the same *fraction* of the travel available to them, pitch takes the aspect
+as gain and gives it straight back on the deadzone:
+
+```
+(E − dz) · g   ≡   (E/a − dz/a) · g·a
+```
+
+Gear them equally instead and the vertical axis feels dead, because the eye
+runs out of screen long before the map runs out of gain.
+
+**`a` is measured, not assumed.** The page reports the viewport it is actually
+filling and re-reports whenever that changes, so an ultrawide, a 4:3 monitor
+and a rotated tablet each get their own gearing — and going fullscreen
+re-gears too, because swallowing the browser chrome changes the shape of the
+picture your eyes are crossing. On a screen taller than it is wide the
+relationship simply inverts and pitch gears *slower* than yaw, which is right:
+there is more room to look up than sideways.
+
+| screen | pitch deadzone | pitch rate |
+|---|---|---|
+| 4:3 | 2.25° | 12.8 |
+| 16:9 | 1.69° | 17.1 |
+| 21:9 | 1.29° | 22.4 |
+| 9:16 (portrait) | 5.33° | 5.4 |
+
+The pitch *ceiling* is the one thing not scaled: that is a comfort cap,
+vertical motion being the more provocative axis with only 180° end to end.
 
 | Flag | Default | |
 |---|---|---|
-| `--gain-yaw` | 4 | degrees of view per degree of gaze, left/right |
-| `--gain-pitch` | 7 | degrees of view per degree of gaze, up/down |
-| `--deadzone-yaw` | 2° | gaze error that commands no motion, left/right |
-| `--deadzone-pitch` | 1° | gaze error that commands no motion, up/down |
-| `--max-yaw` | 180° | furthest the view may turn |
-| `--max-pitch` | 85° | furthest the view may look up or down |
-| `--smooth-time` | 0.13 s | how long the view takes to reach a new target |
+| `--rate-yaw` | 9.6 | deg/s of turn per degree of gaze, left/right |
+| `--rate-pitch` | from the screen | same, up/down — `--rate-yaw` × aspect |
+| `--deadzone-yaw` | 3° | gaze eccentricity that commands no motion |
+| `--deadzone-pitch` | from the screen | same, up/down — `--deadzone-yaw` ÷ aspect |
+| `--max-rate-yaw` | 128°/s | fastest the view may sweep |
+| `--max-rate-pitch` | 96°/s | same, up/down; a comfort cap |
+| `--onset` | 0.03 s | off centre before the view commits to a turn |
+| `--calibration-hold` | 1.4 s | continuous fixation that finishes a pass |
+| `--calibration-tolerance` | 2.5° | wander that restarts one |
 | `--expo` | 1 | response curve; 1 is proportional |
-| `--tau` | 0.03 s | gaze smoothing, before the easing |
+| `--tau` | 0.02 s | gaze smoothing, before the body |
 
-Turn the gains up for more reach per glance, `--smooth-time` down for a
-snappier feel and up for a calmer one.
+The deadzone is set in degrees of visual angle, not screen fraction: people do
+not recruit the head for gaze shifts below roughly 18°, so that is the
+physiological ceiling and 3° is walked a long way down from it — a viewer
+sitting at a screen cannot turn their real head to help, and the onset gate is
+doing the work of rejecting glances that the deadzone would otherwise have to.
 
-### Smoothness and lag
+### The body
 
-Gaze arrives at 30 Hz; the display runs at 60 or more. The browser eases
-towards each new target with a **critically damped spring**, which is what
-turns stepped readings into continuous motion — critically damped meaning it
-converges without ever overshooting or oscillating, however hard the target
-jumps. Both axes ease independently, so a diagonal glance traces a straight
-diagonal.
+The camera is not a filter on your gaze, it is a limb obeying it, and four
+things do nearly all the work of selling that.
+
+**Acceleration is limited, not velocity.** A first-order smoother has its
+maximum acceleration the instant motion begins and then a decaying tail; a
+real head turn is the other way round, with a bell-shaped velocity profile.
+Clamping acceleration at 380°/s² gives a linear ramp while the clamp bites and
+an exponential settle once it does not — trapezoid out, exponential in. The
+stiffness is asymmetric (6 up, 10 down) because heads stop faster than they
+start, which is also what stops the view feeling like it coasts past where you
+wanted it. Deliberately no overshoot, tempting though a real head's is: your
+own gaze is already a feedback element in this loop, and underdamped machine
+dynamics plus a human chasing them is how you get a view that hunts.
+
+**The turn starts ~33 ms late.** Respond the instant the gaze crosses the
+deadzone and the world feels welded to your eyeball; add a lag and it reads as
+a separate limb obeying you. In a natural gaze shift the eye saccades and the
+head follows 60–120 ms behind — this is deliberately under that, tuned for
+responsiveness on the grounds that a viewer sitting at a screen cannot turn
+their real head to help anyway. It is a commit gate rather than a delay line,
+so it costs nothing once moving, and it still rejects a single-sample noise
+spike.
+
+The delay it buys moves in whole gaze samples, because the gate can only open
+when a reading arrives. At ~30 Hz that means one sample (~33 ms) or two
+(~66 ms), with nothing in between, so `--onset` wants to sit comfortably below
+one step rather than near it: at the 30.5 FPS this webcam returns, 0.033 would
+need two samples and quietly cost twice what it reads as.
+
+**There is a torso.** The neck is free within a 55° cone; past it the
+shoulders start coming round and turning further costs effort, so the sweep
+slows by up to 45%. Yaw still wraps freely, but sustained turning now has the
+two-phase rhythm of a real body — head leads, torso catches up, head unwinds —
+and settles at a fixed twist of about 79° and 82°/s rather than winding up.
+
+**It never sits perfectly still.** Two octaves of value noise, 0.25° of yaw
+and 0.15° of pitch at 0.15–0.4 Hz, faded out the moment the view is genuinely
+turning. A perfectly static camera is the plainest tell that there is no body
+behind it.
+
+Two smaller ones: a roll of up to 2.5° driven by yaw *acceleration*, so the
+head leans into the two ends of a sweep rather than throughout it; and five
+taps of directional motion blur along the yaw axis, which besides being what a
+turning head sees also hides the judder a 30 Hz gaze pipeline puts into a fast
+rotation.
+
+None of these are things a viewer can name. They just stop it feeling like a
+tripod.
+
+### Latency
 
 Latency is dominated by things with hard floors: the webcam delivers 30.5
 frames per second whatever mode is requested, and detection plus inference
 costs about 14 ms. What is left to spend is the smoothing, so `--tau` is short
-(30 ms) and the easing does the rest of the work where it can run at display
+(30 ms) and the body does the rest of the work where it can run at display
 rate rather than gaze rate.
 
-Absolute mapping cannot show you what is directly behind you — reaching 180°
-would take a 47° glance. That is the price of having the view come home when
-you look back at the centre, which is the behaviour worth having.
+Two details that matter more than they sound:
 
-Three details that matter more than they sound:
-
-- **Losing your face holds the view.** A blink or a hand across the face must
-  not throw the view back to centre, so the last target is kept until tracking
-  returns. An absolute target cannot run away, unlike a pan speed.
-- **Calibration eases home.** Pressing `C` returns the view to the origin
-  while you are being asked to look at the centre, rather than snapping when
-  the countdown ends.
-- **Calibration counts down before it samples.** Sampling the instant you
-  press the key would average in the moment your eyes were still travelling
-  towards the dot. Where your webcam sits relative to your screen is a real
-  per-setup bias, and this pass is what removes it — so it is worth the three
-  seconds. Press `C` again whenever you shift in your seat.
+- **Losing your face asks for a stop.** A blink or a hand across the face
+  must not keep you turning, so anything that is not a clear reading commands
+  zero rate and the body coasts to a halt. A rate is not an angle: repeated
+  forever while the tracker is quiet it would spin you round and round, so a
+  stale packet is read as "stop", never as "carry on".
+- **Coming back has to earn the turn again.** Losing tracking shuts the onset
+  gate, so a refound face waits out the commit delay rather than resuming a
+  sweep you may no longer want.
 
 ## Design
 
@@ -142,9 +259,9 @@ hardware — and nothing to download.
 ### Streaming a camera-original file
 
 A 360 camera writes its `moov` atom — the index a player needs before it can
-show anything — *after* the video data. In `testvid.mp4` that puts a 163 KB
-index behind 2 GB of frames, so a browser cannot start until it has hunted to
-the end of the file.
+show anything — *after* the video data. On a typical clip in the library that
+puts a few hundred KB of index behind gigabytes of frames, so a browser cannot
+start until it has hunted to the end of the file.
 
 `gaze360/mp4.py` rearranges it virtually: `moov` is parsed once into memory,
 its chunk offsets are corrected for the move, and the server presents
@@ -222,12 +339,28 @@ browser tab that may own it.
 **The video stays black.** Chrome does not load media in a background tab.
 Bring the window to the front and reload.
 
-**The view wobbles when you hold still.** Press `C` and hold still while it
-recalibrates. If it persists, widen the deadzones: `--deadzone-yaw 3
---deadzone-pitch 2`.
+**A card has no picture.** ffmpeg has not reached that clip yet — the count
+under the wordmark says how many are done. A card that never gets one is a file
+ffmpeg could not decode; the clip may still play.
 
-**It moves too far, or not far enough.** `--gain-yaw` and `--gain-pitch` are
-the sensitivity of each axis independently.
+**The grid is empty.** The start screen names the folder it read. Files still
+downloading are skipped until they are complete: `.part` files and the
+`.f313.mp4` single-stream files a downloader leaves behind before muxing.
 
-**It feels twitchy, or laggy.** `--smooth-time` is the trade: 0.08 is snappy
-and shows more of the estimate's jitter, 0.2 is calm and trails further behind.
+**The view drifts when you hold still.** Press `C` and hold still while it
+recalibrates. If it persists, widen the deadzones: `--deadzone-yaw 8
+--deadzone-pitch 4.5`. A rate map cannot tolerate a biased centre the way a
+position map could — a small standing offset is a slow permanent turn.
+
+**Calibration never finishes.** It ends on stillness, so it will wait forever
+if the reading is too noisy to sit inside `--calibration-tolerance`. Raise it
+(`--calibration-tolerance 4`) or shorten the hold (`--calibration-hold 1.0`).
+
+**It turns too fast, or too slowly.** `--rate-yaw` and `--rate-pitch` are the
+sensitivity of each axis; `--max-rate-yaw` and `--max-rate-pitch` cap the
+sweep. Keep the 16/9 ratio between the two rates unless your screen is not
+16:9, in which case use your own aspect.
+
+**It starts turning before you meant it to.** Raise `--onset` — the eyes have
+to stay off centre that long before anything moves, so a longer gate rejects
+more glances. Lower it if the view feels reluctant.
