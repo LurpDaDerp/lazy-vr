@@ -4,9 +4,8 @@ __pycache__/
 *.log
 desktop.ini
 
-# The clips themselves: hundreds of gigabytes of downloaded 360 footage, plus
-# the part-files a downloader leaves behind mid-download.  Reproducible, and
-# far too large for git; they are served from wherever library.json points.
+# Leftover downloaded footage and the part-files a downloader leaves behind.
+# The site streams from youtube now and nothing in the repo needs a clip.
 /videos/
 /site/videos/
 *.mp4
