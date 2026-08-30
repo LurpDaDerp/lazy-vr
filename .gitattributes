@@ -1,6 +1,5 @@
-models/*.onnx binary
-models/*.task binary
-models/*.npz binary
-models/*.npy binary
-*.bat text eol=crlf
-*.ps1 text eol=crlf
+site/models/*.onnx binary
+site/models/*.task binary
+tests/fixtures/*.npz binary
+tests/fixtures/*.npy binary
+site/thumbs/*.jpg binary
