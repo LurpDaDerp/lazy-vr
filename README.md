@@ -184,11 +184,17 @@ when a reading arrives. At ~30 Hz that means one sample (~33 ms) or two
 one step rather than near it: at the 30.5 FPS this webcam returns, 0.033 would
 need two samples and quietly cost twice what it reads as.
 
-**There is a torso.** The neck is free within a 55° cone; past it the
-shoulders start coming round and turning further costs effort, so the sweep
-slows by up to 45%. Yaw still wraps freely, but sustained turning now has the
-two-phase rhythm of a real body — head leads, torso catches up, head unwinds —
-and settles at a fixed twist of about 79° and 82°/s rather than winding up.
+**The neck has an end, and it is not a box.** The head turns 120° either way
+and looks 90° up or down — but not both at once: turned right round to the
+side there is nothing left for looking up. The reachable set is an ellipse in
+(yaw, pitch), and where the head sits inside it is one number, its radius.
+Inside half that radius the neck is free. Beyond it, turning further costs
+effort that climbs steeply as the limit nears — a full-speed sweep is still at
+118°/s at 60% of the way out, 97°/s at 80%, 69°/s at 90%, and zero at the
+end, where the outward part of any request is simply gone. Only the outward
+part is taxed: coming back is free, as a real neck springs back, and sliding
+along the limit — trading yaw for pitch — crawls rather than sweeps. Held
+near the end the head is not quite steady, either.
 
 **It never sits perfectly still.** Two octaves of value noise, 0.25° of yaw
 and 0.15° of pitch at 0.15–0.4 Hz, faded out the moment the view is genuinely

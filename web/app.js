@@ -94,7 +94,7 @@ const body = {
   yaw: 0, pitch: 0,
   yawRate: 0, pitchRate: 0,   // degrees per second
   yawAccel: 0,                // degrees per second squared, drives the roll
-  torso: 0,                   // the shoulders, lazily following the head
+  strain: 0,                  // 0 free, 1 at the end of the neck
   roll: 0,
   // Its own clock, accumulated from the frame steps rather than read off the
   // wall, so the sway is tied to the same time base as the motion.
@@ -123,19 +123,28 @@ const K_DOWN = 10.0;
  * change of motion, since any sizeable change starts out clamped by it. */
 const A_MAX = 380;
 
-/* A neck has a comfortable cone and a limit.  Past the cone the shoulders
- * start to come round and turning further costs effort, which is what gives
- * sustained turning its two-phase rhythm: head leads, torso catches up, head
- * unwinds.  Yaw itself stays unbounded, so you can still spin right round. */
-const NECK_COMFORT = 55;
-const NECK_MAX = 85;
-const TORSO_GAIN = 0.7;
-const STRAIN_SLOWING = 0.45;
+/* A neck has an end, and it is not a box.  The head can turn 120 degrees
+ * either way and look 90 up or down -- but not both at once: turned right
+ * round to the side there is nothing left for looking up, and vice versa.
+ * The reachable set is an ellipse in (yaw, pitch), and where the head sits
+ * inside it is a single number, its radius: 0 at rest, 1 at the limit.
+ *
+ * Inside the comfort radius the neck is free.  Beyond it turning further
+ * costs effort that climbs steeply as the limit nears, and at the limit the
+ * outward component of any request is gone -- the hard stop.  Only the
+ * outward part is taxed: coming back is always free, as a real neck springs
+ * back, and sliding along the boundary (trading yaw for pitch) is only
+ * mildly resisted. */
+const YAW_LIMIT = 120;
+const PITCH_LIMIT = 90;
+const NECK_COMFORT = 0.5;      // radius inside which the neck is unloaded
+const STRAIN_POWER = 2.2;      // how steeply the resistance climbs past it
+const STRAIN_TANGENTIAL = 0.8; // how much sliding along the limit is taxed
+const STRAIN_TREMOR = 0.12;    // degrees of shake at full strain
 
 const K_ROLL = 2.5 / A_MAX;  // a full-tilt acceleration leans it 2.5 degrees
 const MAX_ROLL = 2.5;
 const MAX_BLUR = 6 * DEG;
-const PITCH_LIMIT = 90;
 
 /* Bringing the view back to where the clip started.  A sweep, not a snap:
  * the whole point of the body is that it has mass, and teleporting the
@@ -172,13 +181,60 @@ function approachRate(current, goal, dt) {
   return { rate: current + accel * dt, accel };
 }
 
-function stepBody(dt) {
-  // How loaded the neck is, and so how much the sweep is costing.
-  const offset = wrapDegrees(body.yaw - body.torso);
-  const strain = Math.min(1, Math.max(0,
-    (Math.abs(offset) - NECK_COMFORT) / (NECK_MAX - NECK_COMFORT)));
+/* Where the head sits in the neck's reachable ellipse: its radius (0 at
+ * rest, 1 at the limit) and the outward unit direction, in the normalised
+ * space where the ellipse is a circle. */
+function neckRadius(yaw, pitch) {
+  const nx = yaw / YAW_LIMIT, ny = pitch / PITCH_LIMIT;
+  const r = Math.hypot(nx, ny);
+  return { r, ux: r > 1e-9 ? nx / r : 0, uy: r > 1e-9 ? ny / r : 0 };
+}
 
-  const ceiling = (packet.max_rate_yaw || 120) * (1 - STRAIN_SLOWING * strain);
+/* How much of the neck's give is used up, 0 to 1.  Nothing inside the
+ * comfort radius, then a curve that starts gently and steepens, so the first
+ * resistance is barely there and the last few degrees are hard won. */
+function neckStrain(r) {
+  const past = (r - NECK_COMFORT) / (1 - NECK_COMFORT);
+  return past <= 0 ? 0 : Math.min(1, Math.pow(past, STRAIN_POWER));
+}
+
+/* Put a requested rate through the neck.  The outward component is scaled
+ * by what give remains; the tangential component only mildly; inward is
+ * untouched. */
+function resist(yawRate, pitchRate) {
+  const { r, ux, uy } = neckRadius(body.yaw, body.pitch);
+  const strain = neckStrain(r);
+  body.strain = strain;
+  if (strain <= 0) return { yawRate, pitchRate };
+  // Into the normalised space, where "outward" is a clean direction.
+  const vx = yawRate / YAW_LIMIT, vy = pitchRate / PITCH_LIMIT;
+  const outward = vx * ux + vy * uy;
+  const tx = vx - outward * ux, ty = vy - outward * uy;
+  const give = 1 - strain;
+  const along = outward > 0 ? outward * give : outward;
+  const slide = 1 - STRAIN_TANGENTIAL * strain;
+  const rx = along * ux + tx * slide, ry = along * uy + ty * slide;
+  return { yawRate: rx * YAW_LIMIT, pitchRate: ry * PITCH_LIMIT };
+}
+
+/* The hard stop.  The rate limiting above means the body arrives slowly,
+ * but it has momentum and can still cross the line by a hair; put it back
+ * on the line and take the outward velocity away, so it rests against the
+ * limit rather than bouncing off it. */
+function holdAtLimit() {
+  const { r, ux, uy } = neckRadius(body.yaw, body.pitch);
+  if (r <= 1) return;
+  body.yaw = ux * YAW_LIMIT;
+  body.pitch = uy * PITCH_LIMIT;
+  const vx = body.yawRate / YAW_LIMIT, vy = body.pitchRate / PITCH_LIMIT;
+  const outward = vx * ux + vy * uy;
+  if (outward > 0) {
+    body.yawRate = (vx - outward * ux) * YAW_LIMIT;
+    body.pitchRate = (vy - outward * uy) * PITCH_LIMIT;
+  }
+}
+
+function stepBody(dt) {
   let askedYaw = packet.yaw_rate || 0;
   let askedPitch = packet.pitch_rate || 0;
 
@@ -188,52 +244,33 @@ function stepBody(dt) {
     if (packet.committed && (askedYaw || askedPitch)) {
       homing = false;
     } else {
-      const leftYaw = -wrapDegrees(body.yaw);
+      const leftYaw = -body.yaw;
       const leftPitch = -body.pitch;
       askedYaw = leftYaw * HOME_GAIN;
       askedPitch = leftPitch * HOME_GAIN;
-      // Unwind the shoulders too, or the first turn after a recentre would
-      // start against a neck that is still twisted.
-      body.torso -= body.torso * Math.min(1, dt * HOME_GAIN);
       const arrived = Math.abs(leftYaw) < HOME_SETTLED
         && Math.abs(leftPitch) < HOME_SETTLED
         && Math.abs(body.yawRate) < 2 && Math.abs(body.pitchRate) < 2;
       if (arrived) {
         homing = false;
-        body.yaw = body.pitch = body.torso = 0;
+        body.yaw = body.pitch = 0;
         body.yawRate = body.pitchRate = 0;
       }
     }
   }
 
-  const wantYaw = clamp(askedYaw, ceiling);
-  const wantPitch = clamp(askedPitch, packet.max_rate_pitch || 90);
+  const want = resist(
+    clamp(askedYaw, packet.max_rate_yaw || 120),
+    clamp(askedPitch, packet.max_rate_pitch || 90));
 
-  const turned = approachRate(body.yawRate, wantYaw, dt);
+  const turned = approachRate(body.yawRate, want.yawRate, dt);
   body.yawRate = turned.rate;
   body.yawAccel = turned.accel;
-  body.pitchRate = approachRate(body.pitchRate, wantPitch, dt).rate;
+  body.pitchRate = approachRate(body.pitchRate, want.pitchRate, dt).rate;
 
-  body.yaw = wrapDegrees(body.yaw + body.yawRate * dt);
-  body.pitch = clamp(body.pitch + body.pitchRate * dt, PITCH_LIMIT);
-
-  // The torso is only recruited once the neck is actually loaded, and then
-  // it comes round harder the more loaded the neck is.  The (1 + strain)
-  // term is what lets it exceed the head's own speed near the stop, so a
-  // sustained turn settles at a fixed twist instead of winding up: chasing
-  // at a flat 0.7 of the head's rate, the gap grows at 0.3 of it forever,
-  // sails past 180 degrees, wraps, and the torso then chases the wrong way.
-  if (strain > 0) {
-    body.torso += Math.sign(offset) * TORSO_GAIN * (1 + strain)
-      * Math.abs(body.yawRate) * strain * dt;
-  }
-  // And a hard stop behind it, because a neck has one.  Past the limit the
-  // shoulders are simply dragged round; nothing about the wrap-around case
-  // is then reachable.
-  const wound = wrapDegrees(body.yaw - body.torso);
-  if (Math.abs(wound) > NECK_MAX) {
-    body.torso = body.yaw - Math.sign(wound) * NECK_MAX;
-  }
+  body.yaw += body.yawRate * dt;
+  body.pitch += body.pitchRate * dt;
+  holdAtLimit();
 
   // A head leans into a turn.  Driven by acceleration rather than speed, so
   // the lean happens at the two ends of a sweep instead of throughout it.
@@ -248,9 +285,14 @@ function stepBody(dt) {
   const t = (body.clock += dt);
   const swayYaw = calm * (noise(t * 0.18) * 0.18 + noise(t * 0.36 + 11) * 0.07);
   const swayPitch = calm * (noise(t * 0.15 + 5) * 0.11 + noise(t * 0.30 + 23) * 0.04);
+  // A neck held near its limit is not steady.  Faster and finer than the
+  // sway, and only there when the strain is.
+  const shake = STRAIN_TREMOR * body.strain * body.strain;
+  const tremorYaw = shake * noise(t * 7.3 + 41);
+  const tremorPitch = shake * noise(t * 8.1 + 57);
 
-  view.yaw = (body.yaw + swayYaw) * DEG;
-  view.pitch = (body.pitch + swayPitch) * DEG;
+  view.yaw = (body.yaw + swayYaw + tremorYaw) * DEG;
+  view.pitch = (body.pitch + swayPitch + tremorPitch) * DEG;
   view.roll = body.roll * DEG;
   // Smear along the direction of travel over one exposure.  As well as being
   // what a turning head sees, it hides the judder a 30 Hz gaze pipeline puts
@@ -260,7 +302,7 @@ function stepBody(dt) {
 
 function restBody() {
   homing = false;
-  body.yaw = body.pitch = body.torso = body.roll = body.clock = 0;
+  body.yaw = body.pitch = body.roll = body.clock = body.strain = 0;
   body.yawRate = body.pitchRate = body.yawAccel = 0;
   view.yaw = view.pitch = view.roll = view.blur = 0;
 }
@@ -270,7 +312,7 @@ function restBody() {
  * reference it is measured from. */
 function goHome() {
   if (browsing || !calibrated) return;
-  const away = Math.abs(wrapDegrees(body.yaw)) + Math.abs(body.pitch);
+  const away = Math.abs(body.yaw) + Math.abs(body.pitch);
   if (away < HOME_SETTLED) {
     toast("Already facing the start");
     return;
@@ -396,6 +438,7 @@ const el = {
   gaze: document.getElementById("gaze"),
   rate: document.getElementById("rate"),
   turn: document.getElementById("turn"),
+  neck: document.getElementById("neck"),
   perf: document.getElementById("perf"),
   north: document.getElementById("compassnorth"),
   overlay: document.getElementById("overlay"),
@@ -476,6 +519,10 @@ function render(p) {
   el.turn.textContent =
     `${body.yawRate >= 0 ? "+" : ""}${body.yawRate.toFixed(0)}, ` +
     `${body.pitchRate >= 0 ? "+" : ""}${body.pitchRate.toFixed(0)}°/s`;
+  el.neck.textContent = body.strain <= 0 ? "free"
+    : body.strain >= 0.999 ? "at the limit"
+    : `${Math.round(body.strain * 100)}% strained`;
+  el.neck.className = "val" + (body.strain >= 0.999 ? " bad" : body.strain > 0.5 ? " warn" : "");
   el.perf.textContent = `${p.gaze_fps.toFixed(0)} Hz  ${p.latency_ms.toFixed(0)} ms`;
   drawStick(p);
 }
