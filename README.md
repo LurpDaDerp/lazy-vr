@@ -176,7 +176,9 @@ host, a region lock — the page falls back to **youtube's own iframe player**
 for that video, steered by the same gaze pipeline through the player's
 spherical API. Playback then always works, at youtube's price: its
 presentation, ads included when a clip carries them (a viewer's own youtube
-premium applies), and no motion blur. A toast says which engine you got.
+premium applies), and no motion blur. The player is pinned to the best
+quality tier the upload offers — re-pinned after every stall — rather than
+left to its own adaptive guessing. A toast says which engine you got.
 
 ## How it steers
 

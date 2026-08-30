@@ -35,17 +35,14 @@ test("mapping: roll is clamped and the fov rides along", () => {
   assert.equal(props.fov, EMBED_FOV);
 });
 
-test("overscan: a small window impersonates a 4K-class one", () => {
-  near(overscanFor(1920, 1080, 1), 2);
-  near(overscanFor(3840, 2160, 1), 1);
-});
-
-test("overscan: a dense display asks for at least its own pixels", () => {
+test("overscan: the iframe renders at the display's own pixel density", () => {
+  near(overscanFor(1920, 1080, 1), 1);
   near(overscanFor(2560, 1440, 2), 2);
 });
 
-test("overscan: a tiny window is capped rather than absurd", () => {
-  near(overscanFor(640, 360, 1), 3);
+test("overscan: density is capped so the player's renderer keeps up", () => {
+  near(overscanFor(1920, 1080, 3), 2);
+  near(overscanFor(640, 360, 1), 1);
 });
 
 test("gate: the first send always goes", () => {

@@ -38,13 +38,13 @@ export function sphericalFromView(view) {
   };
 }
 
-/* youtube's player picks its quality tier from how big it believes it is,
- * and the quality-setting API has been a no-op for years.  So the iframe
- * is created larger than the window -- impersonating a 4K-class viewport,
- * or the display's real pixel density if that asks for more -- and scaled
- * back down to fit.  Same picture size on screen; a much better tier. */
+/* The iframe is sized for the display's real pixels (capped at 2x so the
+ * player's own 360 rendering keeps up -- an oversized canvas is exactly
+ * what makes camera motion choppy).  The quality *tier* is not left to the
+ * player's size heuristics at all: forceBest() pins it explicitly, which
+ * is both sharper and cheaper than impersonating a huge viewport. */
 export function overscanFor(width, height, dpr = 1) {
-  return Math.min(3, Math.max(1, dpr, 2160 / Math.max(1, height)));
+  return Math.min(2, Math.max(1, dpr));
 }
 
 /* Steering is a postMessage per call; only bother when the view moved. */
@@ -129,6 +129,7 @@ export class EmbedPlayer {
             }
           },
           onStateChange: (event) => {
+            if (event.data === YT.PlayerState.PLAYING) this.forceBest();
             if (event.data === YT.PlayerState.ENDED && this.handlers.onEnded) this.handlers.onEnded();
           },
         },
@@ -152,6 +153,24 @@ export class EmbedPlayer {
     iframe.style.top = `${(height - innerH * scale) / 2}px`;
     iframe.style.transformOrigin = "top left";
     iframe.style.transform = `scale(${scale})`;
+  }
+
+  /* Pin the player to the best tier the upload offers.  The documented
+   * quality API has been a no-op for years, but the range form still works
+   * in current players; asserted on every PLAYING, so the downshift after
+   * a stall is undone as soon as playback resumes. */
+  forceBest() {
+    const player = this.player;
+    if (!player || typeof player.getAvailableQualityLevels !== "function") return;
+    const levels = player.getAvailableQualityLevels() || [];
+    if (!levels.length) return;
+    const best = levels[0];  // youtube lists highest first
+    try {
+      if (typeof player.setPlaybackQualityRange === "function") {
+        player.setPlaybackQualityRange(best, best);
+      }
+      player.setPlaybackQuality(best);
+    } catch { /* an older player build; nothing more to be done */ }
   }
 
   steer(view) {
