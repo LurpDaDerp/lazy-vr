@@ -1,17 +1,13 @@
 {
-  "$schema": "https://openapi.vercel.sh/vercel.json",
-  "services": {
-    "lazyvr": {
-      "root": ".",
-      "entrypoint": "api/index.py",
-      "outputDirectory": "site",
-      "functions": {
-        "api/index.py": { "maxDuration": 60, "memory": 1024 }
-      }
-    }
-  },
-  "rewrites": [
-    { "source": "/api/:path*", "destination": "/api/index?vkind=api&vpath=:path*" },
-    { "source": "/media/:path*", "destination": "/api/index?vkind=media&vpath=:path*" }
+  "version": 2,
+  "builds": [
+    { "src": "api/index.py", "use": "@vercel/python" },
+    { "src": "site/**", "use": "@vercel/static" }
+  ],
+  "routes": [
+    { "src": "/api/(.*)", "dest": "/api/index.py?vkind=api&vpath=$1" },
+    { "src": "/media/(.*)", "dest": "/api/index.py?vkind=media&vpath=$1" },
+    { "src": "/", "dest": "/site/index.html" },
+    { "src": "/(.*)", "dest": "/site/$1" }
   ]
 }
