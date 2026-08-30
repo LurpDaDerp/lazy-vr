@@ -13,6 +13,7 @@
 import { AVSync } from "./avsync.js";
 import { Body, YAW_LIMIT } from "./body.js";
 import { GazeController } from "./control.js";
+import { EmbedPlayer } from "./embed.js";
 import { GazeTracker } from "./gaze.js";
 import { fetchHome, fetchSearch, fetchStreams, renderResults, renderShelves } from "./library.js";
 import { Renderer } from "./render.js";
@@ -21,7 +22,7 @@ const DEG = Math.PI / 180;
 const $ = (id) => document.getElementById(id);
 
 const el = {
-  canvas: $("view"), video: $("video"), sound: $("sound"), cam: $("cam"),
+  canvas: $("view"), embed: $("embed"), video: $("video"), sound: $("sound"), cam: $("cam"),
   state: $("state"), heading: $("heading"), gaze: $("gaze"), rate: $("rate"),
   turn: $("turn"), neck: $("neck"), perf: $("perf"),
   overlay: $("overlay"), overlaytext: $("overlaytext"), progress: $("progress"),
@@ -37,6 +38,7 @@ const body = new Body();
 const controller = new GazeController();
 const tracker = new GazeTracker({ models: "models", onStatus: showStatus, onReading: onReading });
 const sync = new AVSync(el.video, el.sound);
+const embedPlayer = new EmbedPlayer(el.embed);
 
 let renderer = null;
 try {
@@ -79,6 +81,7 @@ let streamsReady = false;
 let pendingPlay = false;
 let retryAction = "library";
 let qualityLine = null;
+let engineMode = "stream";  // stream (raw, ad-free) | embed (the fallback)
 
 function limitsFor(control) {
   const limits = control.limits;
@@ -101,7 +104,8 @@ function frame(now) {
     reportScreen();
     reportScreenPosition();
     if (started && calibrated) body.step(request, dt);
-    renderer.draw(body.view);
+    if (engineMode === "embed") embedPlayer.steer(body.view);
+    else renderer.draw(body.view);
   }
   updateCompass();
   requestAnimationFrame(frame);
@@ -120,6 +124,25 @@ function reportScreen() {
   reportedH = height;
   controller.setViewport(width, height);
   request = { ...request, ...limitsFor(controller) };
+  considerRecalibration();
+}
+
+/* A meaningfully different screen deserves a fresh calibration: the scale
+ * law carries the map through the change, but the tuning is best measured
+ * where it will be used.  Wait for the resize to settle, then -- if the
+ * size really moved -- pause whatever is playing and run the dots again. */
+const RECAL_SCALE = 0.12;
+const RECAL_SETTLE_MS = 700;
+let recalTimer = null;
+
+function considerRecalibration() {
+  clearTimeout(recalTimer);
+  recalTimer = setTimeout(() => {
+    if (!started || !calibrated || browsing) return;
+    const { scaleX, scaleY } = controller.limits;
+    if (Math.abs(scaleX - 1) < RECAL_SCALE && Math.abs(scaleY - 1) < RECAL_SCALE) return;
+    runCalibration("The screen changed — look at the dot.");
+  }, RECAL_SETTLE_MS);
 }
 
 /* Where the viewport's centre physically sits on the monitor, in CSS px,
@@ -343,6 +366,8 @@ async function selectClip(clip) {
   streamsReady = false;
   pendingPlay = false;
   retryAction = "library";
+  engineMode = "stream";
+  document.body.classList.remove("embedded");
   el.retry.textContent = "Try again";
   el.notice.hidden = true;
   document.body.classList.remove("browsing");
@@ -373,8 +398,11 @@ async function selectClip(clip) {
     })
     .catch((error) => {
       if (session !== my) return;
-      returnToLibrary();
-      notify(`“${clip.title}” would not stream: ${error.message}`);
+      // The raw, ad-free stream was refused -- a bot-challenged host, a
+      // region lock, an expired URL.  youtube will always play its own
+      // videos, though: fall back to its player, steered by the same body.
+      toast("Raw stream refused — using the youtube player");
+      embedFallback(clip, my, error);
     });
 
   // The camera prompt also wants the click's activation.  Ask for it now,
@@ -400,6 +428,56 @@ async function selectClip(clip) {
   watchForBackgroundedTab();
 }
 
+/* The fallback engine: youtube's own iframe player, gaze-steered through
+ * its spherical API.  It joins the same handshake the stream path uses, so
+ * calibration and the play gate need not know which engine won. */
+async function embedFallback(clip, my, why) {
+  try {
+    engineMode = "embed";
+    document.body.classList.add("embedded");
+    await embedPlayer.open(clip.id, {
+      onEnded: () => { if (session === my) returnToLibrary(); },
+      onError: (error) => {
+        if (session !== my) return;
+        returnToLibrary();
+        notify(`“${clip.title}”: ${error.message}`);
+      },
+    });
+    if (session !== my) { embedPlayer.close(); return; }
+    embedPlayer.pause();  // hold for calibration, like the stream path
+    qualityLine = "youtube player fallback — ads possible";
+    streamsReady = true;
+    if (pendingPlay) {
+      pendingPlay = false;
+      el.overlay.classList.add("gone");
+      tryPlay();
+    }
+  } catch (error) {
+    if (session !== my) return;
+    returnToLibrary();
+    notify(`“${clip.title}” would not stream (${why.message}), and the fallback failed too: ${error.message}`);
+  }
+}
+
+/* One remote for two engines: the raw <video> pair, or the embed. */
+function mediaPlay() {
+  return engineMode === "embed" ? embedPlayer.ensurePlaying() : el.video.play();
+}
+
+function mediaPause() {
+  if (engineMode === "embed") embedPlayer.pause();
+  else el.video.pause();
+}
+
+function mediaPaused() {
+  return engineMode === "embed" ? embedPlayer.paused : el.video.paused;
+}
+
+function mediaSeek(delta) {
+  if (engineMode === "embed") embedPlayer.seek(delta);
+  else el.video.currentTime = Math.max(0, Math.min(el.video.duration || 1e9, el.video.currentTime + delta));
+}
+
 /* Playback starts when the slower of the two journeys finishes: the stream
  * resolving, or the viewer calibrating. */
 function maybePlay() {
@@ -414,7 +492,7 @@ function maybePlay() {
 }
 
 function tryPlay() {
-  el.video.play().then(() => {
+  mediaPlay().then(() => {
     if (qualityLine) { toast(qualityLine); qualityLine = null; }
   }).catch(() => {
     // The click that started all this has gone stale for this browser;
@@ -456,6 +534,9 @@ function returnToLibrary() {
   pendingPlay = false;
   retryAction = "library";
   sync.clear();
+  embedPlayer.close();
+  engineMode = "stream";
+  document.body.classList.remove("embedded");
   body.rest();
   // The camera belongs to a playing session, not to browsing the shelves:
   // release it, light and all, until the next video is picked.
@@ -524,6 +605,7 @@ function setOverlay(headline, sub, subClass = "") {
 }
 
 async function runCalibration(headline) {
+  mediaPause();
   calibrated = false;
   awaitingGeneration = null;
   calibrationHeadline = headline;
@@ -578,12 +660,12 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "Escape") returnToLibrary();
   else if (key === "r") recentre();
   else if (key === "c") recalibrate();
-  else if (key === " ") { event.preventDefault(); el.video.paused ? el.video.play().catch(() => {}) : el.video.pause(); }
+  else if (key === " ") { event.preventDefault(); mediaPaused() ? mediaPlay().catch(() => {}) : mediaPause(); }
   else if (key === "f") {
     document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
   } else if (key === "h") document.body.classList.toggle("hidden-hud");
-  else if (event.key === "ArrowRight") el.video.currentTime = Math.min(el.video.duration || 0, el.video.currentTime + 5);
-  else if (event.key === "ArrowLeft") el.video.currentTime = Math.max(0, el.video.currentTime - 5);
+  else if (event.key === "ArrowRight") mediaSeek(5);
+  else if (event.key === "ArrowLeft") mediaSeek(-5);
 });
 
 el.touchbar.addEventListener("click", (event) => {
@@ -605,11 +687,11 @@ function watchForBackgroundedTab() {
   hint.textContent = "Bring this tab to the front — the browser will not load video in a background tab.";
   document.body.appendChild(hint);
   setInterval(() => {
-    const stuck = el.video.readyState === 0 && started;
+    const stuck = engineMode === "stream" && el.video.readyState === 0 && started;
     hint.style.display = stuck && document.visibilityState === "hidden" ? "" : "none";
   }, 1000);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && el.video.readyState === 0 && started) {
+    if (document.visibilityState === "visible" && engineMode === "stream" && el.video.readyState === 0 && started) {
       el.video.load();
       el.video.play().catch(() => {});
       if (renderer) renderer.watchFrames();

@@ -126,8 +126,10 @@ the dot then hops up-right for one more short hold. The first dot teaches
 the player where your neutral gaze sits; the second measures what a screen
 pixel is worth to your eyes, which is what lets a moved or resized window
 stay aimed (see below). Look away and the current dot starts over. It runs
-once a visit, `C` reruns it whenever you shift in your seat, and the camera
-is released — light off — whenever you are back in the library.
+once a visit, `C` reruns it whenever you shift in your seat, a real change
+of screen size — fullscreen, a snapped window — pauses the video and reruns
+the dots by itself, and the camera is released — light off — whenever you
+are back in the library.
 
 | Key | |
 |---|---|
@@ -168,6 +170,13 @@ tallest first, up to 8K on a desktop, capped at 4K on phones. Seeking works
 because the proxy passes byte ranges straight through to YouTube's servers.
 The resolved URLs expire after ~6 hours; the proxy re-resolves on a 403, and
 a video left paused overnight will ask to be picked again.
+
+When the raw stream is refused outright — the bot-challenge on a datacenter
+host, a region lock — the page falls back to **youtube's own iframe player**
+for that video, steered by the same gaze pipeline through the player's
+spherical API. Playback then always works, at youtube's price: its
+presentation, ads included when a clip carries them (a viewer's own youtube
+premium applies), and no motion blur. A toast says which engine you got.
 
 ## How it steers
 

@@ -1,0 +1,173 @@
+/* The fallback engine: youtube's own player in an iframe, steered by the
+ * same body.
+ *
+ * Used when the raw stream is refused -- a bot-challenged host, a region
+ * lock, an expired URL.  Playback always works here, because it is youtube
+ * playing to youtube; the price is youtube's own presentation, ads included
+ * when a clip carries them, and the loss of our renderer's motion blur.
+ *
+ * The IFrame API exposes setSphericalProperties() on 360 uploads, so the
+ * gaze pipeline steers this player exactly as it steers the WebGL sphere:
+ * body.view in, camera angles out, every frame the view moved.
+ */
+
+const DEG = Math.PI / 180;
+
+export const EMBED_FOV = 75;
+
+/* Named for the viewer, not the API. */
+const REFUSALS = {
+  2: "the video id is malformed",
+  5: "youtube's player broke",
+  100: "the video is gone",
+  101: "the uploader blocks embedding",
+  150: "the uploader blocks embedding",
+};
+
+/* body.view (radians) -> the player's spherical properties (degrees).
+ * The player's yaw is mapped to our compass heading -- the same number the
+ * HUD shows -- and pitch is up-positive on both sides.  If a player build
+ * ever pans mirrored, this mapping is the one line to flip. */
+export function sphericalFromView(view) {
+  return {
+    yaw: (((-view.yaw / DEG) % 360) + 360) % 360,
+    pitch: Math.max(-90, Math.min(90, view.pitch / DEG)),
+    roll: Math.max(-180, Math.min(180, -view.roll / DEG)),
+    fov: EMBED_FOV,
+  };
+}
+
+/* Steering is a postMessage per call; only bother when the view moved. */
+export function movedEnough(last, next, epsilon = 0.02) {
+  if (!last) return true;
+  const yawGap = Math.abs((((next.yaw - last.yaw) % 360) + 540) % 360 - 180);
+  return yawGap > epsilon
+    || Math.abs(next.pitch - last.pitch) > epsilon
+    || Math.abs(next.roll - last.roll) > epsilon;
+}
+
+let apiPromise = null;
+
+function iframeApi() {
+  if (apiPromise) return apiPromise;
+  apiPromise = new Promise((resolve, reject) => {
+    if (window.YT && window.YT.Player) {
+      resolve(window.YT);
+      return;
+    }
+    const tag = document.createElement("script");
+    tag.src = "https://www.youtube.com/iframe_api";
+    tag.onerror = () => {
+      apiPromise = null;
+      reject(new Error("youtube's player script would not load"));
+    };
+    window.onYouTubeIframeAPIReady = () => resolve(window.YT);
+    document.head.appendChild(tag);
+  });
+  return apiPromise;
+}
+
+export class EmbedPlayer {
+  constructor(container) {
+    this.container = container;
+    this.player = null;
+    this.sent = null;
+    this.handlers = {};
+  }
+
+  /* Create the player on one video.  Resolves when it is ready to obey;
+   * `onEnded` and `onError` fire for everything after that. */
+  async open(videoId, handlers = {}) {
+    const YT = await iframeApi();
+    this.close();
+    this.handlers = handlers;
+    const mount = document.createElement("div");
+    this.container.appendChild(mount);
+    await new Promise((resolve, reject) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        settled = true;
+        reject(new Error("youtube's player never became ready"));
+      }, 15000);
+      this.player = new YT.Player(mount, {
+        videoId,
+        width: "100%",
+        height: "100%",
+        playerVars: {
+          autoplay: 1, controls: 0, rel: 0, iv_load_policy: 3,
+          playsinline: 1, disablekb: 1, fs: 0, origin: location.origin,
+        },
+        events: {
+          onReady: () => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            resolve();
+          },
+          onError: (event) => {
+            const error = new Error(REFUSALS[event.data] || `youtube's player refused (${event.data})`);
+            if (!settled) {
+              settled = true;
+              clearTimeout(timer);
+              reject(error);
+            } else if (this.handlers.onError) {
+              this.handlers.onError(error);
+            }
+          },
+          onStateChange: (event) => {
+            if (event.data === YT.PlayerState.ENDED && this.handlers.onEnded) this.handlers.onEnded();
+          },
+        },
+      });
+    });
+  }
+
+  steer(view) {
+    if (!this.player || typeof this.player.setSphericalProperties !== "function") return;
+    const props = sphericalFromView(view);
+    if (!movedEnough(this.sent, props)) return;
+    this.sent = props;
+    this.player.setSphericalProperties({ ...props, enableOrientationSensor: false });
+  }
+
+  /* Like video.play(): resolves once playing, rejects when the browser
+   * wants a click first. */
+  async ensurePlaying() {
+    if (!this.player) throw new Error("no player");
+    const YT = window.YT;
+    this.player.playVideo();
+    const began = performance.now();
+    while (performance.now() - began < 1800) {
+      const state = this.player.getPlayerState();
+      if (state === YT.PlayerState.PLAYING || state === YT.PlayerState.BUFFERING) return;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+    throw new Error("autoplay was blocked");
+  }
+
+  pause() {
+    if (this.player && typeof this.player.pauseVideo === "function") this.player.pauseVideo();
+  }
+
+  get paused() {
+    const YT = window.YT;
+    if (!YT || !this.player || typeof this.player.getPlayerState !== "function") return true;
+    const state = this.player.getPlayerState();
+    return state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING;
+  }
+
+  seek(delta) {
+    if (!this.player || typeof this.player.getCurrentTime !== "function") return;
+    this.player.seekTo(Math.max(0, this.player.getCurrentTime() + delta), true);
+  }
+
+  close() {
+    if (this.player) {
+      try { this.player.destroy(); } catch { /* already gone */ }
+    }
+    this.player = null;
+    this.sent = null;
+    this.handlers = {};
+    this.container.textContent = "";
+  }
+}

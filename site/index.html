@@ -10,6 +10,9 @@
 <body class="browsing">
 
 <canvas id="view"></canvas>
+<!-- The fallback engine mounts youtube's own player here when the raw
+     stream is refused; the HUD stays above it. -->
+<div id="embed"></div>
 <video id="video" playsinline preload="auto"></video>
 <!-- High resolutions come from youtube as separate video and audio tracks;
      avsync.js keeps this shadow element on the video's clock. -->
