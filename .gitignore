@@ -1,6 +1,17 @@
 .venv/
 __pycache__/
 *.py[cod]
-*.mp4
 *.log
 desktop.ini
+
+# The library itself: tens of gigabytes of downloaded 360 footage, plus the
+# part-files yt-dlp leaves behind mid-download and the thumbnails built from
+# them.  All of it reproducible, none of it belongs in the history.
+/videos/
+.thumbs/
+*.mp4
+*.webm
+*.mkv
+*.m4v
+*.part
+*.ytdl
