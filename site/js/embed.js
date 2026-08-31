@@ -149,7 +149,10 @@ export class EmbedPlayer {
             }
           },
           onStateChange: (event) => {
-            if (event.data === YT.PlayerState.PLAYING) this.forceBest();
+            if (event.data === YT.PlayerState.PLAYING) {
+              this.forceBest();
+              this.muteCaptions();
+            }
             if (event.data === YT.PlayerState.ENDED && this.handlers.onEnded) this.handlers.onEnded();
           },
         },
@@ -180,6 +183,15 @@ export class EmbedPlayer {
     iframe.style.top = `${(height - innerH * scale) / 2}px`;
     iframe.style.transformOrigin = "top left";
     iframe.style.transform = `scale(${scale})`;
+  }
+
+  /* Subtitles off, and kept off: the captions module reloads with every
+   * video, so this is re-asserted on every PLAYING alongside the quality. */
+  muteCaptions() {
+    if (!this.player) return;
+    for (const module of ["captions", "cc"]) {
+      try { this.player.unloadModule(module); } catch { /* not loaded */ }
+    }
   }
 
   /* Pin the player to the best tier the display deserves.  The documented

@@ -120,7 +120,8 @@ cannot start gaze steering. `tailscale serve --bg 8360` is the proper fix:
 it publishes the same server at `https://<machine>.<tailnet>.ts.net/` with a
 real certificate, camera included (`tailscale serve reset` undoes it).
 
-Chrome will ask for the camera the first time you pick a video. A green dot
+Picking a video goes fullscreen for the session (`Esc` leaves the video,
+`F` toggles). Chrome will ask for the camera the first time. A green dot
 appears: three seconds to settle, then hold still until the bar fills — and
 the dot then hops up-right for one more short hold. The first dot teaches
 the player where your neutral gaze sits; the second measures what a screen

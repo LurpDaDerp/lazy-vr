@@ -158,6 +158,10 @@ let reportedCY = Infinity;
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
   last = now;
+  requestAnimationFrame(frame);
+  // The library needs no sphere, no compass, no simulation: while browsing
+  // the loop is a scheduling no-op and the device gets its cycles back.
+  if (browsing) return;
   frameMs += 0.05 * (Math.min(dt * 1000, 100) - frameMs);
   considerDownshift(now);
   if (renderer) {
@@ -170,7 +174,6 @@ function frame(now) {
     else renderer.draw(body.view);
   }
   updateCompass();
-  requestAnimationFrame(frame);
 }
 
 /* The gearing follows the viewport the eyes are crossing -- its shape and
@@ -292,12 +295,17 @@ function onReading(reading) {
       // The centre is banked; the second dot measures what a screen pixel
       // is worth, so a moved or fullscreened window can be re-aimed.
       secondDot = true;
+      awayShown = false;
       moveDot(calibrationOffset);
       setOverlay(calibrationHeadline, "now the second dot");
     }
     if (controller.resets !== seenResets) {
       seenResets = controller.resets;
       lookAgain();
+    } else if (awayShown && controller.calibrationProgress > 0) {
+      // Back on the dot: the warning has done its job.
+      awayShown = false;
+      setOverlay(calibrationHeadline, secondDot ? "now the second dot" : "hold still…");
     }
     if (controller.calibrated) finishCalibration();
   }
@@ -319,7 +327,10 @@ setInterval(() => {
 
 const WARN = { "low confidence": 1, calibrating: 1, committing: 1 };
 
+let hudHidden = false;
+
 function renderHud(out, reading) {
+  if (hudHidden) return;  // thirty DOM writes a second nobody can see
   el.state.textContent = out.state;
   el.state.className = "val" + (out.state === "lost" ? " bad" : WARN[out.state] ? " warn" : "");
   const sign = (v) => (v >= 0 ? "+" : "");
@@ -336,6 +347,7 @@ function renderHud(out, reading) {
 let compassShown = "";
 
 function updateCompass() {
+  if (hudHidden) return;
   const heading = ((-body.view.yaw / DEG) % 360 + 360) % 360;
   // Touching the DOM sixty times a second for an unchanged number is
   // layout work for nothing; a tenth of a degree is finer than the eye.
@@ -502,6 +514,12 @@ async function selectClip(clip) {
   el.notice.hidden = true;
   document.body.classList.remove("browsing");
 
+  // Fullscreen for the whole session: only this click can grant it, and
+  // calibration is best done at the size the video will play at.
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(() => {});
+  }
+
   // Wake both media elements inside the click, so the browser will let a
   // later, programmatic play() through once calibration is done.
   el.video.load();
@@ -658,6 +676,7 @@ el.retry.addEventListener("click", () => {
 function returnToLibrary() {
   session += 1;
   calibrationRun += 1;
+  pausedBySettings = false;
   browsing = true;
   started = false;
   calibrated = false;
@@ -736,8 +755,20 @@ function settingsChanged() {
 
 for (const input of Object.values(setInputs)) input.addEventListener("input", settingsChanged);
 
+let pausedBySettings = false;
+
 function toggleSettings(force) {
-  el.settings.hidden = force === undefined ? !el.settings.hidden : !force;
+  const show = force === undefined ? el.settings.hidden : force;
+  el.settings.hidden = !show;
+  // Opening the panel pauses whatever plays; closing it resumes only what
+  // the panel itself paused, never a pause the viewer chose.
+  if (show) {
+    pausedBySettings = started && calibrated && !mediaPaused();
+    if (pausedBySettings) mediaPause();
+  } else if (pausedBySettings) {
+    pausedBySettings = false;
+    if (started) mediaPlay().catch(() => {});
+  }
 }
 
 el.gear.addEventListener("click", () => toggleSettings());
@@ -775,7 +806,10 @@ function moveDot(offset) {
   el.dot.style.top = offset ? `calc(50% + ${offset.dy}px)` : "50%";
 }
 
+let awayShown = false;
+
 function lookAgain() {
+  awayShown = true;
   setOverlay(calibrationHeadline, "You looked away", "away");
   el.dot.classList.add("nudge");
   setTimeout(() => el.dot.classList.remove("nudge"), 600);
@@ -818,6 +852,7 @@ async function runCalibration(headline) {
   el.progresswrap.classList.add("on");
   calibrationOffset = dotOffset();
   secondDot = false;
+  awayShown = false;
   moveDot(null);
   awaitingGeneration = controller.recalibrate(calibrationOffset);
 }
@@ -859,7 +894,10 @@ document.addEventListener("keydown", (event) => {
   else if (key === " ") { event.preventDefault(); mediaPaused() ? mediaPlay().catch(() => {}) : mediaPause(); }
   else if (key === "f") {
     document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
-  } else if (key === "h") document.body.classList.toggle("hidden-hud");
+  } else if (key === "h") {
+    hudHidden = document.body.classList.toggle("hidden-hud");
+    if (!hudHidden) compassShown = "";  // repaint on the next frame
+  }
   else if (event.key === "ArrowRight") mediaSeek(5);
   else if (event.key === "ArrowLeft") mediaSeek(-5);
 });
@@ -888,7 +926,17 @@ function watchForBackgroundedTab() {
     hint.style.display = stuck && document.visibilityState === "hidden" ? "" : "none";
   }, 1000);
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible" && engineMode === "stream" && el.video.readyState === 0 && started) {
+    if (document.visibilityState === "hidden") {
+      // A background tab needs no camera: light off, cycles saved.
+      if (cameraOpen) {
+        tracker.stop();
+        cameraOpen = false;
+        el.cam.srcObject = null;
+      }
+      return;
+    }
+    if (started) ensureCamera().catch(() => {});
+    if (engineMode === "stream" && el.video.readyState === 0 && started) {
       el.video.load();
       el.video.play().catch(() => {});
       if (renderer) renderer.watchFrames();
