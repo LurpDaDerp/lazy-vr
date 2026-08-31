@@ -831,6 +831,12 @@ async function runCalibration(headline) {
   // -- must not wake up later and fight the pass that replaced it.
   const run = ++calibrationRun;
   mediaPause();
+  // Calibration belongs in fullscreen: the size the video plays at.  A key
+  // press or a tap carries the permission; a programmatic rerun without a
+  // gesture is refused quietly and calibrates where it is.
+  if (!document.fullscreenElement) {
+    document.documentElement.requestFullscreen().catch(() => {});
+  }
   calibrated = false;
   awaitingGeneration = null;
   calibrationHeadline = headline;
