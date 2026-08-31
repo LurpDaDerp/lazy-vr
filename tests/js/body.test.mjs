@@ -168,12 +168,16 @@ test("home: sweeps back and arrives, from the limit too", () => {
   assert.ok(Math.abs(body.yaw) < 0.01 && Math.abs(body.pitch) < 0.01);
 });
 
-test("home: steering cancels it, and the view keeps the viewer's turn", () => {
+test("home: gaze is locked out until the view is home, then obeyed again", () => {
   const body = run(new Body(), 128, 0, 4);
   body.goHome();
-  for (let i = 0; i < 30; i++) body.step(ask(0, 0, false), DT);
-  body.step(ask(100, 0, true), DT);
+  // A committed hard steer mid-sweep changes nothing: R means R.
+  for (let i = 0; i < 30; i++) body.step(ask(100, 0, true), DT);
+  assert.ok(body.homing);
+  let frames = 0;
+  while (body.homing && frames < 1200) { body.step(ask(100, 0, true), DT); frames++; }
   assert.ok(!body.homing);
+  assert.ok(Math.abs(body.yaw) < 1, `arrived at ${body.yaw}`);
   run(body, 100, 0, 1);
   assert.ok(body.yawRate > 50);
 });

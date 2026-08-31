@@ -161,19 +161,16 @@ export class Body {
     let askedPitch = request.pitchRate || 0;
 
     if (this.homing) {
-      // Steering wins.  Nobody should have to sit out a sweep they have
-      // changed their mind about.
-      if (request.committed && (askedYaw || askedPitch)) {
+      // R means R: gaze is ignored until the view is home.  The sweep is
+      // brief, and a recentre that a stray glance could shoulder aside
+      // would not be a recentre.
+      askedYaw = -this.yaw * HOME_GAIN;
+      askedPitch = -this.pitch * HOME_GAIN;
+      const arrived = Math.abs(this.yaw) < HOME_SETTLED && Math.abs(this.pitch) < HOME_SETTLED
+        && Math.abs(this.yawRate) < 2 && Math.abs(this.pitchRate) < 2;
+      if (arrived) {
         this.homing = false;
-      } else {
-        askedYaw = -this.yaw * HOME_GAIN;
-        askedPitch = -this.pitch * HOME_GAIN;
-        const arrived = Math.abs(this.yaw) < HOME_SETTLED && Math.abs(this.pitch) < HOME_SETTLED
-          && Math.abs(this.yawRate) < 2 && Math.abs(this.pitchRate) < 2;
-        if (arrived) {
-          this.homing = false;
-          this.yaw = this.pitch = this.yawRate = this.pitchRate = 0;
-        }
+        this.yaw = this.pitch = this.yawRate = this.pitchRate = 0;
       }
     }
 

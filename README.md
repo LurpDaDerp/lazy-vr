@@ -134,7 +134,7 @@ are back in the library.
 
 | Key | |
 |---|---|
-| `R` | recentre — turn the view back to where the video started |
+| `R` | recentre — sweep back to the start; gaze is ignored until it arrives |
 | `C` | recalibrate — stare at the green dot |
 | `Space` | play / pause |
 | `F` | fullscreen |
