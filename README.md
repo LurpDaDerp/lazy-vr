@@ -1,8 +1,9 @@
 # LazyVR — steer YouTube's 360 videos with your eyes
 
-A web page. Open it, pick a 360 video from YouTube — off the shelves or by
-search — look around: look left and the view turns left, look back to the
-middle and it stops where it is. No headset, no mouse, no install, no ads.
+A web page. Open it, pick a 360 video — off YouTube's shelves, by search, or
+a file on your own disk — and look around: look left and the view turns left,
+look back to the middle and it stops where it is. No headset, no mouse, no
+install, no ads.
 
 Two pieces. The **page** does everything perceptual in the browser: the
 webcam, the face landmarks, the gaze model, the control law, the rendering.
@@ -70,7 +71,9 @@ Three hosting realities:
 - Every video byte a viewer watches flows **through the server**: give it
   bandwidth — an active 4K–8K viewer pulls tens of Mbit/s.
 - `yt-dlp` rots as YouTube changes; redeploy with a fresh one when streams
-  stop resolving.
+  stop resolving. Install it with `curl-cffi` alongside (both requirements
+  files ask for it) — that is what keeps a cloud host off youtube's bot
+  challenge, and it matters far more there than at home.
 - YouTube sometimes challenges **datacenter IPs** ("confirm you're not a
   bot"). If searches or streams die on a cloud host but work from home,
   that is what happened; a home or tailnet host is rarely challenged, and
@@ -78,9 +81,47 @@ Three hosting realities:
 
 ### When youtube challenges the server ("confirm you're not a bot")
 
-Give yt-dlp cookies. They must belong to the machine the **server** runs on
-— a site can never read a visitor's own youtube cookies, and must not try.
-Three ways in, by environment variable:
+Most of the answer is already in `server/source.py`, and it is worth knowing
+what it does before reaching for cookies.
+
+**Which player client is asked.** yt-dlp's stock pair is `visionos, web`,
+and measured against a live youtube only one of those two hands back plain
+https tracks without a PO token: `web` returns a format list with nothing
+fetchable in it, as do `tv`, `ios`, `mweb` and `web_safari`. So the ask
+climbs a ladder — `visionos` first, which serves an unknown IP with no
+token and no cookie, then widening to the token clients with
+`formats=missing_pot` so their tokenless tracks are offered rather than
+discarded. `LAZYVR_PLAYER_CLIENTS=visionos,tv` replaces the ladder outright
+if youtube treats your host differently.
+
+`android_vr` is deliberately *not* in that ladder, and it is worth saying
+why, because it is the obvious thing to reach for: it resolves beautifully
+from any IP, and every URL it produces then answers 403 — open range,
+bounded range, with its own `http_headers` or without. A client that
+resolves and cannot stream is worse than no client at all, because
+`pick_video` will happily choose its track over an identical playable one.
+
+**What the request looks like.** youtube reads the TLS and HTTP/2 handshake
+before it reads a cookie, and python's own fingerprint on a datacenter IP is
+exactly the pair that gets challenged. `curl-cffi` is in both requirements
+files for that reason: with it installed, requests carry Chrome's
+fingerprint. It is optional at runtime — without it the server asks for no
+impersonation rather than failing — and `LAZYVR_IMPERSONATE=off` opts out.
+
+**Never treating a thin list as an error.** yt-dlp's own format selector
+raises *"Requested format is not available"* when nothing matches
+`bestvideo+bestaudio`, which is not the same as "no formats" — and one
+trimmed list used to send every video in the library to the embed fallback.
+`ignore_no_formats_error` is set: the picker in `pick_streams` does the
+choosing, against what the asking browser said it can decode.
+
+**A different IP.** `LAZYVR_PROXY=socks5://host:port` when an address is
+simply burnt.
+
+If all of that still gets challenged, give yt-dlp cookies. They must belong
+to the machine the **server** runs on — a site can never read a visitor's
+own youtube cookies, and must not try. Three ways in, by environment
+variable:
 
 | Variable | Meaning |
 |---|---|
@@ -145,9 +186,18 @@ are back in the library.
 On a phone there is no keyboard; the buttons that matter appear on screen.
 
 The **settings** button (or `S` while playing) opens a panel: sensitivity,
-deadzone, field of view, motion blur, per-axis inversion, and a max-quality
-override for the display-matched cap. Everything applies live — mid-video
-included — and is saved on the device.
+deadzone, field of view, full-360 turning, motion blur, per-axis inversion,
+and a max-quality override for the display-matched cap. Everything applies
+live — mid-video included — and is saved on the device.
+
+**Full 360° turning** switches the neck off. By default the view has one —
+120° either way, tiring as it nears the end (see *The body*) — which reads
+like a person but does stop. Switch it on and yaw never ends: keep looking
+left and the view keeps coming round, as many times as you like. Pitch still
+stops at 100° either way, up or down, in both modes; there is no version of
+this where looking straight up and carrying on is anything but sickening.
+Switching the neck back *on* while the view is somewhere a neck could not
+reach sweeps home rather than snapping onto the limit.
 
 `?selftest` on the URL runs the gaze graph in *your* browser against the
 exporter's eight reference frames and reports the worst deviation, without
@@ -164,11 +214,47 @@ so the filter is also the projection check: everything that comes back
 renders correctly on the sphere. No API key is involved. Shelves are cached
 for six hours, searches for fifteen minutes.
 
-Picking a video resolves it with `yt-dlp`. Above 720p YouTube stores video
+### A video off your own disk
+
+**Play a file…** in the top bar — or drop a video anywhere on the page —
+plays it through the same sphere, with the same gaze steering, the same
+calibration and the same keys. The file never leaves the device: the page
+points a `<video>` element at an object URL and nothing is uploaded, copied
+or sent to the server, which is not consulted at all. Anything the browser
+can decode works; H.264 or VP9 in MP4 or WebM is the safe pair, and the
+footage wants to be equirectangular like everything else here. The one
+thing that differs is quality — a file has the one encode it was made with,
+so the automatic downshift has nothing to offer and stands down.
+
+Picking a video from YouTube resolves it with `yt-dlp`. Above 720p YouTube stores video
 and audio separately, so the page plays a `<video>` and an `<audio>` and
 `avsync.js` keeps them honest: state changes are mirrored as they happen,
 small drift is steered out by trimming the audio's playbackRate a few
 percent (inaudible), a stall's worth of drift is snapped.
+
+**The proxy reads in windows, and that is the whole ball game.** Measured
+against a live googlevideo — one signed URL, one file, one minute:
+
+| what was asked for | served at |
+|---|---|
+| `Range: bytes=0-` (open-ended) | 1.9 Mbit/s |
+| `Range: bytes=0-16777215` (16 MB) | 2.2 Mbit/s |
+| `Range: bytes=0-8388607` (8 MB) | 158 Mbit/s |
+| `Range: bytes=16777216-25165823` (8 MB, mid-file) | 150 Mbit/s |
+
+An open-ended range is served at roughly playback rate, and so is a bounded
+one over about ten megabytes; under that, it comes as fast as the link goes.
+And an open-ended range is exactly what a `<video>` element asks for first —
+so every clip used to arrive at 2 Mbit/s, which is survivable at 720p and
+hopeless at the 4K and 8K this player exists for. Worse, the symptom is not
+"slow download", it is the picture stuttering.
+
+So `relay()` reads 8 MB at a time and stitches the windows into one response
+— one status, one `Content-Range`, the length the reader actually asked for.
+The same 44 MB clip now arrives in 1.5 seconds instead of three minutes.
+(yt-dlp chunks for the same reason; `api/index.py` already did, because
+Vercel caps response bodies, which is why the serverless path never had
+this.)
 
 The page tells the server what it can decode (`vp9`/`av01`/`avc1`, in its
 own preference order) and the server picks the best track within that,
@@ -327,13 +413,37 @@ rate is not an angle: repeated forever while the tracker is quiet it would
 spin you round and round, so silence is read as "stop", never as "carry on",
 and a refound face has to wait out the commit delay before a turn resumes.
 
-## The gaze pipeline, in the browser
+## The gaze pipeline, in the browser — and off the main thread
 
-`gaze.js` runs where the camera is. MediaPipe's FaceLandmarker
+`gaze-core.js` is the pipeline. MediaPipe's FaceLandmarker
 (`@mediapipe/tasks-vision`) reads `face_landmarker.task`; onnxruntime-web
 runs `gaze_direct.onnx`; `geometry.js` builds the model's inputs. Both
 libraries load from jsDelivr with pinned versions; the model files load
 from the site.
+
+**It runs in a worker.** Two landmarker passes and an ONNX graph, thirty
+times a second, is twenty to forty milliseconds of work per frame — on the
+main thread that is most of the frame budget, sitting squarely between the
+render loop and the screen, and the view stutters not because the maths is
+wrong but because nothing got to draw. (This is why the same pipeline felt
+smooth when it ran on a Python server: the browser had nothing left to do
+but draw.) So `gaze.js` keeps only what must happen on the page —
+`getUserMedia`, which no worker can call — and hands the rest to
+`gaze-worker.js`, best way first:
+
+| | how frames get there | costs the page |
+|---|---|---|
+| worker | a `MediaStreamTrackProcessor`'s `ReadableStream` is *transferred*, and the worker reads frames from it | nothing per frame |
+| frames | no such processor (Firefox, Safari): one `ImageBitmap` at a time, each answered so exactly one is ever in flight | the grab |
+| inline | no worker, or the worker would not load: the pipeline runs on the page, as it always did | all of it |
+
+The track itself stays on the page even in the first case — transferring it
+would leave nothing on this side able to switch the camera light off.
+`gaze-worker.js` is a **classic** worker although everything it loads is a
+module: MediaPipe's fileset resolver loads its wasm with `importScripts()`,
+which a module worker is forbidden to have (in one, the face model dies with
+`ModuleFactory not set.`), and a classic worker can still pull in ES modules
+with dynamic `import()`.
 
 Per frame: detect landmarks on the raw camera frame, detect again on a
 horizontally flipped copy and un-mirror it through the 478-point left/right
@@ -346,7 +456,8 @@ mirror, whose gaze is un-mirrored and averaged with the direct one.
 
 The detector sees the **raw** frame, never a mirrored one, because the sign
 of "left" depends on it: the camera's +x is image right, which is where your
-own left lands. The preview is mirrored for display only, in CSS.
+own left lands. There is no camera preview — nobody came here to watch
+themself — so nothing on the page has to agree with a mirror.
 
 `geometry.js` is held to the numpy original by a fixture the numpy produced
 (`tests/fixtures/geometry_parity.json`, made by `tools/export_fixtures.py`):
@@ -374,14 +485,20 @@ The control law's tests pin its defining properties — a held gaze keeps
 turning, a brief glance moves nothing, both axes reach the same speed at the
 same share of their travel on any screen shape. The body's pin the neck: exact
 limits on each axis, the ellipse never exceeded from any direction, the sweep
-slowing band by band, release free, sliding a crawl. The source's pin what
-counts as a clip and which format each browser is handed; they run without
-yt-dlp or the network.
+slowing band by band, release free, sliding a crawl — and, with full-360
+turning on, yaw running past the limit and wrapping while pitch still stops
+dead at 100°. The source's pin what counts as a clip, which format each
+browser is handed, which player clients are asked in what order, and how a
+Range header is read and cut down to a window; they run without yt-dlp or
+the network.
 
 ## Layout
 
 ```
 site/            the page: index.html, style.css, js/, models/
+                 js/gaze.js is the camera and the choice of where the
+                 pipeline runs; js/gaze-core.js is the pipeline;
+                 js/gaze-worker.js is the worker that usually hosts it
 server/          app.py (aiohttp: static + api + stream proxy), source.py
                  (search, format picking), requirements.txt
 tools/           export_fixtures.py (regenerates the parity fixtures)
@@ -398,8 +515,24 @@ is not `localhost`, the browser will not even ask.
 **A shelf or search says youtube gave nothing back.** Almost always a stale
 `yt-dlp`: `pip install -U yt-dlp` (or rebuild the container) and restart.
 
-**"Would not stream" on every video.** Same cure. If only one video, it is
-usually age-restricted or region-locked — those resolve for no one.
+**Video stalls and re-buffers, or a 4K clip never keeps up.** This was the
+open-ended-range throttle (above); if it comes back, check that the proxy is
+still reading in windows — a single upstream request for a whole track is
+served at playback rate and nothing else will look wrong.
+
+**"Raw stream refused" on every video, and youtube's own player instead.**
+The toast now names what youtube objected to, and the console carries the
+whole error. On a cloud host it is the bot challenge: check `curl-cffi`
+actually installed (it is what supplies the browser TLS fingerprint), then
+try `LAZYVR_PLAYER_CLIENTS`, then cookies — all three above. Anywhere else
+it is usually a stale `yt-dlp`: `pip install -U yt-dlp` and restart. If only
+one video does it, it is age-restricted or region-locked, and those resolve
+for no one.
+
+**A local file will not play.** The browser has to be able to decode it on
+its own — the page hands the file straight to a `<video>` element and does
+no transcoding. H.264 or VP9 in MP4 or WebM plays everywhere; HEVC, ProRes
+and most `.mkv` do not.
 
 **The video stays black in a background tab.** Chrome does not load media in
 a tab that is not in front. Bring it forward; the page reloads it.

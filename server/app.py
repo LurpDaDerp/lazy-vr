@@ -14,6 +14,9 @@ Three jobs, nothing else:
   page needs the video as a WebGL texture, which is exactly the fetch CORS
   guards.  Same-origin proxying settles both at once.  It also means every
   video byte flows through this process: host it somewhere with bandwidth.
+  Every upstream read is bounded to one window (see source.bounded_range):
+  some signed urls answer a bounded range and 403 an open-ended one, and
+  open-ended is exactly what a <video> element asks for first.
 
 No ad system exists in this path: the page plays the raw stream.
 """
@@ -191,18 +194,104 @@ async def api_streams(request: web.Request) -> web.Response:
 COPY_HEADERS = ("Content-Type", "Content-Length", "Content-Range", "Accept-Ranges")
 
 
-async def media(request: web.Request) -> web.StreamResponse:
-    vid = checked_id(request)
-    kind = request.match_info["kind"]
-    if kind not in ("video", "audio"):
-        raise web.HTTPNotFound()
-    codecs, max_height = stream_prefs(request)
+async def open_relay(request: web.Request, upstream, start: int, last: int | None,
+                     total: int | None) -> web.StreamResponse:
+    """Head the reader's response, describing what *it* asked for rather
+    than the one window we happen to have fetched so far."""
+    ranged = "Range" in request.headers
+    response = web.StreamResponse(status=206 if ranged else 200)
+    if upstream.headers.get("Content-Type"):
+        response.headers["Content-Type"] = upstream.headers["Content-Type"]
+    response.headers["Accept-Ranges"] = "bytes"
+    response.headers["Cache-Control"] = "no-store"
+    if total is not None:
+        end = total - 1 if last is None else min(last, total - 1)
+        response.headers["Content-Length"] = str(max(0, end - start + 1))
+        if ranged:
+            response.headers["Content-Range"] = f"bytes {start}-{end}/{total}"
+    await response.prepare(request)
+    return response
 
-    headers = {}
-    if "Range" in request.headers:
-        headers["Range"] = request.headers["Range"]
 
+async def relay(request: web.Request, vid: str, kind: str, codecs: tuple[str, ...],
+                max_height: int, start: int, last: int | None) -> web.StreamResponse:
+    """Bytes ``start``..``last`` (or to the end): one response to the reader,
+    a series of bounded windows upstream.
+
+    The windowing is what makes it fast.  googlevideo serves an open-ended
+    range at roughly playback rate and a bounded one under about ten
+    megabytes at line rate -- a difference of nearly two orders of
+    magnitude, measured (see source.UPSTREAM_WINDOW) -- and ``Range:
+    bytes=0-`` is exactly what a <video> element asks for first.  Stitching
+    the windows here rather than making the player come back for each one
+    keeps the response honest: one status, one Content-Range, the length
+    the reader actually asked for.
+    """
     session: ClientSession = request.app["session"]
+    response: web.StreamResponse | None = None
+    position = start
+    total: int | None = None
+    refreshed = False
+
+    try:
+        while last is None or position <= last:
+            window_start = position
+            stop = position + source.UPSTREAM_WINDOW - 1
+            if last is not None:
+                stop = min(stop, last)
+            if total is not None:
+                if position >= total:
+                    break
+                stop = min(stop, total - 1)
+
+            try:
+                picked = await picked_for(vid, codecs, max_height, force=False)
+            except Exception as error:
+                if response is not None:
+                    break
+                raise web.HTTPBadGateway(reason=clean_error(error))
+            fmt = picked.get(kind)
+            if not fmt:
+                if response is not None:
+                    break
+                raise web.HTTPNotFound(reason=f"this clip has no separate {kind} track")
+
+            stale = False
+            async with session.get(fmt["url"], headers={"Range": f"bytes={position}-{stop}"}) as upstream:
+                if upstream.status in (403, 410) and not refreshed:
+                    stale = True  # the signed url went stale; resolve afresh, once
+                elif upstream.status >= 400:
+                    if response is None:
+                        raise web.HTTPBadGateway(reason=f"youtube said {upstream.status}")
+                    break  # mid-stream: stop where we are rather than lie
+                else:
+                    if response is None:
+                        total = source.total_size(upstream.headers.get("Content-Range"))
+                        response = await open_relay(request, upstream, start, last, total)
+                    async for chunk in upstream.content.iter_chunked(1 << 16):
+                        await response.write(chunk)
+                        position += len(chunk)
+                    if position <= stop:
+                        break  # a short window is the end of the file
+            if stale:
+                refreshed = True
+                await picked_for(vid, codecs, max_height, force=True)
+                position = window_start
+    except (ConnectionResetError, asyncio.CancelledError):
+        pass  # the <video> element seeks by dropping connections
+    if response is None:
+        raise web.HTTPBadGateway(reason="youtube keeps refusing the stream")
+    await response.write_eof()
+    return response
+
+
+async def passthrough(request: web.Request, vid: str, kind: str, codecs: tuple[str, ...],
+                      max_height: int) -> web.StreamResponse:
+    """One upstream request, relayed verbatim.  For the Range forms relay
+    declines to rewrite -- a suffix range, a multipart one -- which no media
+    element sends but a curious client might."""
+    session: ClientSession = request.app["session"]
+    headers = {"Range": request.headers["Range"]}
     for attempt in (1, 2):
         try:
             picked = await picked_for(vid, codecs, max_height, force=attempt > 1)
@@ -212,7 +301,6 @@ async def media(request: web.Request) -> web.StreamResponse:
         if not fmt:
             raise web.HTTPNotFound(reason=f"this clip has no separate {kind} track")
         async with session.get(fmt["url"], headers=headers) as upstream:
-            # A signed URL that has gone stale answers 403; resolve afresh once.
             if upstream.status in (403, 410) and attempt == 1:
                 continue
             response = web.StreamResponse(status=upstream.status)
@@ -226,10 +314,22 @@ async def media(request: web.Request) -> web.StreamResponse:
                 async for chunk in upstream.content.iter_chunked(1 << 16):
                     await response.write(chunk)
             except (ConnectionResetError, asyncio.CancelledError):
-                pass  # the <video> element seeks by dropping connections
+                pass
             await response.write_eof()
             return response
     raise web.HTTPBadGateway(reason="youtube keeps refusing the stream")
+
+
+async def media(request: web.Request) -> web.StreamResponse:
+    vid = checked_id(request)
+    kind = request.match_info["kind"]
+    if kind not in ("video", "audio"):
+        raise web.HTTPNotFound()
+    codecs, max_height = stream_prefs(request)
+    asked = source.parse_range(request.headers.get("Range"))
+    if asked is None:
+        return await passthrough(request, vid, kind, codecs, max_height)
+    return await relay(request, vid, kind, codecs, max_height, *asked)
 
 
 # ---------------------------------------------------------------- wiring

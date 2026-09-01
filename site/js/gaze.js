@@ -1,49 +1,33 @@
-/* Webcam -> MediaPipe landmarks -> gaze angles, all in the browser.
+/* The camera, and where the gaze pipeline runs.
  *
- * The same pipeline the Python server used to run, now where the camera is:
- * MediaPipe's FaceLandmarker reads the same .task file, onnxruntime-web runs
- * the same gaze_direct.onnx, and geometry.js builds the model's inputs the
- * same way (held to the numpy original by a fixture).
+ * The pipeline itself lives in gaze-core.js and knows nothing about cameras
+ * or pages.  This file owns the one thing that must happen on the page --
+ * getUserMedia, which no worker can call -- and then gets the work as far
+ * away from the render loop as the browser will allow.  Three ways, best
+ * first:
  *
- * Two extraction passes per frame, as the reference pipeline did: the frame
- * as captured and horizontally flipped, each with its own detection, and the
- * mean of the two clouds goes to the model.  The two disagree by about a
- * hundredth of an interocular distance at the irises, and averaging cancels
- * the extractor's per-side noise and its side-dependent pitch offset.  On a
- * device that cannot keep up, the second pass is dropped rather than the
- * frame rate.
+ *   worker  a MediaStreamTrackProcessor turns the camera track into a
+ *           stream of frames and the *stream* is transferred, so the worker
+ *           reads them and the page does nothing at all per frame -- while
+ *           the track stays here, where stopping it still turns the camera
+ *           light off.  That is the whole point: gaze inference is twenty
+ *           to forty milliseconds of main-thread work at 30 Hz, and the
+ *           view stuttered because the render loop queued behind it.
+ *   frames  no MediaStreamTrackProcessor (Firefox, Safari): the page grabs
+ *           one ImageBitmap at a time and hands it over.  The inference
+ *           still happens in the worker; only the grab costs the page
+ *           anything, and the worker answers every frame so exactly one is
+ *           ever in flight.
+ *   inline  no worker at all, or the worker would not load its models: the
+ *           pipeline runs here, as it always did.
  *
- * The detector sees the RAW frame, never a mirrored one: that fixes the sign
- * unambiguously.  The camera's +x is image right, which is where the
- * viewer's own left lands, so looking left gives atan2(x, z) > 0.  The
- * preview is mirrored for display only, in CSS.
+ * The preview is gone, and with it the reason to think about mirroring on
+ * this side at all: the detector sees the raw frame, which is what fixes the
+ * sign.  The camera's +x is image right, which is where the viewer's own
+ * left lands, so looking left gives atan2(x, z) > 0.
  */
 
-import { FaceLandmarker, FilesetResolver } from
-  "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/vision_bundle.mjs";
-import * as ort from
-  "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/ort.wasm.min.mjs";
-
-import {
-  NUM_LANDMARKS, SubjectStatistics, averageClouds, cameraContext, combineGaze,
-  eyeVisibility, flattenLandmarks, gazeAngles, landmarkValidity, mirrorCloud,
-  mirrorContext, mirrorValidity, weak3dCloud,
-} from "./geometry.js";
-
-const MEDIAPIPE_WASM = "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@1.0.1/wasm";
-const ORT_DIST = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/";
-
-/* Calibrated fx / image width for a typical webcam; the model's context ray
- * is scaled by it. */
-export const FOCAL_SCALE = 0.75;
-/* The flipped frame is drawn this wide for its detection; the landmarks are
- * normalised, so only the aspect ratio has to be honest. */
-const MIRROR_WIDTH = 640;
-/* If a frame takes longer than this on average the mirror pass is dropped:
- * a single pass at a usable rate beats two passes at a crawl.  Kept tight,
- * because every extraction runs on the main thread, and main-thread time is
- * exactly what smooth camera motion is made of. */
-const MIRROR_BUDGET_MS = 45;
+import { GazeEngine } from "./gaze-core.js";
 
 export class GazeTracker {
   /* `models`: URL of the folder with gaze_direct.onnx, the .task file, the
@@ -56,100 +40,123 @@ export class GazeTracker {
     this.video = null;
     this.stream = null;
     this.running = false;
-    this.mirror = true;
-    this.frameTimes = [];
     this.rate = 0;
     this.error = null;
+    this.worker = null;
+    this.engine = null;
+    this.mode = "inline";
+    this.runId = 0;
+    this._mirror = true;
+    this.pendingLoad = null;
+    this.pendingTest = null;
+  }
+
+  /* The second extraction pass, which the page drops when a device is
+   * struggling.  Wherever the pipeline is, the flag has to reach it -- and
+   * the pipeline drops the pass on its own account too, so every reading
+   * carries the truth back. */
+  get mirror() {
+    return this._mirror;
+  }
+
+  set mirror(value) {
+    const want = Boolean(value);
+    if (want === this._mirror) return;
+    this._mirror = want;
+    if (this.worker) this.worker.postMessage({ type: "mirror", value: want });
+    if (this.engine) this.engine.mirror = want;
   }
 
   // -- loading ----------------------------------------------------------
 
   async load() {
-    this.onStatus("Loading the gaze model…");
-    const [meta, permutation] = await Promise.all([
-      fetch(`${this.models}/gaze_direct.meta.json`).then((r) => r.json()),
-      fetch(`${this.models}/mirror_permutation.json`).then((r) => r.json()),
-    ]);
-    if (permutation.length !== NUM_LANDMARKS) throw new Error("mirror permutation must have 478 entries");
-    this.permutation = Int32Array.from(permutation);
-    const gate = meta.eye_gate || {};
-    this.eyeGate = [Number(gate.low ?? 0), Number(gate.high ?? 0)];
-    const stats = meta.subject_stats || {};
-    this.stats = new SubjectStatistics(stats.training_mean || [0, 0, 0, 0]);
+    if (await this.loadWorker()) return;
+    this.mode = "inline";
+    this.engine = new GazeEngine({ models: this.models, onStatus: this.onStatus });
+    this.engine.mirror = this._mirror;
+    await this.engine.load();
+  }
 
-    ort.env.wasm.wasmPaths = ORT_DIST;
-    // One thread: multi-threaded WASM needs cross-origin isolation headers a
-    // plain static host does not send, and this graph is small.
-    ort.env.wasm.numThreads = 1;
-    this.session = await ort.InferenceSession.create(`${this.models}/gaze_direct.onnx`, {
-      executionProviders: ["wasm"],
-      graphOptimizationLevel: "all",
-    });
-    const context = this.session.inputNames;
-    for (const name of ["cloud", "context", "validity"]) {
-      if (!context.includes(name)) throw new Error(`model is missing input ${name}`);
-    }
-    this.contextWidth = 7;  // ray_x, ray_y, iod/focal + the four subject statistics
-
-    this.onStatus("Loading the face model…");
-    const fileset = await FilesetResolver.forVisionTasks(MEDIAPIPE_WASM);
-    const options = (runningMode) => ({
-      baseOptions: { modelAssetPath: `${this.models}/face_landmarker.task`, delegate: "GPU" },
-      runningMode,
-      numFaces: 1,
-      minFaceDetectionConfidence: 0.5,
-      minFacePresenceConfidence: 0.5,
-      minTrackingConfidence: 0.5,
-      outputFaceBlendshapes: false,
-      outputFacialTransformationMatrixes: false,
-    });
+  /* Build the worker and have it load the models.  Returns false for any
+   * reason at all -- no Worker, no dynamic import there, a GPU delegate that
+   * will not start -- and the caller falls back to loading in-process, so a
+   * browser that cannot do this is slower but never broken.
+   *
+   * Classic, not module: MediaPipe's wasm loader needs importScripts, which
+   * a module worker does not have. */
+  async loadWorker() {
+    if (typeof Worker === "undefined") return false;
+    let worker;
     try {
-      this.landmarker = await FaceLandmarker.createFromOptions(fileset, options("VIDEO"));
-      this.flippedLandmarker = await FaceLandmarker.createFromOptions(fileset, options("IMAGE"));
-    } catch (error) {
-      // No usable GPU delegate: fall back to the CPU one.
-      const cpu = (mode) => ({ ...options(mode), baseOptions: { ...options(mode).baseOptions, delegate: "CPU" } });
-      this.landmarker = await FaceLandmarker.createFromOptions(fileset, cpu("VIDEO"));
-      this.flippedLandmarker = await FaceLandmarker.createFromOptions(fileset, cpu("IMAGE"));
+      worker = new Worker(new URL("./gaze-worker.js", import.meta.url));
+    } catch {
+      return false;
     }
-
-    this.flipCanvas = document.createElement("canvas");
-    this.flipContext = this.flipCanvas.getContext("2d", { willReadFrequently: false });
-    // One set of batch buffers for the life of the tracker: allocating
-    // ~12 KB of Float32Arrays thirty times a second is pure GC churn.
-    this.cloudBatch = new Float32Array(2 * NUM_LANDMARKS * 3);
-    this.contextBatch = new Float32Array(2 * this.contextWidth);
-    this.validityBatch = new Float32Array(2 * NUM_LANDMARKS);
-    await this.warmUp();
-    this.onStatus("Ready");
+    const settled = new Promise((resolve) => { this.pendingLoad = resolve; });
+    worker.onmessage = (event) => this.fromWorker(event.data);
+    worker.onerror = () => {
+      if (this.pendingLoad) { this.pendingLoad(false); this.pendingLoad = null; }
+    };
+    // The worker resolves URLs against its own location, one folder deeper
+    // than the page; the models folder has to be named absolutely.
+    worker.postMessage({ type: "load", models: new URL(this.models, location.href).href });
+    if (!await settled) {
+      worker.terminate();
+      return false;
+    }
+    this.worker = worker;
+    this.mode = "worker";
+    return true;
   }
 
-  async warmUp() {
-    const cloud = new Float32Array(2 * NUM_LANDMARKS * 3);
-    cloud[33 * 3] = -0.5; cloud[263 * 3] = 0.5;
-    cloud[NUM_LANDMARKS * 3 + 33 * 3] = -0.5; cloud[NUM_LANDMARKS * 3 + 263 * 3] = 0.5;
-    await this.run(cloud, new Float32Array(2 * this.contextWidth), new Float32Array(2 * NUM_LANDMARKS).fill(1));
+  fromWorker(data) {
+    switch (data.type) {
+      case "status":
+        this.onStatus(data.text);
+        break;
+      case "loaded":
+      case "loadfailed":
+        if (data.message) console.warn("LazyVR: the gaze worker would not start —", data.message);
+        if (this.pendingLoad) { this.pendingLoad(data.type === "loaded"); this.pendingLoad = null; }
+        break;
+      case "reading":
+        this._mirror = data.reading.mirror;
+        this.rate = data.reading.rate;
+        this.onReading(data.reading);
+        break;
+      case "ready":
+        this.inflight = false;
+        break;
+      case "error":
+        this.error = new Error(data.message);
+        break;
+      case "selftest":
+        if (this.pendingTest) {
+          if (data.message) this.pendingTest.reject(new Error(data.message));
+          else this.pendingTest.resolve(data.worst);
+          this.pendingTest = null;
+        }
+        break;
+      default:
+        break;
+    }
   }
 
-  /* Prove the graph reproduces the exporter's reference frames, as the
-   * Python self-test did.  Returns the worst |dgaze|. */
-  async selfTest() {
-    const parity = await fetch(`${this.models}/parity.json`).then((r) => r.json());
-    const batch = parity.cloud.length;
-    const cloud = Float32Array.from(parity.cloud.flat(2));
-    const context = Float32Array.from(parity.context.flat());
-    const validity = Float32Array.from(parity.validity.flat());
-    const { gaze } = await this.run(cloud, context, validity, batch);
-    let worst = 0;
-    parity.gaze.flat().forEach((expected, i) => { worst = Math.max(worst, Math.abs(gaze[i] - expected)); });
-    if (!(worst <= parity.tolerance)) throw new Error(`parity diff ${worst.toExponential(2)} exceeds ${parity.tolerance}`);
-    return worst;
+  /* Prove the graph reproduces the exporter's reference frames, wherever it
+   * ended up running.  Returns the worst |dgaze|. */
+  selfTest() {
+    if (!this.worker) return this.engine.selfTest();
+    return new Promise((resolve, reject) => {
+      this.pendingTest = { resolve, reject };
+      this.worker.postMessage({ type: "selftest" });
+    });
   }
 
   // -- the camera ---------------------------------------------------------
 
   /* Ask for the front camera.  Throws with a readable message when it is
-   * refused or absent. */
+   * refused or absent.  `videoElement` carries the frames only on the paths
+   * that need it; the worker prefers to hold the track itself. */
   async open(videoElement) {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error(window.isSecureContext
@@ -172,6 +179,22 @@ export class GazeTracker {
       throw new Error(`The camera could not be opened (${why || error}).`);
     }
     this.video = videoElement;
+
+    if (this.worker && typeof MediaStreamTrackProcessor !== "undefined") {
+      const [track] = this.stream.getVideoTracks();
+      try {
+        // The stream of frames goes; the track stays.  Transferring the
+        // track itself would work too, and would leave nothing on this side
+        // able to switch the camera off.
+        const frames = new MediaStreamTrackProcessor({ track }).readable;
+        this.worker.postMessage({ type: "stream", stream: frames }, [frames]);
+        this.mode = "worker";
+        this.onStatus("Camera running");
+        return;
+      } catch { /* not available here after all; carry the frames over */ }
+    }
+
+    this.mode = this.worker ? "frames" : "inline";
     this.video.srcObject = this.stream;
     this.video.muted = true;
     this.video.playsInline = true;
@@ -184,19 +207,27 @@ export class GazeTracker {
   }
 
   start() {
-    if (this.running || !this.video) return;
+    if (this.running) return;
+    if (this.mode === "worker") {
+      if (!this.stream) return;
+      this.running = true;
+      this.worker.postMessage({ type: "start" });
+      return;
+    }
+    if (!this.video) return;
     this.running = true;
     this.busy = false;
+    this.inflight = false;
     this.lastVideoTime = -1;
     // The token retires the previous session's tick chain.  Without it, a
     // stopped chain's still-pending frame callback sees `running` true
     // again after a restart and keeps rescheduling itself -- one extra
     // chain per stop/start cycle, forever, until a reload.
-    const run = this.runId = (this.runId || 0) + 1;
+    const run = this.runId = this.runId + 1;
     const tick = () => {
       if (!this.running || this.runId !== run) return;
       this.schedule(tick);
-      if (this.busy) return;
+      if (this.busy || this.inflight) return;
       if (this.video.currentTime === this.lastVideoTime) return;
       this.lastVideoTime = this.video.currentTime;
       this.busy = true;
@@ -210,114 +241,33 @@ export class GazeTracker {
     else requestAnimationFrame(tick);
   }
 
+  /* One frame, on whichever of the two page-driven paths is in force. */
+  async frame() {
+    const atMs = performance.timeOrigin + performance.now();
+    if (this.mode === "frames") {
+      const image = await createImageBitmap(this.video);
+      // Answered with "ready", so exactly one frame is ever in flight and
+      // the worker is never handed a backlog it can only throw away.
+      this.inflight = true;
+      this.worker.postMessage({ type: "frame", image, atMs }, [image]);
+      return;
+    }
+    const reading = await this.engine.process(
+      this.video, this.video.videoWidth, this.video.videoHeight, atMs);
+    if (!reading) return;
+    this._mirror = reading.mirror;
+    this.rate = reading.rate;
+    this.onReading(reading);
+  }
+
   stop() {
     this.running = false;
+    this.runId += 1;
+    this.inflight = false;
+    if (this.worker) this.worker.postMessage({ type: "stop" });
+    // Stopping the track also ends the transferred frame stream, so the
+    // worker's read loop finishes on its own.
     if (this.stream) for (const track of this.stream.getTracks()) track.stop();
     this.stream = null;
   }
-
-  // -- one frame ----------------------------------------------------------
-
-  async frame() {
-    const started = performance.now();
-    const width = this.video.videoWidth, height = this.video.videoHeight;
-    if (!width || !height) return;
-
-    const result = this.landmarker.detectForVideo(this.video, started);
-    const face = result.faceLandmarks && result.faceLandmarks[0];
-    if (!face) {
-      this.emit({ yaw: 0, pitch: 0, tracked: false, confidence: 0 }, [0, 0], 0, started);
-      return;
-    }
-
-    let landmarks = flattenLandmarks(face);
-    if (this.mirror) {
-      const flipped = this.detectFlipped(width, height);
-      if (flipped) landmarks = averageClouds(landmarks, flatten(flipped), this.permutation);
-    }
-
-    let cloud, context, validity;
-    try {
-      cloud = weak3dCloud(landmarks, width, height);
-      context = cameraContext(landmarks, width, height, FOCAL_SCALE);
-      validity = landmarkValidity(landmarks);
-    } catch (error) {
-      this.emit({ yaw: 0, pitch: 0, tracked: false, confidence: 0 }, [0, 0], 0, started);
-      return;
-    }
-    context = context.concat(this.stats.push(cloud));
-
-    const gaze = await this.predict(cloud, context, validity);
-    const [yaw, pitch] = gazeAngles(gaze);
-    let inside = 0;
-    for (let i = 0; i < NUM_LANDMARKS; i++) inside += validity[i];
-    // The fraction of landmarks inside the frame is the honest quality
-    // signal.  Eye visibility is not: the far-eye gate is relative, so it
-    // drops exactly when the viewer turns -- when we most want to pan.
-    this.emit({ yaw, pitch, tracked: true, confidence: inside / NUM_LANDMARKS },
-      eyeVisibility(cloud, ...this.eyeGate), performance.now() - started, started);
-  }
-
-  detectFlipped(width, height) {
-    const w = Math.min(MIRROR_WIDTH, width);
-    const h = Math.max(1, Math.round(height * w / width));
-    if (this.flipCanvas.width !== w || this.flipCanvas.height !== h) {
-      this.flipCanvas.width = w;
-      this.flipCanvas.height = h;
-    }
-    const ctx = this.flipContext;
-    ctx.setTransform(-1, 0, 0, 1, w, 0);
-    ctx.drawImage(this.video, 0, 0, w, h);
-    const result = this.flippedLandmarker.detect(this.flipCanvas);
-    return result.faceLandmarks && result.faceLandmarks[0];
-  }
-
-  /* Mirror test-time augmentation in one batch-2 call: the second row is the
-   * left/right-permuted cloud with x negated, the context ray's x negated
-   * and the validity permuted; its gaze is un-mirrored and averaged with the
-   * direct row. */
-  async predict(cloud, context, validity) {
-    this.cloudBatch.set(cloud, 0);
-    this.cloudBatch.set(mirrorCloud(cloud, this.permutation), NUM_LANDMARKS * 3);
-    this.contextBatch.set(context, 0);
-    this.contextBatch.set(mirrorContext(context), this.contextWidth);
-    this.validityBatch.set(validity, 0);
-    this.validityBatch.set(mirrorValidity(validity, this.permutation), NUM_LANDMARKS);
-    const { gaze } = await this.run(this.cloudBatch, this.contextBatch, this.validityBatch);
-    return combineGaze(gaze.subarray(0, 3), gaze.subarray(3, 6));
-  }
-
-  async run(cloud, context, validity, batch = 2) {
-    const feeds = {
-      cloud: new ort.Tensor("float32", cloud, [batch, NUM_LANDMARKS, 3]),
-      context: new ort.Tensor("float32", context, [batch, this.contextWidth]),
-      validity: new ort.Tensor("float32", validity, [batch, NUM_LANDMARKS]),
-    };
-    const out = await this.session.run(feeds);
-    return { gaze: out.gaze.data, rotation: out.rotation.data };
-  }
-
-  emit(sample, visibility, latencyMs, startedMs) {
-    const now = performance.now();
-    this.frameTimes.push(now);
-    if (this.frameTimes.length > 60) this.frameTimes.shift();
-    if (this.frameTimes.length > 1) {
-      const span = this.frameTimes[this.frameTimes.length - 1] - this.frameTimes[0];
-      this.rate = (this.frameTimes.length - 1) / (span / 1000);
-      const period = span / (this.frameTimes.length - 1);
-      // Drop the second extraction pass if this device cannot afford it.
-      if (this.mirror && this.frameTimes.length >= 30 && period > MIRROR_BUDGET_MS) this.mirror = false;
-    }
-    this.onReading({
-      sample: { ...sample, timestamp: startedMs / 1000 },
-      eyeVisibility: visibility,
-      latencyMs,
-      rate: this.rate,
-      mirror: this.mirror,
-    });
-  }
-}
-
-function flatten(points) {
-  return flattenLandmarks(points);
 }

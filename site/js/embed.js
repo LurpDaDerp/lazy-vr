@@ -40,17 +40,26 @@ export function sphericalFromView(view) {
   };
 }
 
-/* The iframe is sized for the display's real pixels (capped at 2x so the
- * player's own 360 rendering keeps up -- an oversized canvas is exactly
- * what makes camera motion choppy).  The quality *tier* is not left to the
- * player's size heuristics at all: forceBest() pins it explicitly, which
- * is both sharper and cheaper than impersonating a huge viewport. */
+/* The iframe is built at window size and no larger.
+ *
+ * It used to be built at the display's pixel density -- 2x linear, four
+ * times the area on a retina panel -- on the theory that a big viewport
+ * coaxes a better tier out of the player.  It does not: forceBest() pins
+ * the tier explicitly, so all the extra pixels bought was a 360 renderer
+ * doing four times the work per frame, inside an iframe, while our camera
+ * updates queued up behind it.  That was most of the embed's judder. */
 export function overscanFor(width, height, dpr = 1) {
-  return Math.min(2, Math.max(1, dpr));
+  return 1;
 }
 
-/* Steering is a postMessage per call; only bother when the view moved. */
-export function movedEnough(last, next, epsilon = 0.02) {
+/* Steering is a postMessage per call; only bother when the view moved.
+ *
+ * The threshold is a tenth of a degree rather than a hundredth, because the
+ * body never quite holds still -- the idle sway alone would otherwise post a
+ * message every frame for the length of the clip, and the player would
+ * redraw for a movement no one can see.  A real turn is 0.2 degrees per
+ * frame at its slowest, so nothing the viewer asked for is ever missed. */
+export function movedEnough(last, next, epsilon = 0.1) {
   if (!last) return true;
   const yawGap = Math.abs((((next.yaw - last.yaw) % 360) + 540) % 360 - 180);
   return yawGap > epsilon

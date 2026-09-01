@@ -140,16 +140,11 @@ def api_streams(vid, params):
 
 def media(environ, start_response, vid, kind, params):
     codecs, max_height = prefs_from(params)
-    # Clamp whatever range the browser asked for to one bounded chunk;
-    # it will come back for the next one on its own.
-    header = environ.get("HTTP_RANGE", "bytes=0-")
-    try:
-        first, _, last = header.split("=", 1)[1].partition("-")
-        start = int(first or 0)
-        end = int(last) if last else start + CHUNK - 1
-    except (ValueError, IndexError):
-        start, end = 0, CHUNK - 1
-    end = min(end, start + CHUNK - 1)
+    # Clamp whatever range the browser asked for to one bounded chunk: the
+    # platform buffers function bodies with a hard ceiling, and googlevideo
+    # refuses an open-ended range on some signed urls anyway.  The <video>
+    # element comes back for the next chunk on its own.
+    asked = source.bounded_range(environ.get("HTTP_RANGE"), window=CHUNK)
 
     for attempt in (1, 2):
         try:
@@ -159,7 +154,7 @@ def media(environ, start_response, vid, kind, params):
         fmt = picked.get(kind)
         if not fmt:
             return json_response(start_response, 404, {"error": f"no separate {kind} track"})
-        request = Request(fmt["url"], headers={"Range": f"bytes={start}-{end}"})
+        request = Request(fmt["url"], headers={"Range": asked})
         try:
             with urlopen(request, timeout=40) as upstream:
                 body = upstream.read()

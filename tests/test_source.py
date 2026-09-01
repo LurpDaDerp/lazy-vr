@@ -228,10 +228,162 @@ class CookieTests(unittest.TestCase):
     def test_blank_content_is_no_configuration(self):
         self.assertEqual(source.cookie_options({"LAZYVR_COOKIES": "  \n"}), {})
 
-    def test_the_options_ride_into_every_ydl_call(self):
+
+class PlayableTests(unittest.TestCase):
+    """What "youtube gave us something we can use" means, before any codec
+    preference gets a say: at least one plain-https video track."""
+
+    def test_a_real_format_list_is_playable(self):
+        self.assertTrue(source.has_playable({"formats": [video_fmt(), audio_fmt()]}))
+
+    def test_storyboards_and_manifests_are_not(self):
+        self.assertFalse(source.has_playable({"formats": [
+            video_fmt(protocol="m3u8_native"),
+            video_fmt(vcodec="none", acodec="none", format_id="sb0"),
+            audio_fmt(),
+        ]}))
+
+    def test_nothing_at_all_is_not(self):
+        self.assertFalse(source.has_playable({}))
+        self.assertFalse(source.has_playable({"formats": []}))
+
+
+class TotalSizeTests(unittest.TestCase):
+    def test_the_total_after_the_slash(self):
+        self.assertEqual(source.total_size("bytes 0-1023/44459615"), 44459615)
+        self.assertEqual(source.total_size("bytes 100-200/201"), 201)
+
+    def test_an_unknown_total_is_no_total(self):
+        for header in (None, "", "bytes 0-1023/*", "bytes 0-1023", "nonsense"):
+            self.assertIsNone(source.total_size(header), header)
+
+
+class ParseRangeTests(unittest.TestCase):
+    def test_absent_means_the_whole_thing_from_the_start(self):
+        self.assertEqual(source.parse_range(None), (0, None))
+        self.assertEqual(source.parse_range(""), (0, None))
+        self.assertEqual(source.parse_range("   "), (0, None))
+
+    def test_the_two_forms_a_media_element_sends(self):
+        self.assertEqual(source.parse_range("bytes=0-"), (0, None))
+        self.assertEqual(source.parse_range("bytes=1000-"), (1000, None))
+        self.assertEqual(source.parse_range("bytes=100-200"), (100, 200))
+
+    def test_whitespace_and_case_do_not_matter(self):
+        self.assertEqual(source.parse_range(" BYTES = 5 - 9 "), (5, 9))
+
+    def test_what_we_decline_to_understand(self):
+        # A suffix range means the *last* N bytes; multipart is several at
+        # once.  Neither is worth guessing at, and no media element sends
+        # them -- None says "pass this through as it came".
+        for header in ("bytes=-500", "bytes=0-10,20-30", "items=0-5", "nonsense", "bytes=x-y", "bytes="):
+            self.assertIsNone(source.parse_range(header), header)
+
+
+class RangeTests(unittest.TestCase):
+    """googlevideo answers a bounded range and refuses an open-ended one
+    with a flat 403 on some clients' URLs -- and an open-ended range is
+    exactly what a <video> element asks for first."""
+
+    W = source.UPSTREAM_WINDOW
+
+    def test_no_range_at_all_still_asks_for_a_window(self):
+        self.assertEqual(source.bounded_range(None), f"bytes=0-{self.W - 1}")
+        self.assertEqual(source.bounded_range(""), f"bytes=0-{self.W - 1}")
+
+    def test_the_open_ended_form_a_video_element_sends_gets_an_end(self):
+        self.assertEqual(source.bounded_range("bytes=0-"), f"bytes=0-{self.W - 1}")
+        self.assertEqual(source.bounded_range("bytes=1000-"), f"bytes=1000-{1000 + self.W - 1}")
+
+    def test_a_range_smaller_than_the_window_is_left_alone(self):
+        self.assertEqual(source.bounded_range("bytes=0-99"), "bytes=0-99")
+        self.assertEqual(source.bounded_range("bytes=500-1500"), "bytes=500-1500")
+
+    def test_a_range_larger_than_the_window_is_cut_down(self):
+        self.assertEqual(source.bounded_range("bytes=0-999999999"), f"bytes=0-{self.W - 1}")
+
+    def test_the_window_is_configurable(self):
+        self.assertEqual(source.bounded_range("bytes=0-", window=1024), "bytes=0-1023")
+
+    def test_whitespace_and_case_do_not_matter(self):
+        self.assertEqual(source.bounded_range(" BYTES = 10 - "), f"bytes=10-{10 + self.W - 1}")
+
+    def test_forms_we_do_not_understand_pass_through_untouched(self):
+        # A suffix range means the *last* N bytes; rewriting it would hand
+        # back the wrong part of the file, so it goes as it came.
+        for header in ("bytes=-500", "bytes=0-10,20-30", "items=0-5", "nonsense"):
+            self.assertEqual(source.bounded_range(header), header)
+
+
+class PlayerClientTests(unittest.TestCase):
+    """Which of youtube's player clients we ask, and in what order."""
+
+    def test_the_first_rung_needs_no_token_and_no_cookie(self):
+        ladder = source.client_ladder({})
+        self.assertEqual(ladder[0], source.FREE_CLIENTS)
+        self.assertIn("visionos", ladder[0])
+
+    def test_the_client_whose_urls_never_serve_is_not_asked(self):
+        # android_vr resolves from any IP and then 403s every byte request.
+        # A client that resolves and cannot stream is worse than none:
+        # pick_video would choose its track over an identical playable one.
+        for rung in source.client_ladder({}):
+            self.assertNotIn("android_vr", rung)
+
+    def test_later_rungs_widen_rather_than_replace(self):
+        ladder = source.client_ladder({})
+        self.assertGreater(len(ladder), 1)
+        for rung in ladder[1:]:
+            self.assertTrue(set(source.FREE_CLIENTS) <= set(rung))
+        # Every rung is strictly bigger than the one before it.
+        for earlier, later in zip(ladder, ladder[1:]):
+            self.assertLess(len(earlier), len(later))
+
+    def test_the_environment_can_name_the_clients_itself(self):
+        ladder = source.client_ladder({"LAZYVR_PLAYER_CLIENTS": "ios, tv , "})
+        self.assertEqual(ladder, [("ios", "tv")])
+
+    def test_a_blank_override_is_no_override(self):
+        self.assertEqual(source.client_ladder({"LAZYVR_PLAYER_CLIENTS": "  "}),
+                         source.client_ladder({}))
+
+
+class YdlOptionTests(unittest.TestCase):
+    def test_a_format_list_with_no_winner_is_not_an_error(self):
+        # We want the formats, never yt-dlp's own pick; without this the
+        # whole library falls back to the embed the moment youtube trims
+        # the list.
+        self.assertTrue(source.ydl_options()["ignore_no_formats_error"])
+
+    def test_the_asked_clients_reach_the_extractor(self):
+        args = source.ydl_options(clients=("android_vr", "visionos"))["extractor_args"]["youtube"]
+        self.assertEqual(args["player_client"], ["android_vr", "visionos"])
+        self.assertIn("missing_pot", args["formats"])
+
+    def test_without_clients_the_extractor_is_left_alone(self):
+        self.assertNotIn("extractor_args", source.ydl_options())
+
+    def test_cookies_and_extras_still_ride_along(self):
         options = source.ydl_options(noplaylist=True)
         self.assertTrue(options["quiet"])
         self.assertTrue(options["noplaylist"])
+
+    def test_a_proxy_when_the_environment_names_one(self):
+        self.assertEqual(source.proxy_options({}), {})
+        self.assertEqual(source.proxy_options({"LAZYVR_PROXY": "socks5://h:9"}),
+                         {"proxy": "socks5://h:9"})
+        self.assertEqual(source.proxy_options({"LAZYVR_PROXY": "  "}), {})
+
+    def test_impersonation_is_asked_for_only_when_it_can_be_had(self):
+        # An unavailable target is an error at request time, not a warning,
+        # so this must never ask for one it cannot produce.
+        options = source.impersonate_options()
+        self.assertIsInstance(options, dict)
+        self.assertLessEqual(set(options), {"impersonate"})
+        self.assertEqual(options, source.impersonate_options())  # and it is cached
+
+    def test_impersonation_can_be_switched_off(self):
+        self.assertEqual(source.impersonate_options({"LAZYVR_IMPERSONATE": "off"}), {})
 
 
 class CategoryTests(unittest.TestCase):

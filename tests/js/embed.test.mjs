@@ -35,14 +35,27 @@ test("mapping: roll is clamped and the fov rides along", () => {
   assert.equal(props.fov, EMBED_FOV);
 });
 
-test("overscan: the iframe renders at the display's own pixel density", () => {
-  near(overscanFor(1920, 1080, 1), 1);
-  near(overscanFor(2560, 1440, 2), 2);
+test("overscan: the iframe is never built larger than the window", () => {
+  // forceBest() pins the tier explicitly, so an oversized iframe buys no
+  // quality at all -- it only asks the player to render four times the
+  // pixels, which is exactly what made the camera judder.
+  for (const dpr of [1, 2, 3]) near(overscanFor(1920, 1080, dpr), 1);
+  near(overscanFor(640, 360, 1), 1);
 });
 
-test("overscan: density is capped so the player's renderer keeps up", () => {
-  near(overscanFor(1920, 1080, 3), 2);
-  near(overscanFor(640, 360, 1), 1);
+test("gate: idle sway does not open it", () => {
+  // The body never quite stops; a sway of a tenth of a degree per frame
+  // must not become a postMessage per frame for the whole clip.
+  const a = { yaw: 120, pitch: 10, roll: 1 };
+  assert.ok(!movedEnough(a, { ...a, yaw: 120.06, pitch: 10.04, roll: 1.03 }));
+});
+
+test("gate: a real turn still opens it on the very next frame", () => {
+  // 128 deg/s -- the fastest turn on offer -- is 2.1 degrees per 60 Hz frame.
+  const a = { yaw: 120, pitch: 10, roll: 1 };
+  assert.ok(movedEnough(a, { ...a, yaw: 122.1 }));
+  // Even a slow 12 deg/s crawl clears it in one frame.
+  assert.ok(movedEnough(a, { ...a, yaw: 120.2 }));
 });
 
 test("gate: the first send always goes", () => {

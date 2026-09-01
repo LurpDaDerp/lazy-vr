@@ -1,13 +1,16 @@
-/* LazyVR: youtube's 360 videos, steered by gaze, entirely in the browser.
+/* LazyVR: 360 videos, steered by gaze, entirely in the browser.
  *
- * gaze.js reads the camera and turns each frame into gaze angles; control.js
- * turns those into the turn rate the viewer is asking for; body.js carries
- * that request out at display rate as a head would; render.js draws the
- * sphere.  The clips come from this site's own server: /api/home and
- * /api/search list youtube's 360-filtered uploads, /api/streams resolves
- * one into proxied tracks, and avsync.js keeps the separate audio on the
- * video's clock.  This file is the page: the shelves, the search, the
- * calibration step, the HUD, the keys, and the wiring between them.
+ * gaze.js opens the camera and gets each frame turned into gaze angles --
+ * in a worker, where the work does not queue up in front of the render
+ * loop; control.js turns those angles into the turn rate the viewer is
+ * asking for; body.js carries that request out at display rate as a head
+ * would; render.js draws the sphere.  Clips come from this site's own
+ * server -- /api/home and /api/search list youtube's 360-filtered uploads,
+ * /api/streams resolves one into proxied tracks, and avsync.js keeps the
+ * separate audio on the video's clock -- or from the viewer's own disk,
+ * which needs no server at all.  This file is the page: the shelves, the
+ * search, the file picker, the calibration step, the HUD, the keys, and the
+ * wiring between them.
  */
 
 import { AVSync } from "./avsync.js";
@@ -32,7 +35,7 @@ const el = {
   home: $("home"), results: $("results"), resultline: $("resultline"), backhome: $("backhome"),
   searchForm: $("search"), query: $("query"),
   grid: $("grid"), notice: $("libnotice"), empty: $("libempty"), loading: $("libloading"),
-  touchbar: $("touchbar"),
+  touchbar: $("touchbar"), local: $("local"), localfile: $("localfile"),
   settings: $("settings"), gear: $("gear"), setsclose: $("setsclose"), setsreset: $("setsreset"),
 };
 
@@ -70,7 +73,7 @@ const prefs = (() => {
 const SETTINGS_KEY = "lazyvr.settings";
 const SETTINGS_DEFAULTS = Object.freeze({
   sens: 1, deadzone: DEFAULTS.deadzoneYaw, fov: 75, blur: true,
-  invx: false, invy: false, quality: "auto",
+  invx: false, invy: false, quality: "auto", free: false,
 });
 
 let settings = { ...SETTINGS_DEFAULTS };
@@ -90,6 +93,7 @@ try {
   settings.blur = settings.blur !== false;
   settings.invx = settings.invx === true;
   settings.invy = settings.invy === true;
+  settings.free = settings.free === true;
   settings.quality = ["1080", "1440", "2160", "4320"].includes(String(settings.quality))
     ? Number(settings.quality) : "auto";
 }
@@ -111,8 +115,27 @@ function applySettings() {
     invertPitch: settings.invy,
   });
   request = { ...request, ...limitsFor(controller) };
+  applyFreeLook(settings.free);
   if (renderer) renderer.fov = settings.fov * DEG;
   embedPlayer.fov = settings.fov;
+}
+
+/* Switching the neck back on can leave the view somewhere a neck cannot
+ * reach -- turned right round behind you.  Handing that posture to the body
+ * would have it snap onto the ellipse, fifty degrees of view in a single
+ * frame, so the neck waits: yaw stays free through a sweep home, and the
+ * limit comes back at the start, where it costs nothing. */
+let neckPending = false;
+
+function applyFreeLook(free) {
+  if (body.freeYaw && !free && started && Math.abs(body.yaw) > YAW_LIMIT) {
+    neckPending = true;
+    body.goHome();
+    toast("Neck limits back on — turning to the start");
+    return;
+  }
+  neckPending = false;
+  body.freeYaw = free;
 }
 
 /* What the body is currently being asked to do, refreshed on every gaze
@@ -136,7 +159,7 @@ let streamsReady = false;
 let pendingPlay = false;
 let retryAction = "library";
 let qualityLine = null;
-let engineMode = "stream";  // stream (raw, ad-free) | embed (the fallback)
+let engineMode = "stream";  // stream (raw, ad-free) | embed (the fallback) | local (this device)
 let currentMax = 0;         // the quality cap in force for this video
 let frameMs = 16;           // smoothed frame time: the renderer's own vote
 let slowSince = 0;
@@ -169,6 +192,10 @@ function frame(now) {
     reportScreen();
     reportScreenPosition();
     if (started && calibrated) body.step(request, dt);
+    if (neckPending && !body.homing) {
+      neckPending = false;
+      body.freeYaw = settings.free;
+    }
     if (!settings.blur) body.view.blur = 0;
     if (engineMode === "embed") embedPlayer.steer(body.view);
     else renderer.draw(body.view);
@@ -238,6 +265,8 @@ function considerDownshift(now) {
     toast("Dropping the second gaze pass to stay smooth");
     return;
   }
+  // A file on this device has one quality: the one it was encoded at.
+  if (engineMode === "local") return;
   const lower = tierBelow(currentMax);
   if (!lower || lower < 1080) return;
   currentMax = lower;
@@ -250,7 +279,7 @@ async function applyQualityCap(maxHeight) {
     embedPlayer.capHeight(maxHeight);
     return;
   }
-  if (!playing) return;
+  if (engineMode === "local" || !playing) return;
   const my = session;
   const at = el.video.currentTime;
   const wasPaused = el.video.paused;
@@ -337,8 +366,9 @@ function renderHud(out, reading) {
   el.gaze.textContent = `${sign(out.yawError)}${out.yawError.toFixed(1)}, ${sign(out.pitchError)}${out.pitchError.toFixed(1)}`;
   el.rate.textContent = `${sign(out.yawRate)}${out.yawRate.toFixed(0)}, ${sign(out.pitchRate)}${out.pitchRate.toFixed(0)}°/s`;
   el.turn.textContent = `${sign(body.yawRate)}${body.yawRate.toFixed(0)}, ${sign(body.pitchRate)}${body.pitchRate.toFixed(0)}°/s`;
-  el.neck.textContent = body.strain <= 0 ? "free"
-    : body.strain >= 0.999 ? "at the limit" : `${Math.round(body.strain * 100)}% strained`;
+  el.neck.textContent = body.strain >= 0.999 ? "at the limit"
+    : body.strain > 0 ? `${Math.round(body.strain * 100)}% strained`
+    : body.freeYaw ? "free · 360°" : "free";
   el.neck.className = "val" + (body.strain >= 0.999 ? " bad" : body.strain > 0.5 ? " warn" : "");
   el.perf.textContent = `${reading.rate.toFixed(0)} Hz  ${reading.latencyMs.toFixed(0)} ms${reading.mirror ? "" : "  1-pass"}`;
   drawStick(out);
@@ -388,7 +418,9 @@ function drawStick(out) {
   stick.moveTo(6, c); stick.lineTo(size - 6, c);
   stick.stroke();
   const clamp = (v, l) => Math.max(-l, Math.min(l, v));
-  // Mirrored in x to agree with the mirrored camera preview above it.
+  // Screen-handed, not camera-handed: a glance to the viewer's left puts
+  // the dot on the left of the widget, which is also which way the view
+  // is about to turn.
   const x = c - clamp(out.yawError, limits.spanYaw) * sx;
   const y = c - clamp(out.pitchError, limits.spanPitch) * sy;
   const live = out.yawRate !== 0 || out.pitchRate !== 0;
@@ -482,6 +514,84 @@ el.backhome.addEventListener("click", () => {
   el.query.value = "";
 });
 
+/* ---------- a video off this device ---------- */
+
+/* No server, no upload, no copy: an object URL points the <video> element
+ * straight at the file the viewer picked, and the same renderer, the same
+ * calibration and the same body carry on as if it had come from youtube.
+ * The one thing that follows the file rather than the network is quality --
+ * there is only the one encode, so the downshift has nothing to offer. */
+
+let localUrl = null;
+
+const PLAYABLE = /\.(mp4|m4v|webm|mkv|mov|ogv)$/i;
+
+function playLocalFile(file) {
+  if (!file || !browsing) return;
+  if (!(file.type || "").startsWith("video/") && !PLAYABLE.test(file.name)) {
+    notify(`“${file.name}” does not look like a video file.`);
+    return;
+  }
+  releaseLocal();
+  localUrl = URL.createObjectURL(file);
+  selectClip({ id: null, title: file.name, local: true, src: localUrl });
+}
+
+/* The object URL pins the whole file in memory until it is let go. */
+function releaseLocal() {
+  if (!localUrl) return;
+  URL.revokeObjectURL(localUrl);
+  localUrl = null;
+}
+
+el.local.addEventListener("click", () => el.localfile.click());
+el.localfile.addEventListener("change", () => {
+  const file = el.localfile.files && el.localfile.files[0];
+  // Cleared so that picking the same file twice in a row still fires.
+  el.localfile.value = "";
+  playLocalFile(file);
+});
+
+/* Drop anywhere.  dragenter/dragleave fire for every element crossed, so
+ * the highlight is counted in rather than toggled -- otherwise moving over
+ * a card mid-drag puts it out. */
+let dragDepth = 0;
+
+const draggingFile = (event) =>
+  Array.from(event.dataTransfer ? event.dataTransfer.types : []).includes("Files");
+
+function showDrop(on) {
+  if (!on) dragDepth = 0;
+  document.body.classList.toggle("dropping", on);
+}
+
+document.addEventListener("dragenter", (event) => {
+  if (!browsing || !draggingFile(event)) return;
+  event.preventDefault();
+  dragDepth += 1;
+  showDrop(true);
+});
+
+document.addEventListener("dragover", (event) => {
+  if (!browsing || !draggingFile(event)) return;
+  event.preventDefault();
+  event.dataTransfer.dropEffect = "copy";
+});
+
+document.addEventListener("dragleave", () => {
+  if (dragDepth && --dragDepth === 0) showDrop(false);
+});
+
+// A drag that ends outside the window does not always leave on the way out.
+document.addEventListener("dragend", () => showDrop(false));
+
+document.addEventListener("drop", (event) => {
+  if (!browsing || !draggingFile(event)) return;
+  event.preventDefault();
+  showDrop(false);
+  playLocalFile(event.dataTransfer.files && event.dataTransfer.files[0]);
+});
+
 function notify(message) {
   el.notice.textContent = message;
   el.notice.hidden = false;
@@ -505,7 +615,7 @@ async function selectClip(clip) {
   streamsReady = false;
   pendingPlay = false;
   retryAction = "library";
-  engineMode = "stream";
+  engineMode = clip.local ? "local" : "stream";
   document.body.classList.remove("embedded");
   currentMax = qualityCap();
   frameMs = 16;
@@ -529,29 +639,40 @@ async function selectClip(clip) {
   el.retry.hidden = true;
   el.overlaytext.textContent = "Starting the gaze tracker…";
 
-  // Resolving the stream takes yt-dlp a few seconds; run it underneath the
-  // camera prompt and the calibration countdown rather than before them.
-  fetchStreams(clip.id, { codecs: prefs.codecs, max: currentMax })
-    .then((streams) => {
-      if (session !== my) return;
-      sync.set(streams.video.src, streams.audio && streams.audio.src);
-      const fps = streams.video.fps > 40 ? Math.round(streams.video.fps) : "";
-      qualityLine = `${streams.video.height}p${fps} ${streams.video.codec}`;
-      streamsReady = true;
-      if (pendingPlay) {
-        pendingPlay = false;
-        el.overlay.classList.add("gone");
-        tryPlay();
-      }
-    })
-    .catch((error) => {
-      if (session !== my) return;
-      // The raw, ad-free stream was refused -- a bot-challenged host, a
-      // region lock, an expired URL.  youtube will always play its own
-      // videos, though: fall back to its player, steered by the same body.
-      toast("Raw stream refused — using the youtube player");
-      embedFallback(clip, my, error);
-    });
+  if (clip.local) {
+    // Nothing to resolve and nobody to ask: the file is already here, and
+    // its sound is muxed into it, so the shadow audio element stands down.
+    sync.set(clip.src, null);
+    qualityLine = "playing from this device";
+    streamsReady = true;
+  } else {
+    // Resolving the stream takes yt-dlp a few seconds; run it underneath the
+    // camera prompt and the calibration countdown rather than before them.
+    fetchStreams(clip.id, { codecs: prefs.codecs, max: currentMax })
+      .then((streams) => {
+        if (session !== my) return;
+        sync.set(streams.video.src, streams.audio && streams.audio.src);
+        const fps = streams.video.fps > 40 ? Math.round(streams.video.fps) : "";
+        qualityLine = `${streams.video.height}p${fps} ${streams.video.codec}`;
+        streamsReady = true;
+        if (pendingPlay) {
+          pendingPlay = false;
+          el.overlay.classList.add("gone");
+          tryPlay();
+        }
+      })
+      .catch((error) => {
+        if (session !== my) return;
+        // The raw, ad-free stream was refused -- a bot-challenged host, a
+        // region lock, an expired URL.  youtube will always play its own
+        // videos, though: fall back to its player, steered by the same body.
+        // Say what youtube actually objected to: "refused" on its own has
+        // sent more than one afternoon looking in the wrong place.
+        console.warn("LazyVR: the raw stream was refused", error);
+        toast(`Raw stream refused (${error.message}) — using the youtube player`);
+        embedFallback(clip, my, error);
+      });
+  }
 
   // The camera prompt also wants the click's activation.  Ask for it now,
   // while the models finish loading in parallel.
@@ -677,6 +798,8 @@ function returnToLibrary() {
   session += 1;
   calibrationRun += 1;
   pausedBySettings = false;
+  neckPending = false;
+  body.freeYaw = settings.free;
   browsing = true;
   started = false;
   calibrated = false;
@@ -685,6 +808,7 @@ function returnToLibrary() {
   pendingPlay = false;
   retryAction = "library";
   sync.clear();
+  releaseLocal();
   embedPlayer.close();
   engineMode = "stream";
   document.body.classList.remove("embedded");
@@ -710,15 +834,18 @@ el.video.addEventListener("ended", returnToLibrary);
 el.video.addEventListener("error", () => {
   if (browsing || !el.video.getAttribute("src")) return;
   const title = playing ? playing.title : "That video";
+  const local = engineMode === "local";
   returnToLibrary();
-  notify(`“${title}” stopped streaming. The signed stream may have expired — pick it again.`);
+  notify(local
+    ? `“${title}” would not play. This browser may not decode that file — H.264 or VP9 in MP4 or WebM is the safe pair.`
+    : `“${title}” stopped streaming. The signed stream may have expired — pick it again.`);
 });
 
 /* ---------- the settings panel ---------- */
 
 const setInputs = {
   sens: $("set-sens"), dz: $("set-dz"), fov: $("set-fov"), qual: $("set-qual"),
-  blur: $("set-blur"), invx: $("set-invx"), invy: $("set-invy"),
+  blur: $("set-blur"), invx: $("set-invx"), invy: $("set-invy"), free: $("set-free"),
 };
 
 function renderSettings() {
@@ -729,6 +856,7 @@ function renderSettings() {
   setInputs.blur.checked = settings.blur;
   setInputs.invx.checked = settings.invx;
   setInputs.invy.checked = settings.invy;
+  setInputs.free.checked = settings.free;
   $("sensval").textContent = `×${Number(settings.sens).toFixed(2)}`;
   $("dzval").textContent = `${Number(settings.deadzone).toFixed(1)}°`;
   $("fovval").textContent = `${settings.fov}°`;
@@ -742,6 +870,7 @@ function settingsChanged() {
   settings.blur = setInputs.blur.checked;
   settings.invx = setInputs.invx.checked;
   settings.invy = setInputs.invy.checked;
+  settings.free = setInputs.free.checked;
   settings.quality = setInputs.qual.value === "auto" ? "auto" : Number(setInputs.qual.value);
   renderSettings();
   applySettings();
@@ -982,4 +1111,4 @@ loadHome().then(() => {
 });
 
 // For a console or a test harness.
-window.lazyvr = { body, controller, tracker, sync, get request() { return request; }, get reading() { return lastReading; }, get settings() { return settings; }, YAW_LIMIT };
+window.lazyvr = { body, controller, tracker, sync, embed: embedPlayer, get request() { return request; }, get reading() { return lastReading; }, get settings() { return settings; }, get engineMode() { return engineMode; }, YAW_LIMIT };

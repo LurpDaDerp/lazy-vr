@@ -1,3 +1,9 @@
 # What the Vercel serverless function needs (the container reads
 # server/requirements.txt instead; aiohttp is not used on Vercel).
 yt-dlp>=2026.8.19
+# Chrome's TLS fingerprint.  youtube's bot check reads the handshake before
+# it reads a cookie, and a datacenter IP asking with python's own
+# fingerprint is exactly the pair that gets challenged -- which is what
+# sent every video to the embed fallback.  Optional at runtime: without it
+# source.py asks for no impersonation rather than failing.
+curl-cffi>=0.7

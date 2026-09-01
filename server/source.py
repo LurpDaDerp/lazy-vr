@@ -12,10 +12,15 @@ keeps the two elements in step; the URLs it returns are signed, IP-bound and
 short-lived, which is why the server proxies the bytes rather than handing
 the URLs to the browser.
 
-Everything here that decides -- what counts as a clip, which format wins --
-is a pure function over yt-dlp's dictionaries, so the tests need neither
-yt-dlp nor the network.  Only ``search_360`` and ``resolve`` import yt-dlp,
-and they do it lazily.
+Getting youtube to answer at all is its own problem, and the answer is in
+``client_ladder`` and ``impersonate_options``: ask the player clients that
+still serve an unknown IP, look like a browser while asking, and never let
+yt-dlp's own format selector turn a thin list into an error.
+
+Everything here that decides -- what counts as a clip, which format wins,
+which clients to ask -- is a pure function over yt-dlp's dictionaries or
+the environment, so the tests need neither yt-dlp nor the network.  Only
+``search_360`` and ``resolve`` import yt-dlp, and they do it lazily.
 """
 
 from __future__ import annotations
@@ -152,6 +157,79 @@ def pick_streams(info: dict, max_height: int = 4320,
     return {"video": video, "audio": audio, "combined": combined}
 
 
+# How much of a track to ask googlevideo for at a time.
+#
+# This is throughput, and the numbers are not close.  Measured against a
+# live googlevideo, one signed url, same file, same minute:
+#
+#     Range: bytes=0-             1.9 Mbit/s
+#     Range: bytes=0-16777215     2.2 Mbit/s
+#     Range: bytes=0-8388607    158   Mbit/s
+#     Range: bytes=16777216-25165823
+#                               150   Mbit/s
+#
+# An open-ended range is served at roughly playback rate, and so is a
+# bounded one over about ten megabytes; a bounded read under that is served
+# as fast as the link goes.  `Range: bytes=0-` is exactly what a <video>
+# element asks for first, so the whole library used to arrive at 2 Mbit/s
+# -- fine for 720p, hopeless for the 4K and 8K this player is for, and the
+# stalls read as the picture stuttering rather than as a slow download.
+#
+# So every upstream read is a window under the threshold, and app.py
+# stitches the windows back into one response.  (yt-dlp does the same thing
+# for the same reason; its --http-chunk-size is the same order.)
+UPSTREAM_WINDOW = 8 << 20
+
+
+def parse_range(header: str | None) -> tuple[int, int | None] | None:
+    """``(first byte, last byte or None)`` from a Range header.
+
+    Absent is ``(0, None)``: a reader who said nothing wants all of it.
+    ``None`` means a form we decline to understand -- a suffix range
+    (``bytes=-500``, the *last* 500 bytes) or a multipart one -- which
+    callers pass through as it came rather than guess at.  No media element
+    sends either.
+    """
+    text = (header or "").strip()
+    if not text:
+        return (0, None)
+    unit, sign, spec = text.partition("=")
+    if not sign or unit.strip().lower() != "bytes" or "," in spec:
+        return None
+    first, dash, last = spec.partition("-")
+    if not dash or not first.strip():
+        return None
+    try:
+        return (int(first.strip()), int(last.strip()) if last.strip() else None)
+    except ValueError:
+        return None
+
+
+def bounded_range(header: str | None, window: int = UPSTREAM_WINDOW) -> str:
+    """The Range to ask googlevideo for, given what the reader asked us:
+    the same span, cut down to one window.  A form parse_range declines is
+    handed on untouched."""
+    asked = parse_range(header)
+    if asked is None:
+        return header
+    start, last = asked
+    stop = start + window - 1
+    if last is not None:
+        stop = min(stop, last)
+    return f"bytes={start}-{stop}"
+
+
+def total_size(content_range: str | None) -> int | None:
+    """The whole track's length, out of an upstream ``bytes a-b/total``.
+
+    None when the header is missing or the total is a ``*`` -- the relay
+    then simply streams until the windows run dry."""
+    if not content_range or "/" not in content_range:
+        return None
+    tail = content_range.rsplit("/", 1)[1].strip()
+    return int(tail) if tail.isdigit() else None
+
+
 def stream_expiry(url: str, now: float | None = None) -> float:
     """When a resolved googlevideo URL stops working.  The URL says so
     itself (``expire=<unix>``); four hours if it does not."""
@@ -201,7 +279,103 @@ class TTLCache:
 
 # ---------------------------------------------------------------- yt-dlp
 
-_QUIET = {"quiet": True, "no_warnings": True, "skip_download": True}
+_QUIET = {
+    "quiet": True,
+    "no_warnings": True,
+    "skip_download": True,
+    # We want youtube's format *list*, never yt-dlp's pick from it: the
+    # choosing happens in pick_streams, against what the asking browser
+    # said it can decode.  Without this, a list yt-dlp's own default
+    # selector finds no winner in raises "Requested format is not
+    # available" -- which is not "no formats", it is "no format matched
+    # bestvideo+bestaudio" -- and one trimmed list would send the whole
+    # library to the embed fallback.
+    "ignore_no_formats_error": True,
+    "extractor_retries": 3,
+    "retries": 3,
+    "socket_timeout": 20,
+}
+
+# The player clients youtube will still serve to an IP it does not know.
+#
+# Measured rather than assumed, against a live youtube.  Of the eleven
+# clients yt-dlp knows, `visionos` is the only one that both answers an
+# unknown IP with no PO token and hands back urls that then actually serve
+# bytes.  `web` -- half of yt-dlp's own default pair -- returns a format
+# list with no playable entry at all, as do tv, ios, mweb and web_safari,
+# so the stock configuration is one dead client and one live one, and it
+# fails outright the moment the live one is challenged.
+#
+# `android_vr` is the near miss, and worth naming so nobody adds it back:
+# it resolves beautifully from any IP, and every url it produces answers
+# 403 -- open range, bounded range, with its own http_headers or without.
+# A client that resolves and cannot stream is worse than no client, because
+# pick_video will happily choose its track over an identical playable one.
+FREE_CLIENTS = ("visionos",)
+
+# The second rung: clients that normally want a PO token.  Paired with
+# `formats=missing_pot` below, yt-dlp offers their tokenless formats
+# anyway -- often playable, and always better than giving up -- and any
+# configured cookies do their best work here.
+TOKEN_CLIENTS = ("tv_simply", "web_safari", "mweb", "tv")
+
+
+def has_playable(info: dict) -> bool:
+    """Did this attempt come back with a track a browser could actually
+    fetch?  Plain https only: HLS and DASH manifests are not something the
+    proxy can hand to a <video> element by the byte."""
+    for fmt in info.get("formats") or []:
+        vcodec = fmt.get("vcodec")
+        if vcodec and vcodec != "none" and _plain_http(fmt):
+            return True
+    return False
+
+
+def client_ladder(env=os.environ) -> list[tuple[str, ...]]:
+    """Which clients to ask, in which order, widening as attempts fail.
+
+    ``LAZYVR_PLAYER_CLIENTS=android_vr,tv`` replaces the ladder outright,
+    so a host whose IP youtube treats differently can be retuned without a
+    redeploy."""
+    named = tuple(name for name in (env.get("LAZYVR_PLAYER_CLIENTS") or "").replace(",", " ").split())
+    if named:
+        return [named]
+    return [FREE_CLIENTS, FREE_CLIENTS + TOKEN_CLIENTS]
+
+
+def proxy_options(env=os.environ) -> dict:
+    """``LAZYVR_PROXY``: the last resort when an IP is simply burnt."""
+    proxy = (env.get("LAZYVR_PROXY") or "").strip()
+    return {"proxy": proxy} if proxy else {}
+
+
+_impersonate: dict | None = None
+
+
+def impersonate_options(env=os.environ) -> dict:
+    """Chrome's TLS fingerprint, if this install can produce one.
+
+    youtube's bot check reads the handshake before it reads a cookie:
+    python's own TLS and HTTP/2 fingerprints are recognisable at a glance,
+    and a datacenter IP with a python fingerprint is precisely the pair
+    that gets challenged.  ``pip install "yt-dlp[default,curl-cffi]"`` puts
+    a real Chrome fingerprint within reach.
+
+    An impersonation target that is not installed is an *error* at request
+    time rather than a warning, so this asks for nothing unless curl_cffi
+    is importable.  ``LAZYVR_IMPERSONATE=off`` opts out."""
+    global _impersonate
+    if (env.get("LAZYVR_IMPERSONATE") or "").strip().lower() in ("off", "0", "false", "no"):
+        return {}
+    if _impersonate is None:
+        try:
+            import curl_cffi  # noqa: F401
+            from yt_dlp.networking.impersonate import ImpersonateTarget
+        except ImportError:
+            _impersonate = {}
+        else:
+            _impersonate = {"impersonate": ImpersonateTarget("chrome")}
+    return dict(_impersonate)
 
 # youtube sometimes challenges an unfamiliar IP -- datacenter ranges above
 # all -- with "Sign in to confirm you're not a bot", and yt-dlp's answer is
@@ -249,12 +423,30 @@ def cookie_options(env=os.environ) -> dict:
     return {}
 
 
-def ydl_options(**extra) -> dict:
-    return {**_QUIET, **cookie_options(), **extra}
+def ydl_options(clients: tuple[str, ...] | None = None, **extra) -> dict:
+    """One yt-dlp configuration: quiet, authenticated as the host asked,
+    fingerprinted if it can be, and aimed at the given player clients.
+
+    ``formats=missing_pot`` keeps the tracks youtube served without a PO
+    token instead of discarding them unheard; they usually play."""
+    options = {**_QUIET, **cookie_options(), **proxy_options(), **impersonate_options()}
+    if clients:
+        options["extractor_args"] = {"youtube": {"player_client": list(clients),
+                                                 "formats": ["missing_pot"]}}
+    return {**options, **extra}
+
+
+class Refused(Exception):
+    """youtube would not hand over a playable track for this video."""
 
 
 def search_360(query: str, limit: int = 24) -> list[dict]:
-    """Flat search entries -> clip dicts, already filtered.  Blocking."""
+    """Flat search entries -> clip dicts, already filtered.  Blocking.
+
+    No player client here: reading a results page never asks youtube for a
+    stream, so what matters is only that the request looks ordinary --
+    which is the fingerprint, the cookies and the proxy, all of which
+    ydl_options already carries."""
     from yt_dlp import YoutubeDL
 
     options = ydl_options(extract_flat="in_playlist", playlistend=max(limit * 2, 30))
@@ -271,8 +463,31 @@ def search_360(query: str, limit: int = 24) -> list[dict]:
 
 
 def resolve(video_id: str) -> dict:
-    """The full format list for one video.  Blocking, a few seconds."""
+    """The full format list for one video.  Blocking, a few seconds.
+
+    Climbs the client ladder rather than trusting one ask.  The first rung
+    needs neither a PO token nor a cookie and answers most of the time; the
+    next widens to the clients that usually want one, since a tokenless
+    format from them still plays more often than not.
+
+    An attempt that comes back with a format list containing nothing
+    fetchable is a failure like any other, and one that raises nothing --
+    so has_playable is what decides a rung, not the absence of an
+    exception.  Only when every rung has been tried does this give up, and
+    it gives up with whatever youtube actually said, so the page can pass
+    the reason on instead of silently falling back."""
     from yt_dlp import YoutubeDL
 
-    with YoutubeDL(ydl_options(noplaylist=True)) as ydl:
-        return ydl.extract_info(f"https://www.youtube.com/watch?v={video_id}", download=False)
+    url = f"https://www.youtube.com/watch?v={video_id}"
+    last: Exception | None = None
+    for clients in client_ladder():
+        try:
+            with YoutubeDL(ydl_options(clients=clients, noplaylist=True)) as ydl:
+                info = ydl.extract_info(url, download=False)
+        except Exception as error:  # noqa: BLE001 -- try the next rung, whatever it was
+            last = error
+            continue
+        if info and has_playable(info):
+            return info
+        last = Refused(f"youtube served no playable track to {', '.join(clients)}")
+    raise last or Refused("youtube would not resolve this video")

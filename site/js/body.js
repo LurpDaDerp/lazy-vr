@@ -29,7 +29,7 @@ export const K_DOWN = 10.0;
 export const A_MAX = 380;
 
 /* A neck has an end, and it is not a box.  The head can turn 120 degrees
- * either way and look 90 up or down -- but not both at once: turned right
+ * either way and look 100 up or down -- but not both at once: turned right
  * round to the side there is nothing left for looking up.  The reachable set
  * is an ellipse in (yaw, pitch), and where the head sits inside it is one
  * number, its radius: 0 at rest, 1 at the limit.
@@ -38,9 +38,15 @@ export const A_MAX = 380;
  * costs effort that climbs steeply as the limit nears, and at the limit the
  * outward component of any request is gone -- the hard stop.  Only the
  * outward part is taxed: coming back is always free, as a real neck springs
- * back, and sliding along the limit (trading yaw for pitch) crawls. */
+ * back, and sliding along the limit (trading yaw for pitch) crawls.
+ *
+ * `freeYaw` takes the horizontal half of that away: a viewer who would
+ * rather have the whole sphere than a plausible neck.  The ellipse becomes
+ * a slab -- pitch still ends, yaw never does -- and yaw is wrapped rather
+ * than clamped, so it can run round and round without the numbers growing
+ * and without recentring taking the long way home. */
 export const YAW_LIMIT = 120;
-export const PITCH_LIMIT = 90;
+export const PITCH_LIMIT = 100;
 export const NECK_COMFORT = 0.5;
 export const STRAIN_POWER = 2.2;
 export const STRAIN_TANGENTIAL = 0.8;
@@ -60,6 +66,13 @@ export function clamp(value, limit) {
   return Math.max(-limit, Math.min(limit, value));
 }
 
+/* The same bearing, named in (-180, 180].  Free yaw would otherwise count
+ * up for as long as the clip lasts, and a recentre from +540 would sweep
+ * one and a half turns to reach the same place as a turn of -180. */
+export function wrapDegrees(angle) {
+  return ((angle + 180) % 360 + 360) % 360 - 180;
+}
+
 /* One octave of value noise: smooth, deterministic, no library. */
 function hash(n) {
   const s = Math.sin(n * 127.1) * 43758.5453;
@@ -75,8 +88,8 @@ export function noise(x) {
 /* Where the head sits in the neck's reachable ellipse: its radius and the
  * outward unit direction, in the normalised space where the ellipse is a
  * circle. */
-export function neckRadius(yaw, pitch) {
-  const nx = yaw / YAW_LIMIT, ny = pitch / PITCH_LIMIT;
+export function neckRadius(yaw, pitch, freeYaw = false) {
+  const nx = freeYaw ? 0 : yaw / YAW_LIMIT, ny = pitch / PITCH_LIMIT;
   const r = Math.hypot(nx, ny);
   return { r, ux: r > 1e-9 ? nx / r : 0, uy: r > 1e-9 ? ny / r : 0 };
 }
@@ -91,6 +104,8 @@ export function neckStrain(r) {
 
 export class Body {
   constructor() {
+    // A setting, not state: it outlives rest(), which clears only posture.
+    this.freeYaw = false;
     this.rest();
   }
 
@@ -123,10 +138,16 @@ export class Body {
    * scaled by what give remains; the tangential component more mildly;
    * inward is untouched. */
   resist(yawRate, pitchRate) {
-    const { r, ux, uy } = neckRadius(this.yaw, this.pitch);
+    const { r, ux, uy } = neckRadius(this.yaw, this.pitch, this.freeYaw);
     const strain = neckStrain(r);
     this.strain = strain;
     if (strain <= 0) return { yawRate, pitchRate };
+    if (this.freeYaw) {
+      // The slab pushes back along one axis only, and taxing yaw for being
+      // near the top would be exactly the limit the viewer switched off.
+      const outward = pitchRate * uy;
+      return { yawRate, pitchRate: (outward > 0 ? outward * (1 - strain) : outward) * uy };
+    }
     const vx = yawRate / YAW_LIMIT, vy = pitchRate / PITCH_LIMIT;
     const outward = vx * ux + vy * uy;
     const tx = vx - outward * ux, ty = vy - outward * uy;
@@ -142,6 +163,13 @@ export class Body {
    * put it back on the line and take the outward velocity away, so it rests
    * against the limit rather than bouncing off it. */
   holdAtLimit() {
+    if (this.freeYaw) {
+      if (Math.abs(this.pitch) <= PITCH_LIMIT) return;
+      const side = Math.sign(this.pitch);
+      this.pitch = side * PITCH_LIMIT;
+      if (this.pitchRate * side > 0) this.pitchRate = 0;
+      return;
+    }
     const { r, ux, uy } = neckRadius(this.yaw, this.pitch);
     if (r <= 1) return;
     this.yaw = ux * YAW_LIMIT;
@@ -184,6 +212,7 @@ export class Body {
     this.pitchRate = this.approach(this.pitchRate, want.pitchRate, dt).rate;
 
     this.yaw += this.yawRate * dt;
+    if (this.freeYaw) this.yaw = wrapDegrees(this.yaw);
     this.pitch += this.pitchRate * dt;
     this.holdAtLimit();
 

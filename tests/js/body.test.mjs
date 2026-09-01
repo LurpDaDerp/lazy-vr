@@ -194,3 +194,91 @@ test("rest clears everything", () => {
   body.rest();
   assert.equal(body.yaw, 0); assert.equal(body.strain, 0); assert.ok(!body.homing);
 });
+
+// -- free look ---------------------------------------------------------
+
+test("the pitch limit is 100 degrees", () => {
+  assert.equal(PITCH_LIMIT, 100);
+  assert.ok(Math.abs(run(new Body(), 0, 999, 20).pitch - 100) < 1e-9);
+});
+
+test("free look is off by default: the neck still ends where it did", () => {
+  assert.equal(new Body().freeYaw, false);
+  assert.ok(Math.abs(run(new Body(), 999, 0, 20).yaw - YAW_LIMIT) < 1e-9);
+});
+
+test("free look: yaw runs right past the neck's limit and keeps going", () => {
+  const body = new Body();
+  body.freeYaw = true;
+  let travelled = 0;
+  run(body, 128, 0, 10, () => { travelled += Math.abs(body.yawRate) * DT; });
+  assert.ok(travelled > 360, `only turned ${travelled.toFixed(0)} degrees`);
+  // No strain: the sweep never slows down.
+  assert.ok(body.yawRate > 127, `rate sagged to ${body.yawRate}`);
+  assert.equal(body.strain, 0);
+});
+
+test("free look: yaw stays wrapped into (-180, 180]", () => {
+  for (const rate of [128, -128]) {
+    const body = new Body();
+    body.freeYaw = true;
+    let worst = 0;
+    run(body, rate, 0, 20, () => { worst = Math.max(worst, Math.abs(body.yaw)); });
+    assert.ok(worst <= 180 + 1e-9, `yaw reached ${worst}`);
+  }
+});
+
+test("free look: pitch still stops dead at its limit", () => {
+  for (const rate of [999, -999]) {
+    const body = new Body();
+    body.freeYaw = true;
+    let worst = 0;
+    run(body, 0, rate, 20, () => { worst = Math.max(worst, Math.abs(body.pitch)); });
+    assert.ok(Math.abs(Math.abs(body.pitch) - PITCH_LIMIT) < 1e-9, `stopped at ${body.pitch}`);
+    assert.ok(worst <= PITCH_LIMIT + 1e-9);
+    assert.ok(body.strain > 0.999);
+  }
+});
+
+test("free look: pinned at the top of the pitch slab, yaw is still free", () => {
+  const body = new Body();
+  body.freeYaw = true;
+  run(body, 0, 999, 20);
+  assert.ok(body.strain > 0.999, "the pitch slab is taxing");
+  run(body, 128, 0, 2);
+  assert.ok(body.yawRate > 127, `yaw was taxed too: ${body.yawRate}`);
+});
+
+test("free look: recentring takes the short way round", () => {
+  const body = new Body();
+  body.freeYaw = true;
+  // Turn until the view is just past half a circle the long way.
+  let spun = 0;
+  while (body.yaw > -170 && spun++ < 2400) body.step(ask(-128, 0), DT);
+  assert.ok(body.yaw <= -170 && body.yaw >= -180, `stopped at ${body.yaw}`);
+  assert.ok(body.goHome());
+  let frames = 0;
+  while (body.homing && frames < 2400) { body.step(ask(0, 0, false), DT); frames++; }
+  assert.ok(!body.homing, "never arrived");
+  assert.ok(Math.abs(body.yaw) < 0.01 && Math.abs(body.pitch) < 0.01);
+  // Straight back the way it came: never through the far side.
+  assert.ok(frames / 60 < 5, `took ${frames / 60}s`);
+});
+
+test("free look: rest keeps the setting, and it survives a pass", () => {
+  const body = new Body();
+  body.freeYaw = true;
+  run(body, 999, 0, 5);
+  body.rest();
+  assert.equal(body.freeYaw, true);
+  assert.equal(body.yaw, 0);
+});
+
+test("neckRadius: free look drops the yaw term entirely", () => {
+  const pinned = neckRadius(119, 50, true);
+  assert.equal(pinned.ux, 0);
+  assert.ok(Math.abs(pinned.r - 50 / PITCH_LIMIT) < 1e-12);
+  assert.ok(Math.abs(pinned.uy - 1) < 1e-12);
+  // At dead level there is no outward direction at all.
+  assert.equal(neckRadius(170, 0, true).r, 0);
+});

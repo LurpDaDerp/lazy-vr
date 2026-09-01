@@ -17,6 +17,10 @@
 <!-- High resolutions come from youtube as separate video and audio tracks;
      avsync.js keeps this shadow element on the video's clock. -->
 <audio id="sound" preload="auto"></audio>
+<!-- The camera the tracker reads.  Never shown: the worker takes the track
+     itself, and this only carries frames on the fallback path, for browsers
+     that cannot hand a camera to a worker. -->
+<video id="cam" playsinline muted autoplay></video>
 
 <div id="hud">
   <div class="panel" id="readout">
@@ -31,12 +35,6 @@
 
   <div class="panel" id="stickpanel">
     <canvas id="stick" width="150" height="150"></canvas>
-  </div>
-
-  <div class="panel" id="campanel">
-    <!-- The camera the tracker reads.  Mirrored for display only: the
-         detector sees the raw frame, and the sign of "left" depends on it. -->
-    <video id="cam" playsinline muted autoplay></video>
   </div>
 </div>
 
@@ -67,6 +65,7 @@
 
 <div id="fixation"></div>
 <div id="toast"></div>
+<div id="dropzone"><span>Drop to play it here</span></div>
 
 <!-- The start screen: youtube's 360 uploads, shelved by category, with a
      search over the same 360-filtered index. -->
@@ -78,8 +77,13 @@
              autocomplete="off" spellcheck="false" aria-label="Search youtube's 360 videos">
       <button type="submit">Search</button>
     </form>
+    <button id="local" type="button">Play a file&hellip;</button>
+    <input id="localfile" type="file" accept="video/*" hidden>
     <button id="gear" type="button" aria-label="Settings">settings</button>
   </header>
+
+  <p id="dropnote">&hellip;or drop a 360 video anywhere on this page. It stays on
+     your device &mdash; nothing is uploaded.</p>
 
   <p id="libnotice" hidden></p>
 
@@ -142,6 +146,13 @@
       <option value="4320">4320p (8K)</option>
     </select>
     <span class="sethint">A struggling machine still steps itself down.</span>
+  </label>
+
+  <label class="setrow setcheckrow">
+    <span class="setcheck"><input id="set-free" type="checkbox"> Full 360&deg; turning</span>
+    <span class="sethint">Off, the view has a neck: 120&deg; either way, and it
+      tires as it nears the end. On, it turns for ever &mdash; looking up and
+      down still stops at 100&deg;.</span>
   </label>
 
   <label class="setcheck"><input id="set-blur" type="checkbox" checked> Motion blur on fast turns</label>
