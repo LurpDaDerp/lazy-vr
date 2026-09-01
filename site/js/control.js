@@ -55,8 +55,14 @@ export const DEFAULTS = Object.freeze({
   rateYaw: 9.6,
   ratePitch: null,            // null: derive from the screen
   maxRateYaw: 128.0,
-  // Not scaled by the aspect: a comfort cap rather than a geometry decision.
-  maxRatePitch: 96.0,
+  // null: the same ceiling as yaw.  The gearing below has already made the
+  // two axes ask for the same rate at the same fraction of the screen, so
+  // the *cap* is where that law is kept or broken -- and a lower one broke
+  // it, because pitch reached its ceiling at 7.3 degrees of eye travel
+  // where yaw ran to 16.3, then sat a quarter slower for the whole of the
+  // rest of the screen.  A host that genuinely wants a gentler vertical
+  // may still set a number here.
+  maxRatePitch: null,
   // Eccentricity must stay outside the deadzone this long before the view
   // commits.  In a natural gaze shift the eye saccades and the head follows
   // 60-120 ms later; without any lag the world feels welded to the eyeball.
@@ -197,6 +203,14 @@ export class GazeController {
     return (this.config.ratePitch ?? this.config.rateYaw * this.referenceAspect) / this.scaleY;
   }
 
+  /* The fastest turn either axis will ask for.  Not scaled by the viewport:
+   * this is an output rate in world degrees, not an eye eccentricity, so a
+   * bigger window must not make the view spin faster -- the gearing above
+   * is what the screen's shape and size act on. */
+  get maxRatePitch() {
+    return this.config.maxRatePitch ?? this.config.maxRateYaw;
+  }
+
   /* The viewport being filled, in any consistent units.  Anything unusable
    * leaves it alone: a bad number here would gear an axis into uselessness,
    * and a page is at liberty to report nonsense while it is still laying
@@ -247,9 +261,9 @@ export class GazeController {
       // Where the axis saturates: the eccentricity at which the viewer is
       // already asking for the fastest turn on offer.
       spanYaw: deadzoneYaw + c.maxRateYaw / Math.max(this.rateYaw, 1e-6),
-      spanPitch: deadzonePitch + c.maxRatePitch / Math.max(this.ratePitch, 1e-6),
+      spanPitch: deadzonePitch + this.maxRatePitch / Math.max(this.ratePitch, 1e-6),
       maxRateYaw: c.maxRateYaw,
-      maxRatePitch: c.maxRatePitch,
+      maxRatePitch: this.maxRatePitch,
       scaleX: this.scaleX,
       scaleY: this.scaleY,
     };
@@ -390,7 +404,7 @@ export class GazeController {
     }
 
     let yawRate = responseAngle(yawError, this.deadzoneYaw, this.rateYaw, c.maxRateYaw, c.expo);
-    let pitchRate = responseAngle(pitchError, this.deadzonePitch, this.ratePitch, c.maxRatePitch, c.expo);
+    let pitchRate = responseAngle(pitchError, this.deadzonePitch, this.ratePitch, this.maxRatePitch, c.expo);
     if (c.invertYaw) yawRate = -yawRate;
     if (c.invertPitch) pitchRate = -pitchRate;
 

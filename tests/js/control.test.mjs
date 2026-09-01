@@ -205,6 +205,51 @@ test("map: both axes reach the same speed at the same share of their travel", ()
   near(holdGaze(c, 14, 0, t, 0.4).yawRate, holdGaze(c, 0, 14 / DEFAULT_ASPECT, t, 0.4).pitchRate, 1e-9);
 });
 
+/* The tests above disable the caps to isolate the gearing.  These use the
+ * numbers the page actually ships, because the cap is where the law used to
+ * come apart: pitch saturated at 7.3 degrees of eye travel where yaw ran to
+ * 16.3, and then sat at a ceiling a quarter lower, so every glance past
+ * two-thirds of the way up the screen asked for less than the same glance
+ * sideways. */
+
+function shipped(over = {}) {
+  // The real defaults, with only the clock made convenient for a test.
+  const c = new GazeController({ onset: 0.12, tau: 0, calibrationHold: 0.3, ...over });
+  c.setViewport(1920, 1080);
+  return c;
+}
+
+test("map: the cap obeys the same law as the rest of the map", () => {
+  const c = shipped();
+  near(c.maxRatePitch, c.config.maxRateYaw, 1e-12);
+  // And so the two axes run out of road at the same share of the screen.
+  near(c.limits.spanPitch * (16 / 9), c.limits.spanYaw, 1e-9);
+});
+
+test("map: the same speed at the same share, all the way to the edge", () => {
+  const c = shipped();
+  const t = calibrated(c);
+  // Past 0.6 of the travel is exactly where this used to fail.
+  for (const share of [0.2, 0.5, 0.8, 1, 1.5, 4]) {
+    const yaw = share * 20;
+    near(holdGaze(c, yaw, 0, t, 0.4).yawRate,
+      holdGaze(c, 0, yaw / (16 / 9), t, 0.4).pitchRate, 1e-9, `share ${share}`);
+  }
+});
+
+test("map: at full deflection both axes ask for the full rate", () => {
+  const c = shipped();
+  const t = calibrated(c);
+  near(holdGaze(c, 200, 0, t, 0.4).yawRate, c.config.maxRateYaw, 1e-9);
+  near(holdGaze(c, 0, 200, t, 0.4).pitchRate, c.config.maxRateYaw, 1e-9);
+});
+
+test("map: a host that wants a slower pitch may still say so", () => {
+  const c = shipped({ maxRatePitch: 40 });
+  near(c.maxRatePitch, 40, 1e-12);
+  near(holdGaze(c, 0, 200, calibrated(c), 0.4).pitchRate, 40, 1e-9);
+});
+
 test("map: inversion flips only its own axis", () => {
   const c = new GazeController(config({ invertYaw: true }));
   const seen = holdGaze(c, 20, 10, calibrated(c), 0.4);

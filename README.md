@@ -344,11 +344,22 @@ after dragging to a different monitor, press `C`.
 | `deadzoneYaw` | 3° | gaze eccentricity that commands no motion |
 | `deadzonePitch` | from the screen | `deadzoneYaw` ÷ aspect |
 | `maxRateYaw` | 128°/s | fastest the view may sweep |
-| `maxRatePitch` | 96°/s | same, up/down; a comfort cap |
+| `maxRatePitch` | from the screen | the same ceiling — see below |
 | `onset` | 0.03 s | off centre before the view commits to a turn |
 | `calibrationHold` | 1.4 s | continuous fixation that finishes a pass |
 | `calibrationTolerance` | 2.5° | wander that restarts one |
 | `tau` | 0.02 s | gaze smoothing, before the body |
+
+**The ceiling is part of the law, not an exception to it.** The gearing above
+already makes both axes ask for the same rate at the same *share* of the
+screen — so a lower vertical ceiling silently undoes that. It used to be 96,
+and the arithmetic is unkind: pitch reached its ceiling at 7.3° of eye travel
+where yaw ran to 16.3°, and then sat a quarter slower for the whole of the
+rest of the screen. Every glance past about two-thirds of the way up asked
+for less than the same glance sideways, which is exactly what "up and down
+feels sluggish" is. Both axes now saturate at the same share of the view and
+at the same speed; `maxRatePitch` may still be set explicitly by anyone who
+genuinely wants a gentler vertical.
 
 The deadzone is set in degrees of visual angle, not screen fraction. People do
 not recruit the head for gaze shifts below roughly 18°, so that is the

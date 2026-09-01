@@ -202,9 +202,13 @@ export class Body {
       }
     }
 
+    // The fallbacks match control.js's defaults, and match each other: the
+    // control law has already geared the axes so that the same share of the
+    // screen asks for the same rate, and a lower vertical ceiling would
+    // undo that for every glance past two-thirds of the way up.
     const want = this.resist(
       clamp(askedYaw, request.maxRateYaw || 128),
-      clamp(askedPitch, request.maxRatePitch || 96));
+      clamp(askedPitch, request.maxRatePitch || 128));
 
     const turned = this.approach(this.yawRate, want.yawRate, dt);
     this.yawRate = turned.rate;
