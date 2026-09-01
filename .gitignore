@@ -16,3 +16,8 @@ desktop.ini
 *.ytdl
 
 .vercel
+
+CLAUDE.md
+
+# Agent-authored docs and instruction files stay local.
+docs/superpowers/
