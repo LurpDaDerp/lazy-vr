@@ -71,15 +71,36 @@ const prefs = (() => {
 /* ---------- settings ---------- */
 
 const SETTINGS_KEY = "lazyvr.settings";
+const SETTINGS_VERSION = 2;
+// What version 1 shipped as its deadzone.  See the migration below.
+const LEGACY_DEADZONE = 3.0;
 const SETTINGS_DEFAULTS = Object.freeze({
   sens: 1, deadzone: DEFAULTS.deadzoneYaw, fov: 75, blur: true,
   invx: false, invy: false, quality: "auto", free: false,
+  version: SETTINGS_VERSION,
 });
 
-let settings = { ...SETTINGS_DEFAULTS };
+let stored = {};
 try {
-  settings = { ...settings, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") };
+  stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {};
 } catch { /* a private window, or cleared storage */ }
+let settings = { ...SETTINGS_DEFAULTS, ...stored };
+
+/* Sensitivity is a multiplier, so a stored 1 follows the default wherever it
+ * goes.  The deadzone is not: it is an absolute number of degrees, so a
+ * returning viewer would keep the old one for ever and never see the change.
+ *
+ * A stored value that is exactly the old default was never chosen, only
+ * persisted -- so it moves on.  Anything else the viewer picked on purpose,
+ * and that stays.  The version is read off what was *stored*: taking it from
+ * the merged object would let the current default answer for a save that
+ * predates it, and no migration would ever run. */
+if (stored.version !== SETTINGS_VERSION) {
+  if (Math.abs(Number(settings.deadzone) - LEGACY_DEADZONE) < 1e-9) {
+    settings.deadzone = DEFAULTS.deadzoneYaw;
+  }
+  settings.version = SETTINGS_VERSION;
+}
 
 // Old or hand-edited storage must not be able to break the map.
 {

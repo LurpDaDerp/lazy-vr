@@ -219,6 +219,26 @@ function shipped(over = {}) {
   return c;
 }
 
+test("map: the numbers that decide how the thing feels", () => {
+  // Pinned deliberately.  These four are the whole character of the map,
+  // they are the ones a passing edit is most likely to nudge, and the
+  // settings panel's x1.00 means exactly this row.
+  const d = new GazeController().config;
+  near(d.rateYaw, 12.48, 1e-12);
+  near(d.deadzoneYaw, 1.5, 1e-12);
+  near(d.maxRateYaw, 128, 1e-12);
+  assert.equal(d.deadzonePitch, null);   // both derived from the screen
+  assert.equal(d.ratePitch, null);
+  assert.equal(d.maxRatePitch, null);
+});
+
+test("map: full speed is a glance, not a stare", () => {
+  const c = shipped();
+  // Saturation inside twelve degrees of eye travel: a viewer asking for the
+  // fastest sweep should not have to look off the edge of the screen.
+  assert.ok(c.limits.spanYaw < 12, `saturates at ${c.limits.spanYaw}`);
+});
+
 test("map: the cap obeys the same law as the rest of the map", () => {
   const c = shipped();
   near(c.maxRatePitch, c.config.maxRateYaw, 1e-12);

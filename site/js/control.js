@@ -48,11 +48,16 @@ export const DEFAULTS = Object.freeze({
   // so that is the physiological ceiling; a viewer sitting at a screen
   // cannot turn their real head to help, so it is walked a long way down,
   // and the onset gate does the glance rejection the deadzone would
-  // otherwise have to.
-  deadzoneYaw: 3.0,
+  // otherwise have to.  A degree and a half is nearly as low as it can go
+  // before it is inside the gaze estimate's own noise; the price is that a
+  // biased centre now shows up as a slow standing turn where a wider band
+  // would have swallowed it, which is what C is for.
+  deadzoneYaw: 1.5,
   deadzonePitch: null,        // null: derive from the screen
-  // Degrees per second of turn per degree of gaze past the deadzone.
-  rateYaw: 9.6,
+  // Degrees per second of turn per degree of gaze past the deadzone.  With
+  // the deadzone above, the fastest sweep on offer arrives inside twelve
+  // degrees of eye travel -- a glance rather than a stare.
+  rateYaw: 12.48,
   ratePitch: null,            // null: derive from the screen
   maxRateYaw: 128.0,
   // null: the same ceiling as yaw.  The gearing below has already made the

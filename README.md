@@ -332,16 +332,16 @@ after dragging to a different monitor, press `C`.
 
 | screen | pitch deadzone | pitch rate |
 |---|---|---|
-| 4:3 | 2.25° | 12.8 |
-| 16:9 | 1.69° | 17.1 |
-| 21:9 | 1.29° | 22.4 |
-| 9:16 (portrait) | 5.33° | 5.4 |
+| 4:3 | 1.13° | 16.6 |
+| 16:9 | 0.84° | 22.2 |
+| 21:9 | 0.64° | 29.1 |
+| 9:16 (portrait) | 2.67° | 7.0 |
 
 | Setting (`control.js`) | Default | |
 |---|---|---|
-| `rateYaw` | 9.6 | deg/s of turn per degree of gaze, left/right |
+| `rateYaw` | 12.48 | deg/s of turn per degree of gaze, left/right |
 | `ratePitch` | from the screen | `rateYaw` × aspect |
-| `deadzoneYaw` | 3° | gaze eccentricity that commands no motion |
+| `deadzoneYaw` | 1.5° | gaze eccentricity that commands no motion |
 | `deadzonePitch` | from the screen | `deadzoneYaw` ÷ aspect |
 | `maxRateYaw` | 128°/s | fastest the view may sweep |
 | `maxRatePitch` | from the screen | the same ceiling — see below |
@@ -363,9 +363,25 @@ genuinely wants a gentler vertical.
 
 The deadzone is set in degrees of visual angle, not screen fraction. People do
 not recruit the head for gaze shifts below roughly 18°, so that is the
-physiological ceiling and 3° is walked a long way down from it — a viewer at a
-screen cannot turn their real head to help, and the onset gate does the glance
-rejection the deadzone would otherwise have to.
+physiological ceiling and 1.5° is walked a very long way down from it — a
+viewer at a screen cannot turn their real head to help, and the onset gate
+does the glance rejection the deadzone would otherwise have to.
+
+Together with the gain, that puts the fastest sweep on offer within **11.8°**
+of eye travel, so full speed is a glance rather than a stare:
+
+| glance | before | now |
+|---|---|---|
+| 3° | 0°/s | 19°/s |
+| 6° | 29°/s | 56°/s |
+| 12° | 86°/s | 128°/s |
+
+Note the effect near the centre is far more than the 30% the gain alone
+would give: a narrower deadzone compounds with it, and a glance that used to
+command nothing at all now commands a real turn. The other side of that
+bargain is drift — a small standing bias in the calibrated centre used to be
+swallowed by the wider band and now shows up as a slow permanent turn, so
+`C` earns its keep.
 
 ### The body
 
