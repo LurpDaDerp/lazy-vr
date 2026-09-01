@@ -20,9 +20,14 @@ html, body {
   cursor: default;
 }
 
+/* Three seconds into a playing video the chrome goes, cursor and all,
+   and the first movement of the pointer brings it back. */
 body.hidden-hud #hud,
 body.hidden-hud #compass,
+body.hidden-hud #touchbar,
 body.hidden-hud #keys { opacity: 0; pointer-events: none; }
+
+body.hidden-hud { cursor: none; }
 
 #view {
   position: fixed;
@@ -67,7 +72,7 @@ body.embedded #view { display: none; }
   display: block;
 }
 
-#hud, #compass, #keys { transition: opacity 220ms ease; }
+#hud, #compass, #keys, #touchbar { transition: opacity 220ms ease; }
 
 #hud {
   position: fixed;
@@ -241,8 +246,7 @@ body.embedded #view { display: none; }
   box-shadow: 0 0 0 5px rgba(110, 231, 183, .18), 0 0 22px 6px rgba(110, 231, 183, .45);
   opacity: 0;
   transform: scale(.4);
-  transition: opacity 240ms ease, transform 240ms ease,
-              left 360ms ease, top 360ms ease;
+  transition: opacity 240ms ease, transform 240ms ease;
   pointer-events: none;
   z-index: 20;
 }
@@ -594,14 +598,6 @@ body:not(.browsing) #library { opacity: 0; pointer-events: none; }
 }
 
 #local:hover { border-color: rgba(110, 231, 183, .5); }
-
-#dropnote {
-  margin: -6px 0 0;
-  padding: 0 clamp(20px, 5vw, 56px);
-  font-family: var(--sans);
-  font-size: 12px;
-  color: var(--dim);
-}
 
 /* Only raised while a file is genuinely over the window. */
 #dropzone {

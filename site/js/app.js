@@ -71,9 +71,10 @@ const prefs = (() => {
 /* ---------- settings ---------- */
 
 const SETTINGS_KEY = "lazyvr.settings";
-const SETTINGS_VERSION = 2;
-// What version 1 shipped as its deadzone.  See the migration below.
-const LEGACY_DEADZONE = 3.0;
+const SETTINGS_VERSION = 3;
+// Every deadzone this page has shipped as its own default -- 3.0 in version
+// 1, 1.5 in version 2.  See the migration below.
+const LEGACY_DEADZONES = [3.0, 1.5];
 const SETTINGS_DEFAULTS = Object.freeze({
   sens: 1, deadzone: DEFAULTS.deadzoneYaw, fov: 75, blur: true,
   invx: false, invy: false, quality: "auto", free: false,
@@ -90,13 +91,13 @@ let settings = { ...SETTINGS_DEFAULTS, ...stored };
  * goes.  The deadzone is not: it is an absolute number of degrees, so a
  * returning viewer would keep the old one for ever and never see the change.
  *
- * A stored value that is exactly the old default was never chosen, only
+ * A stored value that is exactly some past default was never chosen, only
  * persisted -- so it moves on.  Anything else the viewer picked on purpose,
  * and that stays.  The version is read off what was *stored*: taking it from
  * the merged object would let the current default answer for a save that
  * predates it, and no migration would ever run. */
 if (stored.version !== SETTINGS_VERSION) {
-  if (Math.abs(Number(settings.deadzone) - LEGACY_DEADZONE) < 1e-9) {
+  if (LEGACY_DEADZONES.some((old) => Math.abs(Number(settings.deadzone) - old) < 1e-9)) {
     settings.deadzone = DEFAULTS.deadzoneYaw;
   }
   settings.version = SETTINGS_VERSION;
@@ -196,8 +197,6 @@ function limitsFor(control) {
 let last = performance.now();
 let reportedW = 0;
 let reportedH = 0;
-let reportedCX = Infinity;
-let reportedCY = Infinity;
 
 function frame(now) {
   const dt = Math.min((now - last) / 1000, 0.1);
@@ -211,7 +210,6 @@ function frame(now) {
   if (renderer) {
     renderer.resize();
     reportScreen();
-    reportScreenPosition();
     if (started && calibrated) body.step(request, dt);
     if (neckPending && !body.homing) {
       neckPending = false;
@@ -316,21 +314,6 @@ async function applyQualityCap(maxHeight) {
   } catch { /* the swap failed; keep what is playing */ }
 }
 
-/* Where the viewport's centre physically sits on the monitor, in CSS px,
- * approximating the browser chrome as side borders plus a top bar.  A
- * window dragged, snapped or fullscreened moves "straight ahead" with it,
- * and the controller re-aims by what the two-dot pass measured. */
-function reportScreenPosition() {
-  const side = Math.max(0, (window.outerWidth - window.innerWidth) / 2);
-  const top = Math.max(0, window.outerHeight - window.innerHeight - side);
-  const x = window.screenX + side + window.innerWidth / 2;
-  const y = window.screenY + top + window.innerHeight / 2;
-  if (Math.abs(x - reportedCX) < 1 && Math.abs(y - reportedCY) < 1) return;
-  reportedCX = x;
-  reportedCY = y;
-  controller.setScreenCentre(x, y);
-}
-
 /* ---------- gaze readings ---------- */
 
 function onReading(reading) {
@@ -341,21 +324,13 @@ function onReading(reading) {
   renderHud(out, reading);
   if (!calibrated && started && awaitingGeneration !== null && controller.generation >= awaitingGeneration) {
     el.progress.style.width = `${Math.round(controller.calibrationProgress * 100)}%`;
-    if (controller.phase === "offset" && !secondDot) {
-      // The centre is banked; the second dot measures what a screen pixel
-      // is worth, so a moved or fullscreened window can be re-aimed.
-      secondDot = true;
-      awayShown = false;
-      moveDot(calibrationOffset);
-      setOverlay(calibrationHeadline, "now the second dot");
-    }
     if (controller.resets !== seenResets) {
       seenResets = controller.resets;
       lookAgain();
     } else if (awayShown && controller.calibrationProgress > 0) {
       // Back on the dot: the warning has done its job.
       awayShown = false;
-      setOverlay(calibrationHeadline, secondDot ? "now the second dot" : "hold still…");
+      setOverlay(calibrationHeadline, "hold still…");
     }
     if (controller.calibrated) finishCalibration();
   }
@@ -373,11 +348,46 @@ setInterval(() => {
     console.error(tracker.error);
     tracker.error = null;
   }
+  updateHud();
 }, 200);
 
 const WARN = { "low confidence": 1, calibrating: 1, committing: 1 };
 
 let hudHidden = false;
+
+/* The chrome keeps youtube's habit: it goes three seconds into a playing
+ * video and comes back on the first twitch of the pointer.  Whether it is
+ * up is *derived* -- from the tick below and from the pointer -- rather
+ * than toggled, so pausing, calibrating, the settings panel and the library
+ * all get their say without a timer each. */
+const HUD_IDLE_MS = 3000;
+let lastPointerAt = 0;
+
+function hudAwake(now) {
+  if (browsing || !started || !calibrated) return true;
+  if (!el.settings.hidden) return true;   // the panel is chrome too
+  if (mediaPaused()) return true;         // a paused video is being read, not watched
+  return now - lastPointerAt < HUD_IDLE_MS;
+}
+
+function updateHud() {
+  const hide = !hudAwake(performance.now());
+  if (hide === hudHidden) return;
+  hudHidden = hide;
+  document.body.classList.toggle("hidden-hud", hide);
+  if (!hide) compassShown = "";  // repaint on the next frame
+}
+
+/* Any sign of life keeps it up.  The pointer is the one that has to feel
+ * instant, so it does not wait for the tick. */
+function wakeHud() {
+  lastPointerAt = performance.now();
+  if (hudHidden) updateHud();
+}
+
+document.addEventListener("pointermove", wakeHud);
+document.addEventListener("pointerdown", wakeHud);
+document.addEventListener("wheel", wakeHud, { passive: true });
 
 function renderHud(out, reading) {
   if (hudHidden) return;  // thirty DOM writes a second nobody can see
@@ -481,6 +491,52 @@ async function ensureCamera() {
   await tracker.open(el.cam);
   cameraOpen = true;
   tracker.start();
+}
+
+/* Has the camera already been granted?  Chrome shows a prompt by taking the
+ * page out of fullscreen, so the answer decides which of the two goes
+ * first.  Firefox will not answer the question at all: an unanswerable one
+ * counts as a no, which costs nothing but the slower, safer order. */
+async function cameraGranted() {
+  if (cameraOpen) return true;
+  try {
+    const status = await navigator.permissions.query({ name: "camera" });
+    return status.state === "granted";
+  } catch {
+    return false;
+  }
+}
+
+function goFullscreen() {
+  if (document.fullscreenElement) return Promise.resolve();
+  return document.documentElement.requestFullscreen();
+}
+
+/* Answering the permission prompt has spent the click that would have
+ * carried the page into fullscreen.  A request made straight afterwards
+ * usually still lands; when it does not, ask for the one gesture that will
+ * rather than calibrating at a size the video is not going to play at. */
+async function fullscreenAfterCamera(my) {
+  try {
+    await goFullscreen();
+    return;
+  } catch { /* the click was spent on the prompt */ }
+  if (session !== my || document.fullscreenElement) return;
+  el.overlay.classList.remove("gone");
+  el.overlaytext.textContent = "Camera ready — click anywhere to go fullscreen.";
+  await new Promise((resolve) => {
+    const done = () => {
+      document.removeEventListener("pointerdown", done);
+      document.removeEventListener("keydown", done);
+      resolve();
+    };
+    document.addEventListener("pointerdown", done);
+    document.addEventListener("keydown", done);
+  });
+  // Esc during the wait is a keydown like any other: the session has moved
+  // on and there is nothing left to go fullscreen for.
+  if (session !== my) return;
+  try { await goFullscreen(); } catch { /* calibrate where we are, then */ }
 }
 
 /* ---------- the library ---------- */
@@ -645,16 +701,19 @@ async function selectClip(clip) {
   el.notice.hidden = true;
   document.body.classList.remove("browsing");
 
-  // Fullscreen for the whole session: only this click can grant it, and
-  // calibration is best done at the size the video will play at.
-  if (!document.fullscreenElement) {
-    document.documentElement.requestFullscreen().catch(() => {});
-  }
-
   // Wake both media elements inside the click, so the browser will let a
   // later, programmatic play() through once calibration is done.
   el.video.load();
   el.sound.load();
+
+  // Fullscreen for the whole session: only this click can grant it, and
+  // calibration is best done at the size the video will play at.  The one
+  // thing that outranks it is the camera prompt, which chrome shows by
+  // dropping the page straight back out of fullscreen -- so the first time
+  // it will be asked, the ask goes first and the fullscreen follows it.
+  const askFirst = !(await cameraGranted());
+  if (session !== my) return;
+  if (!askFirst) goFullscreen().catch(() => {});
 
   el.overlay.classList.remove("gone");
   el.retry.hidden = true;
@@ -705,6 +764,8 @@ async function selectClip(clip) {
     if (session === my) fail(error.message, true);
     return;
   }
+  if (session !== my) return;
+  if (askFirst) await fullscreenAfterCamera(my);
   if (session !== my) return;
 
   if (everCalibrated) {
@@ -785,6 +846,9 @@ function maybePlay() {
 function tryPlay() {
   mediaPlay().then(() => {
     if (qualityLine) { toast(qualityLine); qualityLine = null; }
+    // The three seconds of HUD a viewer gets are counted from here, not
+    // from the click that picked the video a calibration ago.
+    lastPointerAt = performance.now();
   }).catch(() => {
     // The click that started all this has gone stale for this browser;
     // one fresh click fixes it.
@@ -798,7 +862,6 @@ function fail(message, retryable = false) {
   el.overlay.classList.remove("gone");
   el.overlay.classList.remove("calibrating");
   el.dot.classList.remove("on");
-  moveDot(null);
   el.progresswrap.classList.remove("on");
   el.overlaytext.textContent = message;
   el.retry.hidden = !retryable;
@@ -840,7 +903,6 @@ function returnToLibrary() {
   cameraOpen = false;
   el.cam.srcObject = null;
   lastReadingAt = 0;
-  moveDot(null);
   el.overlay.classList.add("gone");
   el.overlay.classList.remove("calibrating");
   el.progresswrap.classList.remove("on");
@@ -848,6 +910,7 @@ function returnToLibrary() {
   el.retry.hidden = true;
   el.retry.textContent = "Try again";
   document.body.classList.add("browsing");
+  updateHud();
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
 
@@ -935,26 +998,8 @@ el.setsreset.addEventListener("click", () => {
 let awaitingGeneration = null;
 let seenResets = 0;
 let calibrationHeadline = "Look at the dot.";
-let calibrationOffset = null;
-let secondDot = false;
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
-
-/* The second dot sits up and to the right of the first, so one extra hold
- * measures both axes. */
-const DOT_OFFSET = { x: 0.30, y: -0.25 };
-
-function dotOffset() {
-  return {
-    dx: Math.round(el.canvas.clientWidth * DOT_OFFSET.x),
-    dy: Math.round(el.canvas.clientHeight * DOT_OFFSET.y),
-  };
-}
-
-function moveDot(offset) {
-  el.dot.style.left = offset ? `calc(50% + ${offset.dx}px)` : "50%";
-  el.dot.style.top = offset ? `calc(50% + ${offset.dy}px)` : "50%";
-}
 
 let awayShown = false;
 
@@ -984,9 +1029,7 @@ async function runCalibration(headline) {
   // Calibration belongs in fullscreen: the size the video plays at.  A key
   // press or a tap carries the permission; a programmatic rerun without a
   // gesture is refused quietly and calibrates where it is.
-  if (!document.fullscreenElement) {
-    document.documentElement.requestFullscreen().catch(() => {});
-  }
+  goFullscreen().catch(() => {});
   calibrated = false;
   awaitingGeneration = null;
   calibrationHeadline = headline;
@@ -1006,18 +1049,14 @@ async function runCalibration(headline) {
   setOverlay(headline, "hold still…");
   el.progress.style.width = "0%";
   el.progresswrap.classList.add("on");
-  calibrationOffset = dotOffset();
-  secondDot = false;
   awayShown = false;
-  moveDot(null);
-  awaitingGeneration = controller.recalibrate(calibrationOffset);
+  awaitingGeneration = controller.recalibrate();
 }
 
 function finishCalibration() {
   calibrated = true;
   everCalibrated = true;
   awaitingGeneration = null;
-  moveDot(null);
   el.overlay.classList.add("gone");
   el.overlay.classList.remove("calibrating");
   el.progresswrap.classList.remove("on");
@@ -1039,6 +1078,7 @@ function recalibrate() {
 
 document.addEventListener("keydown", (event) => {
   if (browsing) return;
+  wakeHud();
   const key = event.key.toLowerCase();
   if (event.key === "Escape") {
     if (!el.settings.hidden) toggleSettings(false);
@@ -1049,10 +1089,7 @@ document.addEventListener("keydown", (event) => {
   else if (key === "c") recalibrate();
   else if (key === " ") { event.preventDefault(); mediaPaused() ? mediaPlay().catch(() => {}) : mediaPause(); }
   else if (key === "f") {
-    document.fullscreenElement ? document.exitFullscreen() : document.documentElement.requestFullscreen().catch(() => {});
-  } else if (key === "h") {
-    hudHidden = document.body.classList.toggle("hidden-hud");
-    if (!hudHidden) compassShown = "";  // repaint on the next frame
+    document.fullscreenElement ? document.exitFullscreen() : goFullscreen().catch(() => {});
   }
   else if (event.key === "ArrowRight") mediaSeek(5);
   else if (event.key === "ArrowLeft") mediaSeek(-5);

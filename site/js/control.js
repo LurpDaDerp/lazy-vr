@@ -37,10 +37,6 @@ export const MAX_ASPECT = 6.0;
 // How far a resize may rescale the map: past this, something is lying.
 export const MIN_SCALE = 0.2;
 export const MAX_SCALE = 5.0;
-// What a screen pixel may plausibly be worth in gaze degrees.  A measured
-// value outside this band is a botched fixation, not a monitor.
-export const MIN_K = 0.001;
-export const MAX_K = 0.2;
 
 export const DEFAULTS = Object.freeze({
   // Eye eccentricity that commands no motion, in degrees of visual angle.
@@ -48,16 +44,16 @@ export const DEFAULTS = Object.freeze({
   // so that is the physiological ceiling; a viewer sitting at a screen
   // cannot turn their real head to help, so it is walked a long way down,
   // and the onset gate does the glance rejection the deadzone would
-  // otherwise have to.  A degree and a half is nearly as low as it can go
-  // before it is inside the gaze estimate's own noise; the price is that a
-  // biased centre now shows up as a slow standing turn where a wider band
-  // would have swallowed it, which is what C is for.
-  deadzoneYaw: 1.5,
+  // otherwise have to.  Below about a degree and a half the band is inside
+  // the gaze estimate's own noise, and anywhere near that floor every scrap
+  // of bias in the calibrated centre reads as a slow standing turn -- so it
+  // sits a little clear of it rather than on it, and C is for the rest.
+  deadzoneYaw: 1.8,
   deadzonePitch: null,        // null: derive from the screen
   // Degrees per second of turn per degree of gaze past the deadzone.  With
-  // the deadzone above, the fastest sweep on offer arrives inside twelve
+  // the deadzone above, the fastest sweep on offer arrives inside fourteen
   // degrees of eye travel -- a glance rather than a stare.
-  rateYaw: 12.48,
+  rateYaw: 10.6,
   ratePitch: null,            // null: derive from the screen
   maxRateYaw: 128.0,
   // null: the same ceiling as yaw.  The gearing below has already made the
@@ -150,14 +146,6 @@ export class GazeController {
     this.yawEma = new Ema(this.config.tau);
     this.pitchEma = new Ema(this.config.tau);
     this.centre = [0, 0];
-    // Where the viewport's centre sits on the monitor now and when the last
-    // pass finished, and what one moved pixel is worth in gaze degrees --
-    // [kx, ky], signed, measured by the two-dot pass.  Null until known.
-    this.screenCentre = null;
-    this.calScreenCentre = null;
-    this.k = null;
-    this.offsetRequest = null;
-    this.phase = "centre";  // centre | offset, then idle once calibrated
     this.calibrated = false;
     // Bumped on every centring pass, so a page can tell one pass's progress
     // from a previous pass's.
@@ -234,27 +222,6 @@ export class GazeController {
     Object.assign(this.config, partial);
   }
 
-  /* Where the viewport's centre sits on the monitor, in the same pixels
-   * the viewport is measured in. */
-  setScreenCentre(x, y) {
-    const px = Number(x);
-    const py = Number(y);
-    if (!Number.isFinite(px) || !Number.isFinite(py)) return;
-    this.screenCentre = [px, py];
-  }
-
-  /* The calibrated centre, corrected for how far the viewport's centre has
-   * physically moved on the monitor since the pass finished.  A side-
-   * snapped window taken fullscreen puts "straight ahead" somewhere else
-   * entirely, and k -- measured, sign included, by the two-dot pass --
-   * says how many gaze degrees each moved pixel is worth. */
-  get effectiveCentre() {
-    if (!this.k || !this.screenCentre || !this.calScreenCentre) return this.centre;
-    const dx = this.screenCentre[0] - this.calScreenCentre[0];
-    const dy = this.screenCentre[1] - this.calScreenCentre[1];
-    return [this.centre[0] + this.k[0] * dx, this.centre[1] + this.k[1] * dy];
-  }
-
   /* What the HUD needs to draw the axes, at the current screen size. */
   get limits() {
     const c = this.config;
@@ -282,16 +249,11 @@ export class GazeController {
     this.progress = 0;
   }
 
-  /* Re-run the centring pass.  With `offset` ({dx, dy} in viewport px), a
-   * second dot follows the first at that displacement, and the difference
-   * between the two fixations measures what a screen pixel is worth. */
-  recalibrate(offset = null) {
+  /* Re-run the centring pass: one dot, one hold, and the mean of the
+   * fixation becomes where straight ahead is. */
+  recalibrate() {
     this.calibrated = false;
     this.generation += 1;
-    const usable = offset && Number.isFinite(offset.dx) && Number.isFinite(offset.dy)
-      && (offset.dx !== 0 || offset.dy !== 0);
-    this.offsetRequest = usable ? { dx: offset.dx, dy: offset.dy } : null;
-    this.phase = "centre";
     this.resetFixation();
     this.release();
     return this.generation;
@@ -325,41 +287,19 @@ export class GazeController {
     if (held >= hold) {
       let meanYaw = 0, meanPitch = 0;
       for (const [y, p] of this.streak) { meanYaw += y; meanPitch += p; }
-      const mean = [meanYaw / this.streak.length, meanPitch / this.streak.length];
-      if (this.phase === "offset") {
-        // The second fixation, a known number of pixels from the first:
-        // the difference measures degrees per pixel, sign included.
-        const measured = (delta, d) => {
-          if (!d) return 0;
-          const k = delta / d;
-          return Math.abs(k) >= MIN_K && Math.abs(k) <= MAX_K ? k : 0;
-        };
-        this.k = [measured(mean[0] - this.centre[0], this.offsetRequest.dx),
-                  measured(mean[1] - this.centre[1], this.offsetRequest.dy)];
-        this.finish();
-      } else {
-        this.centre = mean;
-        if (this.offsetRequest) {
-          this.phase = "offset";
-          this.resetFixation();
-        } else {
-          this.finish();
-        }
-      }
+      this.centre = [meanYaw / this.streak.length, meanPitch / this.streak.length];
+      this.finish();
     }
   }
 
   /* The pass is done: bank everything the map is relative to.  The tuning
-   * is only true for the screen it happened on -- its size and its place --
-   * so both are remembered, and a later resize or move rescales and re-aims
-   * instead of drifting. */
+   * is only true for the viewport it happened in, so that is remembered,
+   * and a later resize rescales against it instead of drifting. */
   finish() {
     this.calibrated = true;
-    this.phase = "idle";
     this.progress = 1;
     this.calWidth = this.width;
     this.calHeight = this.height;
-    this.calScreenCentre = this.screenCentre ? [...this.screenCentre] : null;
   }
 
   // -- the map ----------------------------------------------------------
@@ -385,7 +325,7 @@ export class GazeController {
       return this.still("calibrating", 0, 0, sample.confidence);
     }
 
-    const centre = this.effectiveCentre;
+    const centre = this.centre;
     const yawError = yaw - centre[0];
     const pitchError = pitch - centre[1];
 

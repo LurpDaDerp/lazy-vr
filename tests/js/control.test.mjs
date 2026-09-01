@@ -224,8 +224,8 @@ test("map: the numbers that decide how the thing feels", () => {
   // they are the ones a passing edit is most likely to nudge, and the
   // settings panel's x1.00 means exactly this row.
   const d = new GazeController().config;
-  near(d.rateYaw, 12.48, 1e-12);
-  near(d.deadzoneYaw, 1.5, 1e-12);
+  near(d.rateYaw, 10.6, 1e-12);
+  near(d.deadzoneYaw, 1.8, 1e-12);
   near(d.maxRateYaw, 128, 1e-12);
   assert.equal(d.deadzonePitch, null);   // both derived from the screen
   assert.equal(d.ratePitch, null);
@@ -234,9 +234,9 @@ test("map: the numbers that decide how the thing feels", () => {
 
 test("map: full speed is a glance, not a stare", () => {
   const c = shipped();
-  // Saturation inside twelve degrees of eye travel: a viewer asking for the
-  // fastest sweep should not have to look off the edge of the screen.
-  assert.ok(c.limits.spanYaw < 12, `saturates at ${c.limits.spanYaw}`);
+  // Saturation inside fourteen degrees of eye travel: a viewer asking for
+  // the fastest sweep should not have to look off the edge of the screen.
+  assert.ok(c.limits.spanYaw < 14, `saturates at ${c.limits.spanYaw}`);
 });
 
 test("map: the cap obeys the same law as the rest of the map", () => {
@@ -414,79 +414,6 @@ test("configure: live tuning takes hold on the very next sample", () => {
   near(holdGaze(c, 15, 0, t, 0.4).yawRate, (15 - 6) * 9, 1e-9);
   c.configure({ rateYaw: 18, deadzoneYaw: 3, invertYaw: true, maxRateYaw: 1e6 });
   near(holdGaze(c, 15, 0, t + 0.5, 0.4).yawRate, -(15 - 3) * 18, 1e-9);
-});
-
-// -- two dots: what a screen pixel is worth ------------------------------
-// The second fixation sits a known number of pixels from the first, so the
-// difference between the two measures degrees-of-gaze per pixel, sign
-// included -- and a moved window can then be re-aimed exactly.
-
-function twoPoint(kx = 0.02, ky = -0.02) {
-  const c = new GazeController(config());
-  c.setViewport(1600, 900);
-  c.setScreenCentre(800, 450);
-  c.recalibrate({ dx: 400, dy: -225 });
-  let t = 0;
-  while (c.phase === "centre") { t += STEP; c.update(tracked(0, 0, t)); }
-  while (!c.calibrated) { t += STEP; c.update(tracked(kx * 400, ky * -225, t)); }
-  return { c, t };
-}
-
-test("two-point: the pass measures degrees per pixel, sign included", () => {
-  const { c } = twoPoint();
-  near(c.k[0], 0.02, 1e-9);
-  near(c.k[1], -0.02, 1e-9);
-  assert.equal(c.phase, "idle");
-  assert.ok(c.calibrated);
-});
-
-test("two-point: a moved window moves the centre with it", () => {
-  const { c, t } = twoPoint();
-  // The window slides 200 px right and 100 px up; staring at the *new*
-  // screen centre produces the gaze k predicts, and nothing turns.
-  c.setScreenCentre(1000, 350);
-  const out = holdGaze(c, 0.02 * 200, -0.02 * -100, t, 0.4);
-  near(out.yawError, 0, 1e-9);
-  near(out.pitchError, 0, 1e-9);
-  assert.equal(out.yawRate, 0);
-  assert.equal(out.state, "holding");
-});
-
-test("two-point: without a second dot no correction is applied", () => {
-  const c = new GazeController(config());
-  c.setViewport(1600, 900);
-  c.setScreenCentre(800, 450);
-  c.recalibrate();
-  const t = calibrated(c);
-  assert.equal(c.k, null);
-  c.setScreenCentre(1200, 450);
-  near(holdGaze(c, 0, 0, t, 0.2).yawError, 0, 1e-9);
-});
-
-test("two-point: an absurd measurement corrects nothing", () => {
-  // A botched second fixation reads as an implausible degrees-per-pixel
-  // and is discarded rather than believed.
-  const { c, t } = twoPoint(0.0001, 0.0001);
-  assert.equal(c.k[0], 0);
-  assert.equal(c.k[1], 0);
-  c.setScreenCentre(1300, 450);
-  near(holdGaze(c, 0, 0, t, 0.2).yawError, 0, 1e-9);
-});
-
-test("two-point: looking away during the second dot restarts only that dot", () => {
-  const c = new GazeController(config());
-  c.setViewport(1600, 900);
-  c.recalibrate({ dx: 400, dy: 0 });
-  let t = 0;
-  while (c.phase === "centre") { t += STEP; c.update(tracked(0, 0, t)); }
-  const centre = [...c.centre];
-  t += STEP; c.update(tracked(8, 0, t));
-  const before = c.resets;
-  t += STEP; c.update(tracked(40, 0, t));  // a glance far away
-  assert.equal(c.resets, before + 1);
-  assert.equal(c.phase, "offset");
-  assert.deepEqual(c.centre, centre);
-  assert.ok(!c.calibrated);
 });
 
 test("defaults: the onset gate opens on one sample at any plausible frame rate", () => {

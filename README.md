@@ -162,16 +162,17 @@ it publishes the same server at `https://<machine>.<tailnet>.ts.net/` with a
 real certificate, camera included (`tailscale serve reset` undoes it).
 
 Picking a video goes fullscreen for the session (`Esc` leaves the video,
-`F` toggles). Chrome will ask for the camera the first time. A green dot
-appears: three seconds to settle, then hold still until the bar fills — and
-the dot then hops up-right for one more short hold. The first dot teaches
-the player where your neutral gaze sits; the second measures what a screen
-pixel is worth to your eyes, which is what lets a moved or resized window
-stay aimed (see below). Look away and the current dot starts over. It runs
-once a visit, `C` reruns it whenever you shift in your seat, a real change
-of screen size — fullscreen, a snapped window — pauses the video and reruns
-the dots by itself, and the camera is released — light off — whenever you
-are back in the library.
+`F` toggles). Chrome will ask for the camera the first time, and because it
+shows that prompt by dropping the page *out* of fullscreen, the first ask
+is made before the fullscreen rather than inside it; the page goes
+fullscreen once the prompt is answered, and asks for one more click if the
+browser wants a fresh gesture by then. Then a green dot appears in the
+middle: three seconds to settle, then hold still until the bar fills. That
+one hold teaches the player where your neutral gaze sits — look away and it
+starts over. It runs once a visit, `C` reruns it whenever you shift in your
+seat, a real change of screen size — fullscreen, a snapped window — pauses
+the video and reruns it by itself, and the camera is released — light off —
+whenever you are back in the library.
 
 | Key | |
 |---|---|
@@ -179,9 +180,13 @@ are back in the library.
 | `C` | recalibrate — stare at the green dot |
 | `Space` | play / pause |
 | `F` | fullscreen |
-| `H` | hide the overlay |
 | `←` `→` | seek five seconds |
 | `Esc` | back to the library |
+
+The HUD, compass and key hints look after themselves the way a video
+player's controls do: three seconds into a playing video they fade out,
+cursor included, and the first movement of the pointer brings them back.
+Pausing, the settings panel and calibration all hold them open.
 
 On a phone there is no keyboard; the buttons that matter appear on screen.
 
@@ -319,29 +324,29 @@ divided — keeping one thing invariant: the same **fraction** of the view
 always asks for the same turn. At the calibrated size the scales are 1 and
 nothing changes.
 
-A moved window needs more than a ratio: a side-snapped window taken
-fullscreen puts "straight ahead" somewhere physically different on the
-monitor. That is what the second calibration dot is for. It sits a known
-number of pixels from the first, so the difference between the two
-fixations measures degrees-of-gaze per screen pixel — magnitude *and* sign,
-per axis — and whenever the viewport's centre moves on the monitor, the
-calibrated centre is shifted by exactly what those pixels are worth. An
-implausible measurement (a botched second fixation) is discarded rather
-than believed. The one assumption is one monitor at one viewing distance;
-after dragging to a different monitor, press `C`.
+A window *moved* across the monitor is a different problem: a side-snapped
+window taken fullscreen puts "straight ahead" somewhere physically else,
+and no ratio can see that. There used to be a second calibration dot for
+it, a known number of pixels from the first, measuring degrees-of-gaze per
+screen pixel so the centre could be shifted by what the movement was worth.
+It cost a second hold from every viewer on every pass, it could never run
+on the YouTube-player fallback (whose sphere is an iframe, so there is no
+canvas to offset the dot within), and calibration happens in fullscreen and
+stays there, where nothing moves. So the pass is one dot, and a window
+dragged somewhere new — or onto another monitor — is what `C` is for.
 
 | screen | pitch deadzone | pitch rate |
 |---|---|---|
-| 4:3 | 1.13° | 16.6 |
-| 16:9 | 0.84° | 22.2 |
-| 21:9 | 0.64° | 29.1 |
-| 9:16 (portrait) | 2.67° | 7.0 |
+| 4:3 | 1.35° | 14.1 |
+| 16:9 | 1.01° | 18.8 |
+| 21:9 | 0.77° | 24.7 |
+| 9:16 (portrait) | 3.20° | 6.0 |
 
 | Setting (`control.js`) | Default | |
 |---|---|---|
-| `rateYaw` | 12.48 | deg/s of turn per degree of gaze, left/right |
+| `rateYaw` | 10.6 | deg/s of turn per degree of gaze, left/right |
 | `ratePitch` | from the screen | `rateYaw` × aspect |
-| `deadzoneYaw` | 1.5° | gaze eccentricity that commands no motion |
+| `deadzoneYaw` | 1.8° | gaze eccentricity that commands no motion |
 | `deadzonePitch` | from the screen | `deadzoneYaw` ÷ aspect |
 | `maxRateYaw` | 128°/s | fastest the view may sweep |
 | `maxRatePitch` | from the screen | the same ceiling — see below |
@@ -363,25 +368,27 @@ genuinely wants a gentler vertical.
 
 The deadzone is set in degrees of visual angle, not screen fraction. People do
 not recruit the head for gaze shifts below roughly 18°, so that is the
-physiological ceiling and 1.5° is walked a very long way down from it — a
+physiological ceiling and 1.8° is walked a very long way down from it — a
 viewer at a screen cannot turn their real head to help, and the onset gate
-does the glance rejection the deadzone would otherwise have to.
+does the glance rejection the deadzone would otherwise have to. Below about
+1.5° the band is inside the gaze estimate's own noise, and anywhere near
+that floor every scrap of bias in the calibrated centre reads as a slow
+standing turn, so it sits a little clear of it rather than on it.
 
-Together with the gain, that puts the fastest sweep on offer within **11.8°**
-of eye travel, so full speed is a glance rather than a stare:
+Together with the gain, that puts the fastest sweep on offer within **13.9°**
+of eye travel, so full speed is still a glance rather than a stare:
 
 | glance | before | now |
 |---|---|---|
-| 3° | 0°/s | 19°/s |
-| 6° | 29°/s | 56°/s |
-| 12° | 86°/s | 128°/s |
+| 3° | 19°/s | 13°/s |
+| 6° | 56°/s | 45°/s |
+| 12° | 128°/s | 108°/s |
 
-Note the effect near the centre is far more than the 30% the gain alone
-would give: a narrower deadzone compounds with it, and a glance that used to
-command nothing at all now commands a real turn. The other side of that
-bargain is drift — a small standing bias in the calibrated centre used to be
-swallowed by the wider band and now shows up as a slow permanent turn, so
-`C` earns its keep.
+Near the centre the change is more than the 15% the gain alone would give:
+the wider band compounds with it, and the two together are what buy back the
+tolerance for drift that the previous pair spent — a small standing bias in
+the calibrated centre is swallowed again rather than showing up as a slow
+permanent turn.
 
 ### The body
 
