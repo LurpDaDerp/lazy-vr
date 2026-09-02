@@ -186,7 +186,10 @@ whenever you are back in the library.
 The HUD, compass and key hints look after themselves the way a video
 player's controls do: three seconds into a playing video they fade out,
 cursor included, and the first movement of the pointer brings them back.
-Pausing, the settings panel and calibration all hold them open.
+Pausing, the settings panel and calibration all hold them open — and so
+does anything that would leave the page unable to see the pointer at all:
+a window that has lost the focus, or the youtube-player fallback, whose
+iframe covers the window and keeps every pointer move to itself.
 
 On a phone there is no keyboard; the buttons that matter appear on screen.
 
@@ -511,7 +514,7 @@ re-gear themselves for a portrait screen (see above).
 ## Tests
 
 ```
-node --test "tests/js/*.test.mjs"          # geometry parity, control law, body, avsync
+node --test "tests/js/*.test.mjs"          # geometry parity, control law, body, avsync, gaze transport
 python -m unittest discover -s tests       # the youtube source: clips, format picking
 ```
 

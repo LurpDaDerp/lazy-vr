@@ -367,6 +367,13 @@ function hudAwake(now) {
   if (browsing || !started || !calibrated) return true;
   if (!el.settings.hidden) return true;   // the panel is chrome too
   if (mediaPaused()) return true;         // a paused video is being read, not watched
+  // The chrome may only fade while this document is the one the pointer is
+  // moving over.  Under the youtube-player fallback it is not: the iframe
+  // covers the window, and a pointer moving inside another document never
+  // crosses back -- so all four ways up are dead there, and chrome that
+  // went would have nothing left able to bring it back.  A window that has
+  // lost the focus cannot see the pointer either.
+  if (engineMode === "embed" || !document.hasFocus()) return true;
   return now - lastPointerAt < HUD_IDLE_MS;
 }
 
@@ -388,6 +395,21 @@ function wakeHud() {
 document.addEventListener("pointermove", wakeHud);
 document.addEventListener("pointerdown", wakeHud);
 document.addEventListener("wheel", wakeHud, { passive: true });
+// Coming back to the window is a sign of life like any other, and the three
+// seconds are owed from then rather than from whenever the pointer last
+// moved before the viewer looked away.
+window.addEventListener("focus", wakeHud);
+
+/* A click inside youtube's iframe carries the keyboard off into another
+ * document, and every shortcut here goes quiet -- while nothing is
+ * listening over there either, since the player is built with its own keys
+ * turned off.  Take it back the moment it goes: the click has already
+ * landed, and what an ad's skip button wants is the pointer, not the
+ * focus. */
+window.addEventListener("blur", () => {
+  const active = document.activeElement;
+  if (active && active.tagName === "IFRAME" && el.embed.contains(active)) active.blur();
+});
 
 function renderHud(out, reading) {
   if (hudHidden) return;  // thirty DOM writes a second nobody can see

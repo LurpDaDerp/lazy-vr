@@ -47,6 +47,7 @@ export class GazeTracker {
     this.mode = "inline";
     this.runId = 0;
     this._mirror = true;
+    this.ready = null;
     this.pendingLoad = null;
     this.pendingTest = null;
   }
@@ -69,7 +70,22 @@ export class GazeTracker {
 
   // -- loading ----------------------------------------------------------
 
-  async load() {
+  /* The pipeline, loaded once.  Two callers want it finished -- the page,
+   * which starts it as soon as the shelves are up, and open() below, which
+   * cannot choose a transport until it knows where the pipeline ended up --
+   * and the second must join the first rather than load a second copy.  A
+   * load that failed is forgotten, so a retry is a fresh attempt. */
+  load() {
+    if (!this.ready) {
+      this.ready = this.loadOnce().catch((error) => {
+        this.ready = null;
+        throw error;
+      });
+    }
+    return this.ready;
+  }
+
+  async loadOnce() {
     if (await this.loadWorker()) return;
     this.mode = "inline";
     this.engine = new GazeEngine({ models: this.models, onStatus: this.onStatus });
@@ -180,6 +196,22 @@ export class GazeTracker {
     }
     this.video = videoElement;
 
+    // Which of the three carries the frames depends on where the pipeline
+    // ended up, and load() only settles that at the very end: the worker is
+    // not adopted until its models are in.  The camera is much the faster
+    // of the two -- granted on an earlier visit it answers in milliseconds,
+    // well inside the seconds the models take -- so choosing here on what
+    // load() happened to have reached would send the frames to a worker
+    // that is not there yet, take the inline path instead, and then watch
+    // load() move `mode` out from under it.  Nothing would process a frame
+    // again, and the page would sit at a calibration bar that never moves.
+    //
+    // The ask still goes first: getUserMedia wants the click while it is
+    // still warm, and waiting before it would spend that.  A load that
+    // failed is the caller's to report; all that matters here is that it is
+    // no longer in flight.
+    await this.load().catch(() => {});
+
     if (this.worker && typeof MediaStreamTrackProcessor !== "undefined") {
       const [track] = this.stream.getVideoTracks();
       try {
@@ -215,6 +247,13 @@ export class GazeTracker {
       return;
     }
     if (!this.video) return;
+    // Frames with nowhere to go.  Silence here looks exactly like a healthy
+    // tracker that cannot see a face -- a bar that never moves and no error
+    // anywhere -- so it is worth saying.
+    if (this.mode === "frames" ? !this.worker : !this.engine) {
+      this.error = new Error("The gaze pipeline was not loaded before the camera started.");
+      return;
+    }
     this.running = true;
     this.busy = false;
     this.inflight = false;
