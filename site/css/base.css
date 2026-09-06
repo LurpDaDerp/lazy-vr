@@ -1,0 +1,335 @@
+/* The ground everything stands on: the reset, the media elements nobody
+ * sees, the browser surfaces (scrollbar, selection, caret, focus), and
+ * the shared control vocabulary (buttons, fields, switches, sliders). */
+
+*, *::before, *::after { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  overflow: hidden;
+  background: var(--dome-deep);
+  color: var(--star);
+  font: var(--t-body);
+  font-variant-numeric: tabular-nums;
+  -webkit-font-smoothing: antialiased;
+  cursor: default;
+}
+
+/* -- browser surfaces carry the design too ------------------------- */
+
+::selection { background: rgba(240, 181, 107, 0.30); color: var(--star); }
+input, textarea { caret-color: var(--lamp); }
+
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--seat-2) transparent;
+}
+*::-webkit-scrollbar { width: 8px; height: 8px; }
+*::-webkit-scrollbar-track { background: transparent; }
+*::-webkit-scrollbar-thumb { background: var(--seat-2); border-radius: var(--r-round); }
+*::-webkit-scrollbar-thumb:hover { background: var(--dusk); }
+
+:focus { outline: none; }
+:focus-visible {
+  outline: 2px solid var(--lamp);
+  outline-offset: 2px;
+  border-radius: var(--r-sm);
+}
+
+/* The controls below set display, which would beat the UA's [hidden]
+   rule; app.js hides things by the attribute, so it must always win. */
+[hidden] { display: none !important; }
+
+h1, h2, h3, p { margin: 0; }
+button, input, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled { cursor: default; opacity: 0.5; }
+
+svg.icon {
+  width: 20px;
+  height: 20px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.5;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  flex: none;
+  display: block;
+}
+
+/* -- the picture --------------------------------------------------- */
+
+#view {
+  position: fixed;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  display: block;
+}
+
+/* The source frames go to a texture, never to the screen.  Kept inside the
+   viewport and never display:none -- Chrome stops decoding a video it thinks
+   nobody is looking at, and a stalled decoder means a black sphere. */
+#video, #cam {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 1px;
+  height: 1px;
+  opacity: 0.01;
+  pointer-events: none;
+  z-index: -1;
+}
+
+#sound { display: none; }
+
+/* The fallback engine: youtube's iframe where the sphere would be.  It
+   keeps its pointer events -- an ad's skip button must stay clickable. */
+#embed {
+  position: fixed;
+  inset: 0;
+  display: none;
+  background: var(--dome-deep);
+}
+
+body.embedded #embed { display: block; }
+body.embedded #view { display: none; }
+
+/* The iframe keeps the oversized width/height attributes embed.js gives it;
+   fit() scales it onto the window. */
+#embed iframe { border: 0; display: block; }
+
+/* -- shared controls ----------------------------------------------- */
+
+.btn, .btn-primary, .btn-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  height: var(--control);
+  padding: 0 var(--s-4);
+  border: 1px solid var(--rail);
+  border-radius: var(--r-sm);
+  background: var(--seat);
+  color: var(--star);
+  font: var(--t-title);
+  white-space: nowrap;
+  transition: background var(--t-base) var(--ease-out), border-color var(--t-base) var(--ease-out),
+              color var(--t-base) var(--ease-out), transform var(--t-fast) var(--ease-out);
+}
+
+.btn:hover, .btn-icon:hover { background: var(--seat-2); border-color: var(--rail-strong); }
+.btn:active, .btn-icon:active, .btn-primary:active { transform: translateY(1px); }
+
+.btn-icon {
+  width: var(--control);
+  padding: 0;
+  color: var(--star-dim);
+}
+.btn-icon:hover { color: var(--star); }
+
+.btn-primary {
+  background: var(--lamp);
+  border-color: transparent;
+  color: var(--dome-deep);
+  padding: 0 var(--s-6);
+  font-weight: 600;
+}
+.btn-primary:hover { background: var(--lamp-deep); }
+
+/* A field: seat ground, one hairline, the lamp only when focused. */
+input[type="search"], input[type="text"], select {
+  height: var(--control);
+  padding: 0 var(--s-3);
+  border: 1px solid var(--rail);
+  border-radius: var(--r-sm);
+  background: var(--seat);
+  color: var(--star);
+  font: var(--t-title);
+  transition: border-color var(--t-base) var(--ease-out), background var(--t-base) var(--ease-out);
+}
+input[type="search"]::placeholder { color: var(--star-dim); }
+input[type="search"]:focus, input[type="text"]:focus, select:focus {
+  border-color: var(--lamp-rim);
+  background: var(--seat-2);
+}
+input[type="search"]:focus-visible, select:focus-visible { outline: none; }
+input[type="search"]::-webkit-search-cancel-button { -webkit-appearance: none; appearance: none; }
+
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  padding-right: var(--s-8);
+  width: 100%;
+}
+.select-wrap { position: relative; display: block; }
+.select-wrap .icon {
+  position: absolute;
+  right: var(--s-3);
+  top: 50%;
+  transform: translateY(-50%);
+  width: 16px;
+  height: 16px;
+  color: var(--star-dim);
+  pointer-events: none;
+}
+
+/* A slider: a brass track, the played part in lamp, a lamp thumb. */
+input[type="range"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 100%;
+  height: 24px;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+  --fill: 0%;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 2px;
+  border-radius: var(--r-round);
+  background: linear-gradient(90deg, var(--lamp) var(--fill), var(--brass-dim) var(--fill));
+}
+input[type="range"]::-moz-range-track {
+  height: 2px;
+  border-radius: var(--r-round);
+  background: var(--brass-dim);
+}
+input[type="range"]::-moz-range-progress { height: 2px; background: var(--lamp); }
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 16px;
+  height: 16px;
+  margin-top: -7px;
+  border-radius: 50%;
+  background: var(--lamp);
+  border: 2px solid var(--dome-deep);
+  box-shadow: 0 0 0 1px var(--brass-dim);
+  transition: transform var(--t-fast) var(--ease-out);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--lamp);
+  border: 2px solid var(--dome-deep);
+  box-shadow: 0 0 0 1px var(--brass-dim);
+}
+input[type="range"]:hover::-webkit-slider-thumb, input[type="range"]:focus-visible::-webkit-slider-thumb { transform: scale(1.15); }
+input[type="range"]:focus-visible { outline: none; }
+input[type="range"]:focus-visible::-webkit-slider-thumb { box-shadow: 0 0 0 3px var(--lamp-rim); }
+
+/* A switch: a checkbox drawn as a 34×20 track with a knob. */
+input[type="checkbox"] {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 34px;
+  height: 20px;
+  margin: 0;
+  flex: none;
+  border-radius: var(--r-round);
+  background: var(--seat-2);
+  border: 1px solid var(--rail);
+  position: relative;
+  cursor: pointer;
+  transition: background var(--t-base) var(--ease-out), border-color var(--t-base) var(--ease-out);
+}
+input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  background: var(--star-dim);
+  transition: transform var(--t-base) var(--ease-out), background var(--t-base) var(--ease-out);
+}
+input[type="checkbox"]:checked { background: var(--lamp); border-color: var(--lamp); }
+input[type="checkbox"]:checked::after { background: var(--dome-deep); transform: translateX(14px); }
+input[type="checkbox"]:focus-visible { outline-offset: 3px; border-radius: var(--r-round); }
+
+kbd {
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+  color: var(--brass);
+  border: 1px solid var(--brass-dim);
+  border-radius: var(--r-xs);
+  padding: 1px 5px;
+  min-width: 18px;
+  display: inline-block;
+  text-align: center;
+}
+
+/* -- the toast, one message at a time, above the transport --------- */
+
+#toast {
+  position: fixed;
+  bottom: 112px;
+  left: 50%;
+  transform: translateX(-50%) translateY(6px);
+  padding: var(--s-2) var(--s-4);
+  border-radius: var(--r-round);
+  background: var(--seat);
+  border: 1px solid var(--rail);
+  color: var(--star);
+  font: var(--t-title);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 25;
+  transition: opacity var(--t-slow) var(--ease-out), transform var(--t-slow) var(--ease-out);
+}
+#toast.on { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* -- only raised while a file is genuinely over the window --------- */
+
+#dropzone {
+  position: fixed;
+  inset: 0;
+  z-index: 60;
+  display: none;
+  place-items: center;
+  background: rgba(6, 8, 20, 0.86);
+}
+body.dropping #dropzone { display: grid; }
+#dropzone span {
+  font: var(--t-headline);
+  color: var(--lamp);
+  border: 1px dashed var(--lamp-rim);
+  border-radius: var(--r-lg);
+  padding: var(--s-12) var(--s-16);
+}
+
+/* -- no keyboard on a phone: the actions that matter, as buttons ---- */
+
+#touchbar {
+  display: none;
+  position: fixed;
+  bottom: max(16px, env(safe-area-inset-bottom));
+  left: 50%;
+  transform: translateX(-50%);
+  gap: var(--s-2);
+  z-index: 15;
+  transition: opacity var(--t-slow) var(--ease-out);
+}
+#touchbar button {
+  height: var(--control);
+  padding: 0 var(--s-4);
+  border: 1px solid var(--rail);
+  border-radius: var(--r-round);
+  background: var(--seat);
+  color: var(--star);
+  font: var(--t-title);
+}
+@media (pointer: coarse) {
+  body:not(.browsing) #touchbar { display: flex; }
+  #keys { display: none; }
+}
+body.browsing #touchbar { display: none; }
+body.hidden-hud #touchbar { opacity: 0; pointer-events: none; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition-duration: 0.01ms !important; animation-duration: 0.01ms !important; }
+}

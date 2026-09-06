@@ -21,22 +21,26 @@ import { GazeTracker } from "./gaze.js";
 import { fetchHome, fetchSearch, fetchStreams, renderResults, renderShelves } from "./library.js";
 import { screenTier, tierBelow } from "./quality.js";
 import { Renderer } from "./render.js";
+import { createHud, neckEdge, qualityLabel, trackerHealth } from "./hud.js";
+import {
+  SETTINGS_DEFAULTS, bindSettingsPanel, fillCameraOptions, readSettings, readSettingsPanel,
+  renderSettingsPanel, writeSettings,
+} from "./settings.js";
 
 const DEG = Math.PI / 180;
 const $ = (id) => document.getElementById(id);
 
 const el = {
   canvas: $("view"), embed: $("embed"), video: $("video"), sound: $("sound"), cam: $("cam"),
-  state: $("state"), heading: $("heading"), gaze: $("gaze"), rate: $("rate"),
-  turn: $("turn"), neck: $("neck"), perf: $("perf"),
-  overlay: $("overlay"), overlaytext: $("overlaytext"), progress: $("progress"),
-  progresswrap: $("progresswrap"), retry: $("retry"),
-  marks: $("compassmarks"), north: $("compassnorth"), dot: $("fixation"), toast: $("toast"),
+  overlay: $("overlay"), overlaytext: $("overlaytext"), retry: $("retry"), dot: $("fixation"),
+  toast: $("toast"),
   home: $("home"), results: $("results"), resultline: $("resultline"), backhome: $("backhome"),
   searchForm: $("search"), query: $("query"),
-  grid: $("grid"), notice: $("libnotice"), empty: $("libempty"), loading: $("libloading"),
+  grid: $("grid"), notice: $("libnotice"), empty: $("libempty"), emptyfile: $("emptyfile"),
+  loading: $("libloading"),
   touchbar: $("touchbar"), local: $("local"), localfile: $("localfile"),
   settings: $("settings"), gear: $("gear"), setsclose: $("setsclose"), setsreset: $("setsreset"),
+  cameraSelect: $("set-camera"), playbtn: $("playbtn"), mutebtn: $("mutebtn"), hudgear: $("hudgear"),
 };
 
 const body = new Body();
@@ -44,6 +48,7 @@ const controller = new GazeController();
 const tracker = new GazeTracker({ models: "models", onStatus: showStatus, onReading: onReading });
 const sync = new AVSync(el.video, el.sound);
 const embedPlayer = new EmbedPlayer(el.embed);
+const hud = createHud();
 
 let renderer = null;
 try {
@@ -70,58 +75,16 @@ const prefs = (() => {
 
 /* ---------- settings ---------- */
 
-const SETTINGS_KEY = "lazyvr.settings";
-const SETTINGS_VERSION = 3;
-// Every deadzone this page has shipped as its own default -- 3.0 in version
-// 1, 1.5 in version 2.  See the migration below.
-const LEGACY_DEADZONES = [3.0, 1.5];
-const SETTINGS_DEFAULTS = Object.freeze({
-  sens: 1, deadzone: DEFAULTS.deadzoneYaw, fov: 75, blur: true,
-  invx: false, invy: false, quality: "auto", free: false,
-  version: SETTINGS_VERSION,
-});
-
-let stored = {};
-try {
-  stored = JSON.parse(localStorage.getItem(SETTINGS_KEY) || "{}") || {};
-} catch { /* a private window, or cleared storage */ }
-let settings = { ...SETTINGS_DEFAULTS, ...stored };
-
-/* Sensitivity is a multiplier, so a stored 1 follows the default wherever it
- * goes.  The deadzone is not: it is an absolute number of degrees, so a
- * returning viewer would keep the old one for ever and never see the change.
- *
- * A stored value that is exactly some past default was never chosen, only
- * persisted -- so it moves on.  Anything else the viewer picked on purpose,
- * and that stays.  The version is read off what was *stored*: taking it from
- * the merged object would let the current default answer for a save that
- * predates it, and no migration would ever run. */
-if (stored.version !== SETTINGS_VERSION) {
-  if (LEGACY_DEADZONES.some((old) => Math.abs(Number(settings.deadzone) - old) < 1e-9)) {
-    settings.deadzone = DEFAULTS.deadzoneYaw;
-  }
-  settings.version = SETTINGS_VERSION;
-}
-
-// Old or hand-edited storage must not be able to break the map.
-{
-  const bound = (value, lo, hi, fallback) => {
-    const n = Number(value);
-    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
-  };
-  settings.sens = bound(settings.sens, 0.4, 2.5, 1);
-  settings.deadzone = bound(settings.deadzone, 1, 8, DEFAULTS.deadzoneYaw);
-  settings.fov = bound(settings.fov, 60, 100, 75);
-  settings.blur = settings.blur !== false;
-  settings.invx = settings.invx === true;
-  settings.invy = settings.invy === true;
-  settings.free = settings.free === true;
-  settings.quality = ["1080", "1440", "2160", "4320"].includes(String(settings.quality))
-    ? Number(settings.quality) : "auto";
-}
+/* What the viewer can adjust lives in settings.js: the defaults, the
+ * deadzone migration, and the bounds that keep hand-edited storage from
+ * breaking the map.  This file owns what the settings do. */
+const storage = (() => {
+  try { return window.localStorage; } catch { return null; }  // a sandboxed frame
+})();
+let settings = readSettings(storage);
 
 function saveSettings() {
-  try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings)); } catch { /* ditto */ }
+  writeSettings(settings, storage);
 }
 
 function qualityCap() {
@@ -140,6 +103,45 @@ function applySettings() {
   applyFreeLook(settings.free);
   if (renderer) renderer.fov = settings.fov * DEG;
   embedPlayer.fov = settings.fov;
+  applySound();
+  document.body.classList.toggle("no-hints", !settings.hints);
+  document.body.classList.toggle("diagnostics", settings.diagnostics);
+  // A different camera mid-session: let the tracker go and reopen it on
+  // the new one.  Calibration is kept -- the centre is a property of the
+  // eyes, not of the lens -- and C is there if the new angle wants it.
+  if (started && cameraOpen && settings.camera !== cameraInUse) {
+    tracker.stop();
+    cameraOpen = false;
+    el.cam.srcObject = null;
+    ensureCamera().catch((error) => toast(error.message));
+  }
+}
+
+/* Volume and mute reach every engine: the raw pair (the >720p path plays
+ * its sound from the shadow <audio>), and youtube's player. */
+function applySound() {
+  for (const media of [el.video, el.sound]) {
+    media.volume = settings.volume;
+    media.muted = settings.muted;
+  }
+  embedPlayer.setSound(settings.volume, settings.muted);
+}
+
+function setVolume(volume) {
+  settings.volume = Math.max(0, Math.min(1, Math.round(volume * 20) / 20));
+  if (settings.volume > 0) settings.muted = false;
+  applySound();
+  saveSettings();
+  if (!el.settings.hidden) renderSettingsPanel(el.settings, settings);
+  toast(settings.volume === 0 ? "Volume off" : `Volume ${Math.round(settings.volume * 100)}%`);
+}
+
+function toggleMute() {
+  settings.muted = !settings.muted;
+  applySound();
+  saveSettings();
+  if (!el.settings.hidden) renderSettingsPanel(el.settings, settings);
+  toast(settings.muted ? "Muted — M to unmute" : "Sound on");
 }
 
 /* Switching the neck back on can leave the view somewhere a neck cannot
@@ -219,7 +221,7 @@ function frame(now) {
     if (engineMode === "embed") embedPlayer.steer(body.view);
     else renderer.draw(body.view);
   }
-  updateCompass();
+  if (!hudHidden) hud.paintCompass(currentHeading());
 }
 
 /* The gearing follows the viewport the eyes are crossing -- its shape and
@@ -301,15 +303,19 @@ async function applyQualityCap(maxHeight) {
   if (engineMode === "local" || !playing) return;
   const my = session;
   const at = el.video.currentTime;
-  const wasPaused = el.video.paused;
+  // What the viewer wants, not what the panel did: a swap asked for from
+  // the settings panel finds the video paused *by the panel*, and closing
+  // the panel is what resumes it.
+  const resume = !el.video.paused || pausedBySettings;
   try {
     const streams = await fetchStreams(playing.id, { codecs: prefs.codecs, max: maxHeight });
     if (session !== my) return;
     sync.set(streams.video.src, streams.audio && streams.audio.src);
+    qualityText = qualityLabel(streams.video.height, streams.video.fps);
     el.video.addEventListener("loadedmetadata", () => {
       if (session !== my) return;
       el.video.currentTime = at;
-      if (!wasPaused) el.video.play().catch(() => {});
+      if (resume && !pausedBySettings) el.video.play().catch(() => {});
     }, { once: true });
   } catch { /* the swap failed; keep what is playing */ }
 }
@@ -321,16 +327,20 @@ function onReading(reading) {
   lastReading = reading;
   const out = controller.update(reading.sample);
   request = { yawRate: out.yawRate, pitchRate: out.pitchRate, committed: out.committed, ...limitsFor(controller) };
-  renderHud(out, reading);
+  lastOut = out;
+  readingsStale = false;
+  if (!hudHidden && settings.diagnostics) {
+    hud.paintDiagnostics({ out, reading, body, limits: controller.limits, heading: currentHeading() });
+  }
   if (!calibrated && started && awaitingGeneration !== null && controller.generation >= awaitingGeneration) {
-    el.progress.style.width = `${Math.round(controller.calibrationProgress * 100)}%`;
+    ringHold(controller.calibrationProgress);
     if (controller.resets !== seenResets) {
       seenResets = controller.resets;
       lookAgain();
     } else if (awayShown && controller.calibrationProgress > 0) {
       // Back on the dot: the warning has done its job.
       awayShown = false;
-      setOverlay(calibrationHeadline, "hold still…");
+      setOverlayLine("Hold still.");
     }
     if (controller.calibrated) finishCalibration();
   }
@@ -338,20 +348,21 @@ function onReading(reading) {
 
 setInterval(() => {
   if (started && lastReadingAt && performance.now() - lastReadingAt > 400) {
-    el.state.textContent = "no signal";
-    el.state.className = "val bad";
+    readingsStale = true;
+    if (settings.diagnostics) hud.setDiagnosticsState("no signal", "bad");
     request = { ...request, yawRate: 0, pitchRate: 0 };
   }
   if (tracker.error) {
-    el.state.textContent = "tracker error";
-    el.state.className = "val bad";
+    if (settings.diagnostics) hud.setDiagnosticsState("tracker error", "bad");
     console.error(tracker.error);
     tracker.error = null;
   }
   updateHud();
+  // One read of the media for both painters.
+  const media = browsing ? null : mediaStatus();
+  paintAwake(media);
+  paintPeripheral(media);
 }, 200);
-
-const WARN = { "low confidence": 1, calibrating: 1, committing: 1 };
 
 let hudHidden = false;
 
@@ -382,7 +393,11 @@ function updateHud() {
   if (hide === hudHidden) return;
   hudHidden = hide;
   document.body.classList.toggle("hidden-hud", hide);
-  if (!hide) compassShown = "";  // repaint on the next frame
+  if (!hide && !browsing) {
+    // Everything the chrome shows may have moved on while it was down.
+    hud.paintCompass(currentHeading());
+    paintAwake();
+  }
 }
 
 /* Any sign of life keeps it up.  The pointer is the one that has to feel
@@ -411,79 +426,56 @@ window.addEventListener("blur", () => {
   if (active && active.tagName === "IFRAME" && el.embed.contains(active)) active.blur();
 });
 
-function renderHud(out, reading) {
-  if (hudHidden) return;  // thirty DOM writes a second nobody can see
-  el.state.textContent = out.state;
-  el.state.className = "val" + (out.state === "lost" ? " bad" : WARN[out.state] ? " warn" : "");
-  const sign = (v) => (v >= 0 ? "+" : "");
-  el.gaze.textContent = `${sign(out.yawError)}${out.yawError.toFixed(1)}, ${sign(out.pitchError)}${out.pitchError.toFixed(1)}`;
-  el.rate.textContent = `${sign(out.yawRate)}${out.yawRate.toFixed(0)}, ${sign(out.pitchRate)}${out.pitchRate.toFixed(0)}°/s`;
-  el.turn.textContent = `${sign(body.yawRate)}${body.yawRate.toFixed(0)}, ${sign(body.pitchRate)}${body.pitchRate.toFixed(0)}°/s`;
-  el.neck.textContent = body.strain >= 0.999 ? "at the limit"
-    : body.strain > 0 ? `${Math.round(body.strain * 100)}% strained`
-    : body.freeYaw ? "free · 360°" : "free";
-  el.neck.className = "val" + (body.strain >= 0.999 ? " bad" : body.strain > 0.5 ? " warn" : "");
-  el.perf.textContent = `${reading.rate.toFixed(0)} Hz  ${reading.latencyMs.toFixed(0)} ms${reading.mirror ? "" : "  1-pass"}`;
-  drawStick(out);
+/* ---------- painting the HUD ---------- */
+
+let lastOut = null;         // the control law's last word
+let readingsStale = false;  // no reading for 400 ms: the tracker has gone quiet
+let qualityText = null;     // "2160p60", once the stream is known
+
+function currentHeading() {
+  return ((-body.view.yaw / DEG) % 360 + 360) % 360;
 }
 
-let compassShown = "";
-
-function updateCompass() {
-  if (hudHidden) return;
-  const heading = ((-body.view.yaw / DEG) % 360 + 360) % 360;
-  // Touching the DOM sixty times a second for an unchanged number is
-  // layout work for nothing; a tenth of a degree is finer than the eye.
-  const key = heading.toFixed(1);
-  if (key === compassShown) return;
-  compassShown = key;
-  el.heading.textContent = `${heading.toFixed(0)}°`;
-  el.marks.style.backgroundPositionX = `${-heading / 360 * 4 * el.marks.clientWidth}px`;
-  // The strip shows a quarter turn across its width; mark where the clip
-  // started, and hide the mark once it is off the strip.
-  const bearing = -(body.view.yaw / DEG);
-  const visible = Math.abs(bearing) <= 45;
-  el.north.style.display = visible ? "" : "none";
-  if (visible) el.north.style.left = `${50 + (bearing / 90) * 100}%`;
+function trackerNow() {
+  return trackerHealth({
+    state: lastOut ? lastOut.state : "lost",
+    mirror: tracker.mirror,
+    stale: readingsStale,
+  });
 }
 
-/* ---------- the deadzone widget ---------- */
+function qualityNow() {
+  if (engineMode === "embed") return qualityLabel(embedPlayer.currentHeight());
+  return qualityText;
+}
 
-const stick = $("stick").getContext("2d");
+/* The awake layer: repainted a few times a second while the chrome is up.
+ * hud.js skips the DOM when nothing changed. */
+function paintAwake(media = null) {
+  if (hudHidden || browsing) return;
+  media = media || mediaStatus();
+  hud.paintStatus({ quality: qualityNow(), engine: engineMode, tracker: trackerNow() });
+  hud.paintTransport({
+    currentTime: media.currentTime, duration: media.duration, paused: media.paused,
+    volume: settings.volume, muted: settings.muted,
+  });
+}
 
-function drawStick(out) {
-  const limits = controller.limits;
-  const size = 150, c = size / 2, pad = 10;
-  const sx = (c - pad) / Math.max(limits.spanYaw, 1);
-  const sy = (c - pad) / Math.max(limits.spanPitch, 1);
-  stick.clearRect(0, 0, size, size);
-  stick.strokeStyle = "rgba(255,255,255,.16)";
-  stick.lineWidth = 1;
-  stick.strokeRect(c - limits.spanYaw * sx, c - limits.spanPitch * sy, 2 * limits.spanYaw * sx, 2 * limits.spanPitch * sy);
-  stick.strokeStyle = "rgba(255,255,255,.30)";
-  stick.setLineDash([3, 3]);
-  stick.strokeRect(c - limits.deadzoneYaw * sx, c - limits.deadzonePitch * sy,
-    2 * limits.deadzoneYaw * sx, 2 * limits.deadzonePitch * sy);
-  stick.setLineDash([]);
-  stick.strokeStyle = "rgba(255,255,255,.10)";
-  stick.beginPath();
-  stick.moveTo(c, 6); stick.lineTo(c, size - 6);
-  stick.moveTo(6, c); stick.lineTo(size - 6, c);
-  stick.stroke();
-  const clamp = (v, l) => Math.max(-l, Math.min(l, v));
-  // Screen-handed, not camera-handed: a glance to the viewer's left puts
-  // the dot on the left of the widget, which is also which way the view
-  // is about to turn.
-  const x = c - clamp(out.yawError, limits.spanYaw) * sx;
-  const y = c - clamp(out.pitchError, limits.spanPitch) * sy;
-  const live = out.yawRate !== 0 || out.pitchRate !== 0;
-  if (live) {
-    stick.strokeStyle = "rgba(110,231,183,.55)";
-    stick.lineWidth = 2;
-    stick.beginPath(); stick.moveTo(c, c); stick.lineTo(x, y); stick.stroke();
+/* The peripheral layer: painted whether or not the chrome is up, because
+ * these are the marks a viewer needs while looking around. */
+function paintPeripheral(media = null) {
+  if (browsing || !started || !calibrated) {
+    hud.paintPeripheral({ tracker: "ok", edge: null, buffering: false, paused: false });
+    return;
   }
-  stick.fillStyle = live ? "#6ee7b7" : "rgba(255,255,255,.55)";
-  stick.beginPath(); stick.arc(x, y, 5, 0, 2 * Math.PI); stick.fill();
+  media = media || mediaStatus();
+  const overlayUp = !el.overlay.classList.contains("gone");
+  hud.paintPeripheral({
+    tracker: trackerNow(),
+    edge: neckEdge({ yaw: body.yaw, pitch: body.pitch, strain: body.strain, freeYaw: body.freeYaw }),
+    buffering: media.buffering,
+    paused: media.paused && !overlayUp,
+  });
 }
 
 /* ---------- the gaze engine ---------- */
@@ -507,11 +499,14 @@ function ensureEngine() {
 }
 
 let cameraOpen = false;
+let cameraInUse = "";  // the device id the open camera was asked for
 
 async function ensureCamera() {
   if (cameraOpen) return;
-  await tracker.open(el.cam);
+  const wanted = settings.camera;
+  await tracker.open(el.cam, wanted);
   cameraOpen = true;
+  cameraInUse = wanted;
   tracker.start();
 }
 
@@ -741,11 +736,14 @@ async function selectClip(clip) {
   el.retry.hidden = true;
   el.overlaytext.textContent = "Starting the gaze tracker…";
 
+  hud.setTitle(clip.title);
+  qualityText = null;
+
   if (clip.local) {
     // Nothing to resolve and nobody to ask: the file is already here, and
     // its sound is muxed into it, so the shadow audio element stands down.
     sync.set(clip.src, null);
-    qualityLine = "playing from this device";
+    qualityLine = "Playing from this device";
     streamsReady = true;
   } else {
     // Resolving the stream takes yt-dlp a few seconds; run it underneath the
@@ -754,8 +752,13 @@ async function selectClip(clip) {
       .then((streams) => {
         if (session !== my) return;
         sync.set(streams.video.src, streams.audio && streams.audio.src);
-        const fps = streams.video.fps > 40 ? Math.round(streams.video.fps) : "";
-        qualityLine = `${streams.video.height}p${fps} ${streams.video.codec}`;
+        qualityText = qualityLabel(streams.video.height, streams.video.fps);
+        qualityLine = `${qualityText} · raw stream`;
+        // A deep link arrives with no title; youtube's answer carries one.
+        if (streams.title && playing === clip && clip.title === "Direct link") {
+          clip.title = streams.title;
+          hud.setTitle(clip.title);
+        }
         streamsReady = true;
         if (pendingPlay) {
           pendingPlay = false;
@@ -819,7 +822,7 @@ async function embedFallback(clip, my, why) {
     if (session !== my) { embedPlayer.close(); return; }
     embedPlayer.capHeight(currentMax);
     embedPlayer.pause();  // hold for calibration, like the stream path
-    qualityLine = "youtube player fallback — ads possible";
+    qualityLine = "youtube player — ads possible";
     streamsReady = true;
     if (pendingPlay) {
       pendingPlay = false;
@@ -850,6 +853,27 @@ function mediaPaused() {
 function mediaSeek(delta) {
   if (engineMode === "embed") embedPlayer.seek(delta);
   else el.video.currentTime = Math.max(0, Math.min(el.video.duration || 1e9, el.video.currentTime + delta));
+}
+
+/* Whether the picture is stalled waiting for bytes.  The raw pair says so
+ * through the <video> element's events -- `waiting` when playback has run
+ * out of buffer, cleared by anything that means frames are moving again --
+ * and youtube's player through its state. */
+let videoBuffering = false;
+el.video.addEventListener("waiting", () => { videoBuffering = true; });
+for (const name of ["playing", "canplay", "pause", "seeked", "emptied"]) {
+  el.video.addEventListener(name, () => { videoBuffering = false; });
+}
+
+/* Where the clip is, for the HUD: one shape for both engines. */
+function mediaStatus() {
+  if (engineMode === "embed") return embedPlayer.status();
+  return {
+    currentTime: el.video.currentTime,
+    duration: el.video.duration,
+    paused: el.video.paused,
+    buffering: videoBuffering && !el.video.paused,
+  };
 }
 
 /* Playback starts when the slower of the two journeys finishes: the stream
@@ -883,8 +907,7 @@ function tryPlay() {
 function fail(message, retryable = false) {
   el.overlay.classList.remove("gone");
   el.overlay.classList.remove("calibrating");
-  el.dot.classList.remove("on");
-  el.progresswrap.classList.remove("on");
+  ringReset();
   el.overlaytext.textContent = message;
   el.retry.hidden = !retryable;
 }
@@ -925,16 +948,29 @@ function returnToLibrary() {
   cameraOpen = false;
   el.cam.srcObject = null;
   lastReadingAt = 0;
+  lastOut = null;
+  readingsStale = false;
+  qualityText = null;
+  hud.setTitle("");
   el.overlay.classList.add("gone");
   el.overlay.classList.remove("calibrating");
-  el.progresswrap.classList.remove("on");
-  el.dot.classList.remove("on");
+  ringReset();
   el.retry.hidden = true;
   el.retry.textContent = "Try again";
   document.body.classList.add("browsing");
   updateHud();
+  paintPeripheral();
+  // The chrome is display:none while browsing, but the next pick lifts that
+  // before its overlay is up; nothing of the last clip may linger in it.
+  hud.paintStatus({ quality: null, engine: "stream", tracker: "ok" });
+  hud.paintTransport({ currentTime: 0, duration: NaN, paused: true, volume: settings.volume, muted: settings.muted });
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
 }
+
+// A file off this device has one quality: the one it was encoded at.
+el.video.addEventListener("loadedmetadata", () => {
+  if (engineMode === "local") qualityText = qualityLabel(el.video.videoHeight);
+});
 
 el.video.addEventListener("ended", returnToLibrary);
 el.video.addEventListener("error", () => {
@@ -949,36 +985,12 @@ el.video.addEventListener("error", () => {
 
 /* ---------- the settings panel ---------- */
 
-const setInputs = {
-  sens: $("set-sens"), dz: $("set-dz"), fov: $("set-fov"), qual: $("set-qual"),
-  blur: $("set-blur"), invx: $("set-invx"), invy: $("set-invy"), free: $("set-free"),
-};
-
-function renderSettings() {
-  setInputs.sens.value = settings.sens;
-  setInputs.dz.value = settings.deadzone;
-  setInputs.fov.value = settings.fov;
-  setInputs.qual.value = String(settings.quality);
-  setInputs.blur.checked = settings.blur;
-  setInputs.invx.checked = settings.invx;
-  setInputs.invy.checked = settings.invy;
-  setInputs.free.checked = settings.free;
-  $("sensval").textContent = `×${Number(settings.sens).toFixed(2)}`;
-  $("dzval").textContent = `${Number(settings.deadzone).toFixed(1)}°`;
-  $("fovval").textContent = `${settings.fov}°`;
-}
-
-function settingsChanged() {
+/* The panel's inputs carry data-setting; settings.js reads and writes them
+ * generically, so the markup is free to move. */
+bindSettingsPanel(el.settings, () => {
   const capBefore = qualityCap();
-  settings.sens = Number(setInputs.sens.value);
-  settings.deadzone = Number(setInputs.dz.value);
-  settings.fov = Number(setInputs.fov.value);
-  settings.blur = setInputs.blur.checked;
-  settings.invx = setInputs.invx.checked;
-  settings.invy = setInputs.invy.checked;
-  settings.free = setInputs.free.checked;
-  settings.quality = setInputs.qual.value === "auto" ? "auto" : Number(setInputs.qual.value);
-  renderSettings();
+  settings = readSettingsPanel(el.settings, settings);
+  renderSettingsPanel(el.settings, settings);
   applySettings();
   saveSettings();
   const cap = qualityCap();
@@ -986,9 +998,14 @@ function settingsChanged() {
     currentMax = cap;
     if (started) applyQualityCap(cap);  // swap in place, mid-video
   }
-}
+});
 
-for (const input of Object.values(setInputs)) input.addEventListener("input", settingsChanged);
+/* The cameras on offer, refreshed whenever the panel opens.  Labels only
+ * arrive once a camera has been granted, so an early list is numbered. */
+async function refreshCameras() {
+  const cameras = await GazeTracker.cameras();
+  fillCameraOptions(el.cameraSelect, cameras, settings.camera);
+}
 
 let pausedBySettings = false;
 
@@ -998,6 +1015,8 @@ function toggleSettings(force) {
   // Opening the panel pauses whatever plays; closing it resumes only what
   // the panel itself paused, never a pause the viewer chose.
   if (show) {
+    renderSettingsPanel(el.settings, settings);
+    refreshCameras().catch(() => {});
     pausedBySettings = started && calibrated && !mediaPaused();
     if (pausedBySettings) mediaPause();
   } else if (pausedBySettings) {
@@ -1010,10 +1029,28 @@ el.gear.addEventListener("click", () => toggleSettings());
 el.setsclose.addEventListener("click", () => toggleSettings(false));
 el.setsreset.addEventListener("click", () => {
   settings = { ...SETTINGS_DEFAULTS };
-  renderSettings();
+  renderSettingsPanel(el.settings, settings);
   applySettings();
   saveSettings();
 });
+
+/* The transport's two buttons, for a pointer.  Blurred after the click so
+ * a Space that follows toggles playback once, through the key handler,
+ * rather than twice. */
+el.playbtn.addEventListener("click", (event) => {
+  event.currentTarget.blur();
+  if (!started || !calibrated) return;
+  mediaPaused() ? mediaPlay().catch(() => {}) : mediaPause();
+});
+el.mutebtn.addEventListener("click", (event) => {
+  event.currentTarget.blur();
+  toggleMute();
+});
+el.hudgear.addEventListener("click", (event) => {
+  event.currentTarget.blur();
+  toggleSettings();
+});
+el.emptyfile.addEventListener("click", () => el.localfile.click());
 
 /* ---------- calibration ---------- */
 
@@ -1025,20 +1062,37 @@ const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 let awayShown = false;
 
-function lookAgain() {
-  awayShown = true;
-  setOverlay(calibrationHeadline, "You looked away", "away");
-  el.dot.classList.add("nudge");
-  setTimeout(() => el.dot.classList.remove("nudge"), 600);
+/* The fixation ring says everything the countdown and the hold used to say
+ * in words, so the eye never has a reason to leave the dot: three arcs
+ * light one per second, then the ring fills with the hold. */
+function ringCountdown(remaining) {
+  for (const arc of el.dot.querySelectorAll(".ring-count")) {
+    arc.classList.toggle("on", Number(arc.dataset.third) <= 4 - remaining);
+  }
 }
 
-function setOverlay(headline, sub, subClass = "") {
-  el.overlaytext.textContent = "";
-  el.overlaytext.append(headline, document.createElement("br"));
-  const span = document.createElement("span");
-  span.className = `count ${subClass}`.trim();
-  span.textContent = sub;
-  el.overlaytext.appendChild(span);
+function ringHold(fraction) {
+  el.dot.classList.add("holding");
+  el.dot.style.setProperty("--fill", String(Math.max(0, Math.min(1, fraction))));
+}
+
+function ringReset() {
+  el.dot.classList.remove("on", "holding", "away");
+  el.dot.style.setProperty("--fill", "0");
+  for (const arc of el.dot.querySelectorAll(".ring-count")) arc.classList.remove("on");
+}
+
+/* One line under the ring, one thing at a time. */
+function setOverlayLine(text) {
+  el.overlaytext.textContent = text;
+}
+
+function lookAgain() {
+  awayShown = true;
+  setOverlayLine("You looked away. Look at the dot.");
+  el.dot.style.setProperty("--fill", "0");
+  el.dot.classList.add("away");
+  setTimeout(() => el.dot.classList.remove("away"), 600);
 }
 
 let calibrationRun = 0;
@@ -1059,18 +1113,20 @@ async function runCalibration(headline) {
   body.rest();
   el.overlay.classList.remove("gone");
   el.overlay.classList.add("calibrating");
-  el.progresswrap.classList.remove("on");
+  el.retry.hidden = true;
+  ringReset();
   el.dot.classList.add("on");
+  setOverlayLine(headline);
   // Count down before the hold starts, so it begins while the viewer is
-  // already fixed on the dot rather than still moving onto it.
+  // already fixed on the dot rather than still moving onto it.  The count
+  // is drawn on the ring, where the eyes already are.
   for (let count = 3; count > 0; count--) {
-    setOverlay(headline, String(count));
+    ringCountdown(count);
     await wait(1000);
     if (run !== calibrationRun || browsing) return;
   }
-  setOverlay(headline, "hold still…");
-  el.progress.style.width = "0%";
-  el.progresswrap.classList.add("on");
+  setOverlayLine("Hold still.");
+  ringHold(0);
   awayShown = false;
   awaitingGeneration = controller.recalibrate();
 }
@@ -1081,8 +1137,7 @@ function finishCalibration() {
   awaitingGeneration = null;
   el.overlay.classList.add("gone");
   el.overlay.classList.remove("calibrating");
-  el.progresswrap.classList.remove("on");
-  el.dot.classList.remove("on");
+  ringReset();
   if (!browsing) maybePlay();
 }
 
@@ -1102,19 +1157,26 @@ document.addEventListener("keydown", (event) => {
   if (browsing) return;
   wakeHud();
   const key = event.key.toLowerCase();
+  // A control inside the panel owns its own keys (a slider's arrows, a
+  // select's space); only Esc reaches past it.
+  const inPanel = event.target instanceof Element && event.target.closest("#settings");
   if (event.key === "Escape") {
     if (!el.settings.hidden) toggleSettings(false);
     else returnToLibrary();
   }
+  else if (inPanel) return;
   else if (key === "s") toggleSettings();
   else if (key === "r") recentre();
   else if (key === "c") recalibrate();
+  else if (key === "m") toggleMute();
   else if (key === " ") { event.preventDefault(); mediaPaused() ? mediaPlay().catch(() => {}) : mediaPause(); }
   else if (key === "f") {
     document.fullscreenElement ? document.exitFullscreen() : goFullscreen().catch(() => {});
   }
   else if (event.key === "ArrowRight") mediaSeek(5);
   else if (event.key === "ArrowLeft") mediaSeek(-5);
+  else if (event.key === "ArrowUp") { event.preventDefault(); setVolume(settings.volume + 0.1); }
+  else if (event.key === "ArrowDown") { event.preventDefault(); setVolume(settings.volume - 0.1); }
 });
 
 el.touchbar.addEventListener("click", (event) => {
@@ -1138,7 +1200,9 @@ function watchForBackgroundedTab() {
   document.body.appendChild(hint);
   setInterval(() => {
     const stuck = engineMode === "stream" && el.video.readyState === 0 && started;
-    hint.style.display = stuck && document.visibilityState === "hidden" ? "" : "none";
+    // "block", not "": the stylesheet rests the hint at display none, and
+    // an empty inline value only hands control back to it.
+    hint.style.display = stuck && document.visibilityState === "hidden" ? "block" : "none";
   }, 1000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
@@ -1179,7 +1243,7 @@ async function selfTest() {
 
 /* ---------- start ---------- */
 
-renderSettings();
+renderSettingsPanel(el.settings, settings);
 applySettings();
 if (renderer) requestAnimationFrame(frame);
 loadHome().then(() => {
@@ -1191,4 +1255,4 @@ loadHome().then(() => {
 });
 
 // For a console or a test harness.
-window.lazyvr = { body, controller, tracker, sync, embed: embedPlayer, get request() { return request; }, get reading() { return lastReading; }, get settings() { return settings; }, get engineMode() { return engineMode; }, YAW_LIMIT };
+window.lazyvr = { body, controller, tracker, sync, hud, embed: embedPlayer, get request() { return request; }, get reading() { return lastReading; }, get settings() { return settings; }, get engineMode() { return engineMode; }, YAW_LIMIT };

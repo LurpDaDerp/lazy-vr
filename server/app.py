@@ -57,6 +57,7 @@ mimetypes.add_type("text/javascript", ".mjs")
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("application/octet-stream", ".task")
 mimetypes.add_type("application/octet-stream", ".onnx")
+mimetypes.add_type("font/woff2", ".woff2")
 
 CACHE = source.TTLCache()
 LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
@@ -357,8 +358,25 @@ async def client_session(app: web.Application):
     await app["session"].close()
 
 
+@web.middleware
+async def cache_headers(request: web.Request, handler):
+    """aiohttp's static route sends ETag and Last-Modified but no Cache-Control,
+    so browsers guess.  Models and fonts change only with a deploy; the page's
+    own files revalidate after five minutes.  The API and the relay set their
+    own headers."""
+    response = await handler(request)
+    path = request.path
+    if (request.method == "GET" and not path.startswith(("/api/", "/media/"))
+            and "Cache-Control" not in response.headers):
+        response.headers["Cache-Control"] = (
+            "public, max-age=86400, stale-while-revalidate=604800"
+            if path.startswith(("/models/", "/fonts/"))
+            else "public, max-age=300, must-revalidate")
+    return response
+
+
 def build_app() -> web.Application:
-    app = web.Application()
+    app = web.Application(middlewares=[cache_headers])
     app.cleanup_ctx.append(client_session)
     app.router.add_get("/", index)
     app.router.add_get("/api/home", api_home)

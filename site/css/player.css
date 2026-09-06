@@ -1,0 +1,408 @@
+/* The playback HUD: what sits on the picture, and when.
+ *
+ * Looking at a corner steers the view, so nothing here may need reading
+ * during playback.  Two layers.  The awake layer (#hud) is chrome: pinned
+ * to the edges, up while the pointer moves, while paused, while settings
+ * are open, under the youtube player; it fades when the viewer is only
+ * looking around.  The peripheral layer (#periphery) is a handful of marks
+ * seen without fixation, and it never fades with the chrome.
+ *
+ * No panels behind text: every mark sits straight on the picture with the
+ * scrim as a text shadow (a drop shadow for the glyphs and tracks). */
+
+:root {
+  --hud-inset: var(--s-6);        /* the chrome's distance from the edges */
+  --hud-hit: var(--s-8);          /* a transport button's hit target */
+  --timeline-w: 240px;            /* the progress track */
+  --volbar-w: var(--s-12);        /* the volume track */
+  --periph-rise: 96px;            /* peripheral marks sit here, clear of the transport */
+  --band-depth: 120px;            /* the neck band's reach in from its edge */
+  /* The text scrim, for glyphs and the ring: a 16px stroke needs the
+     second, wider layer or it goes under a bright sky. */
+  --icon-scrim: drop-shadow(0 1px 2px var(--scrim)) drop-shadow(0 0 6px var(--scrim));
+}
+
+/* -- the awake layer ----------------------------------------------- */
+
+/* Clicks pass through to the sphere and the youtube iframe's skip button;
+   only the two transport buttons take the pointer back. */
+#hud {
+  position: fixed;
+  inset: 0;
+  z-index: 12;
+  pointer-events: none;
+  user-select: none;
+  color: var(--star);
+  text-shadow: var(--text-scrim);
+  font-variant-numeric: tabular-nums;
+  opacity: 1;
+  visibility: visible;
+  /* Its own stacking context, so the washes below can sit behind every
+     mark with a negative z-index instead of painting over the transport. */
+  isolation: isolate;
+  /* Coming back is the fast direction: the pointer just moved. */
+  transition: opacity var(--t-base) var(--ease-out), visibility 0s;
+}
+
+/* Asleep: the viewer is looking around, and the pointer goes with the chrome. */
+body.hidden-hud #hud {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--t-slow) var(--ease-out), visibility 0s var(--t-slow);
+}
+/* Its own rule: an engine without :has() must still get the one above. */
+body:has(#overlay:not(.gone)) #hud {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity var(--t-slow) var(--ease-out), visibility 0s var(--t-slow);
+}
+body.hidden-hud { cursor: none; }
+
+/* The library needs no chrome and no marks. */
+body.browsing #hud,
+body.browsing #periphery { display: none; }
+
+#hud [hidden],
+#periphery [hidden] { display: none !important; }
+
+#hud .icon { filter: var(--icon-scrim); }
+
+/* The house lights, not glass: a soft wash of the dome behind the top row
+   and the transport, so the marks read over a bright sky.  Part of the
+   awake layer, so it goes when the chrome goes and the peripheral marks
+   stay bare on the picture. */
+#hud::before, #hud::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  z-index: -1;   /* under the marks: ::after would otherwise paint over them */
+  pointer-events: none;
+}
+#hud::before {
+  top: 0;
+  height: 168px;
+  background: linear-gradient(180deg, rgba(6, 8, 20, 0.62), rgba(6, 8, 20, 0.28) 45%, transparent);
+}
+#hud::after {
+  bottom: 0;
+  /* Tall enough that the densest stop sits under the transport and the
+     hints (the bottom 100px), not below them. */
+  height: 260px;
+  background: linear-gradient(0deg, rgba(6, 8, 20, 0.74), rgba(6, 8, 20, 0.62) 38%, rgba(6, 8, 20, 0.26) 68%, transparent);
+}
+
+/* The title, top-left: one line, and it yields to the compass. */
+.hud-title {
+  position: absolute;
+  top: var(--hud-inset);
+  left: var(--hud-inset);
+  max-width: 34vw;
+  font: var(--t-title);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* The horizon ring, top-centre.  No box: the arc is drawn, not framed,
+   and the number it stands for lives in the diagnostics. */
+.hud-compass {
+  position: absolute;
+  top: var(--hud-inset);
+  left: 0;
+  right: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+#ring {
+  display: block;
+  width: 320px;
+  height: 56px;
+  /* No filter: a filtered canvas is a render surface the compositor
+     re-blurs every vsync the video updates; hud.js strokes the scrim in. */
+}
+
+/* Quality, engine, tracker: three marks in the top-right corner. */
+.hud-status {
+  position: absolute;
+  top: var(--hud-inset);
+  right: var(--hud-inset);
+  display: flex;
+  align-items: center;
+  gap: var(--s-3);
+  min-height: var(--s-6);
+}
+/* The one control up here: settings, for a pointer that has no S key. */
+.hud-status .hud-btn {
+  width: var(--s-8);
+  height: var(--s-8);
+  margin-left: var(--s-1);
+  color: var(--star-dim);
+}
+.hud-status .hud-btn .icon { width: 18px; height: 18px; }
+.hud-status .hud-btn:hover { color: var(--star); }
+.mark {
+  --mark-ink: var(--star-dim);
+  --mark-text: var(--star);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-2);
+}
+.mark .icon {
+  width: 16px;
+  height: 16px;
+  color: var(--mark-ink);
+}
+.mark-text {
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+  color: var(--mark-text);
+}
+.mark-text:empty { display: none; }   /* a mark with no word leaves no gap */
+
+/* Caution turns the whole mark ember; a one-pass tracker is just quieter. */
+#tracker[data-health="dim"],
+#tracker[data-health="stale"],
+#tracker[data-health="lost"] {
+  --mark-ink: var(--ember);
+  --mark-text: var(--ember);
+}
+
+/* The transport, bottom-centre, one row, with the key hints under it. */
+.hud-transport {
+  position: absolute;
+  /* Above the hint row: inset, the row's own height, and 12px between. */
+  bottom: calc(var(--hud-inset) + 20px + var(--s-3));
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-3);
+}
+body.no-hints .hud-transport { bottom: var(--hud-inset); }
+
+.hud-btn {
+  pointer-events: auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--hud-hit);
+  height: var(--hud-hit);
+  padding: 0;
+  border: 0;
+  border-radius: var(--r-sm);
+  background: none;
+  color: var(--star);
+  transition: color var(--t-base) var(--ease-out), transform var(--t-fast) var(--ease-out);
+}
+.hud-btn:hover { color: var(--lamp); }
+.hud-btn:active { transform: translateY(1px); }
+
+.hud-clock { font: var(--t-title); }
+.clock-sep {
+  color: var(--star-dim);
+  margin: 0 var(--s-1);
+}
+
+/* The two tracks: a brass hairline with the played or heard part in lamp.
+   A 1px scrim under them keeps a hairline visible over a bright sky. */
+.hud-timeline, .hud-volbar {
+  position: relative;
+  height: 2px;
+  border-radius: var(--r-round);
+  background: var(--brass-dim);
+  box-shadow: 0 1px 2px var(--scrim);
+}
+.hud-timeline { width: var(--timeline-w); }
+.hud-volbar { width: var(--volbar-w); }
+.hud-played, .hud-vollevel {
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 0;
+  border-radius: inherit;
+  background: var(--lamp);
+  /* No transition: the tick repaints five times a second, and a seek
+     should land where it landed. */
+}
+
+/* The key hints: the map of the keyboard, quiet, under the transport. */
+.hud-keys {
+  position: absolute;
+  bottom: var(--hud-inset);
+  left: 0;
+  right: 0;
+  display: flex;
+  justify-content: center;
+  gap: var(--s-4);
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+  /* Quiet in weight, not in contrast: star, so it clears a bright sky. */
+  color: var(--star);
+  font-weight: 400;
+  white-space: nowrap;
+}
+.hud-keys span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--s-1);
+}
+body.no-hints #keys { display: none; }
+
+/* A phone has the touch bar where the hints would be; the transport
+   moves up over it. */
+@media (pointer: coarse) {
+  .hud-transport, body.no-hints .hud-transport {
+    bottom: calc(max(16px, env(safe-area-inset-bottom)) + var(--control) + var(--s-4));
+  }
+}
+
+/* The diagnostics readout, under the title, for whoever switched it on.
+   The one place the HUD has a ground: the numbers are dense and read by
+   someone debugging, not steering. */
+.hud-diagnostics {
+  position: absolute;
+  /* Under the title: inset, its line box, 12px between. */
+  top: calc(var(--hud-inset) + 20px + var(--s-3));
+  left: var(--hud-inset);
+  display: none;
+  align-items: flex-start;
+  gap: var(--s-3);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid var(--rail);
+  border-radius: var(--r-sm);
+  background: color-mix(in srgb, var(--seat) 80%, transparent);
+  text-shadow: none;
+}
+body.diagnostics #diagnostics { display: flex; }
+
+.diag-rows {
+  min-width: 160px;
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+}
+.diag-rows .row {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--s-3);
+}
+.diag-rows .key { color: var(--brass); }
+.diag-rows .val {
+  color: var(--star);
+  white-space: nowrap;
+}
+.diag-rows .val[data-tone="warn"] { color: var(--ember); opacity: 0.85; }
+.diag-rows .val[data-tone="bad"] { color: var(--ember); }
+#stick {
+  display: block;
+  flex: none;
+  width: 96px;
+  height: 96px;
+}
+
+/* -- the peripheral layer ------------------------------------------ */
+
+/* Marks a viewer needs while looking around, so they stay up when the
+   chrome goes and never take the pointer. */
+#periphery {
+  position: fixed;
+  inset: 0;
+  z-index: 11;
+  pointer-events: none;
+  user-select: none;
+  overflow: hidden;
+}
+
+/* Buffering: a lamp hairline sliding along the very top edge. */
+.periph-buffer {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 2px;
+  overflow: hidden;
+  opacity: 0;
+  transition: opacity var(--t-base) var(--ease-out);
+}
+.periph-buffer::before {
+  content: "";
+  position: absolute;
+  inset: 0 auto 0 0;
+  width: 30%;
+  background: linear-gradient(90deg, transparent, var(--lamp) 30%, var(--lamp) 70%, transparent);
+  transform: translateX(-100%);
+}
+.periph-buffer.on { opacity: 1; }
+.periph-buffer.on::before { animation: periph-slide 1.2s linear infinite; }
+@keyframes periph-slide {
+  from { transform: translateX(-100%); }
+  to { transform: translateX(334%); }    /* the far edge, in the segment's own width */
+}
+@media (prefers-reduced-motion: reduce) {
+  /* A still line is still a sign of stalling. */
+  .periph-buffer.on::before {
+    animation: none;
+    width: 100%;
+    transform: none;
+  }
+}
+
+/* The neck: an ember band on the edge being pushed, as hard as it is pushed. */
+.periph-edge {
+  --strength: 0;
+  position: absolute;
+  opacity: calc(var(--strength) * 0.35);
+  transition: opacity var(--t-base) var(--ease-out);
+}
+.periph-edge[data-side=""] { opacity: 0; }
+.periph-edge[data-side="left"] {
+  inset: 0 auto 0 0;
+  width: var(--band-depth);
+  background: linear-gradient(90deg, var(--ember), transparent);
+}
+.periph-edge[data-side="right"] {
+  inset: 0 0 0 auto;
+  width: var(--band-depth);
+  background: linear-gradient(270deg, var(--ember), transparent);
+}
+.periph-edge[data-side="top"] {
+  inset: 0 0 auto 0;
+  height: var(--band-depth);
+  background: linear-gradient(180deg, var(--ember), transparent);
+}
+.periph-edge[data-side="bottom"] {
+  inset: auto 0 0 0;
+  height: var(--band-depth);
+  background: linear-gradient(0deg, var(--ember), transparent);
+}
+
+/* A lost face and a paused picture: one glyph and one word at bottom
+   centre, above the transport. */
+.periph-mark {
+  position: absolute;
+  bottom: var(--periph-rise);
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--s-2);
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+  color: var(--star);
+  text-shadow: var(--text-scrim);
+  opacity: 0;
+  transition: opacity var(--t-base) var(--ease-out);
+}
+.periph-mark .icon {
+  width: 18px;
+  height: 18px;
+  filter: var(--icon-scrim);
+}
+.periph-mark.on { opacity: 1; }
+#facemark { color: var(--ember); }
+/* Both at once: the pause mark steps up so the two never overprint. */
+#facemark.on ~ #pausemark.on { bottom: calc(var(--periph-rise) + var(--s-6)); }

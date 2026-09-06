@@ -166,8 +166,10 @@ Picking a video goes fullscreen for the session (`Esc` leaves the video,
 shows that prompt by dropping the page *out* of fullscreen, the first ask
 is made before the fullscreen rather than inside it; the page goes
 fullscreen once the prompt is answered, and asks for one more click if the
-browser wants a fresh gesture by then. Then a green dot appears in the
-middle: three seconds to settle, then hold still until the bar fills. That
+browser wants a fresh gesture by then. Then a lamp-lit dot appears in the
+middle of the screen inside a thin ring: the ring counts three seconds
+down, then fills while you hold still, so your eyes never have to leave
+the dot to know how it is going. That
 one hold teaches the player where your neutral gaze sits — look away and it
 starts over. It runs once a visit, `C` reruns it whenever you shift in your
 seat, a real change of screen size — fullscreen, a snapped window — pauses
@@ -177,19 +179,30 @@ whenever you are back in the library.
 | Key | |
 |---|---|
 | `R` | recentre — sweep back to the start; gaze is ignored until it arrives |
-| `C` | recalibrate — stare at the green dot |
+| `C` | recalibrate — look at the dot |
 | `Space` | play / pause |
+| `M` | mute |
+| `↑` `↓` | volume |
 | `F` | fullscreen |
 | `←` `→` | seek five seconds |
+| `S` | settings |
 | `Esc` | back to the library |
 
-The HUD, compass and key hints look after themselves the way a video
-player's controls do: three seconds into a playing video they fade out,
-cursor included, and the first movement of the pointer brings them back.
-Pausing, the settings panel and calibration all hold them open — and so
-does anything that would leave the page unable to see the pointer at all:
-a window that has lost the focus, or the youtube-player fallback, whose
-iframe covers the window and keeps every pointer move to itself.
+The HUD — the clip's title, the horizon ring with the heading, the quality,
+engine and tracker marks, the transport line and the key hints — looks after
+itself the way a video player's controls do: three seconds into a playing
+video it fades out, cursor included, and the first movement of the pointer
+brings it back. Pausing, the settings panel and calibration all hold it
+open — and so does anything that would leave the page unable to see the
+pointer at all: a window that has lost the focus, or the youtube-player
+fallback, whose iframe covers the window and keeps every pointer move to
+itself. A few marks never fade, because they are needed while you are
+looking around and can be seen without being looked at: a lost face, the
+neck at its limit (a soft band on the edge you are pushing), a stalled
+stream (a line along the top edge), and pause. Looking at anything in a
+corner steers the view toward it — the deadzone is under two degrees — so
+nothing in the HUD is meant to be *read* during playback; the developer's
+readout and gaze stick are behind a Diagnostics switch in settings.
 
 On a phone there is no keyboard; the buttons that matter appear on screen.
 
@@ -532,7 +545,8 @@ the network.
 ## Layout
 
 ```
-site/            the page: index.html, style.css, js/, models/
+site/            the page: index.html, css/ (tokens, base, one file per
+                 screen), fonts/, js/, models/
                  js/gaze.js is the camera and the choice of where the
                  pipeline runs; js/gaze-core.js is the pipeline;
                  js/gaze-worker.js is the worker that usually hosts it
@@ -588,6 +602,8 @@ the reading is too noisy to sit inside `calibrationTolerance`. Better light
 on your face helps more than anything; raising the tolerance in `control.js`
 is the fallback.
 
-**It is slow on a phone.** The HUD's `tracker` row shows the gaze rate. Under
+**It is slow on a phone.** The diagnostics readout (a switch in settings)
+shows the gaze rate on its `tracker` row, and the tracker mark in the HUD
+says `1-pass` once the second pass has gone. Under
 about 15 Hz the mirror pass has already been dropped (`1-pass`); below that
 the phone is simply too slow for the landmarker.

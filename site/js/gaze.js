@@ -170,10 +170,29 @@ export class GazeTracker {
 
   // -- the camera ---------------------------------------------------------
 
+  /* The cameras this device offers, for the settings panel.  Labels are
+   * only handed out once a camera has been granted; before that the list
+   * still says how many there are, numbered. */
+  static async cameras() {
+    if (!navigator.mediaDevices?.enumerateDevices) return [];
+    let devices = [];
+    try {
+      devices = await navigator.mediaDevices.enumerateDevices();
+    } catch {
+      return [];
+    }
+    return devices
+      .filter((device) => device.kind === "videoinput")
+      .map((device, index) => ({
+        id: device.deviceId,
+        label: device.label || `Camera ${index + 1}`,
+      }));
+  }
+
   /* Ask for the front camera.  Throws with a readable message when it is
    * refused or absent.  `videoElement` carries the frames only on the paths
    * that need it; the worker prefers to hold the track itself. */
-  async open(videoElement) {
+  async open(videoElement, deviceId = "") {
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error(window.isSecureContext
         ? "This browser is too old to open a camera."
@@ -182,12 +201,25 @@ export class GazeTracker {
           + "address instead.");
     }
     this.onStatus("Waiting for the camera…");
-    try {
-      this.stream = await navigator.mediaDevices.getUserMedia({
-        video: { facingMode: "user", width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
-        audio: false,
-      });
-    } catch (error) {
+    // A chosen camera is asked for by id; otherwise whichever faces the
+    // viewer.  An id that no longer exists (a webcam since unplugged) is
+    // not an error worth stopping for: fall back to the default ask.
+    const shape = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
+    const asks = deviceId
+      ? [{ deviceId: { exact: deviceId }, ...shape }, { facingMode: "user", ...shape }]
+      : [{ facingMode: "user", ...shape }];
+    let error = null;
+    for (const video of asks) {
+      try {
+        this.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+        error = null;
+        break;
+      } catch (caught) {
+        error = caught;
+        if (caught && caught.name === "NotAllowedError") break;
+      }
+    }
+    if (error) {
       const why = error && error.name;
       if (why === "NotAllowedError") throw new Error("Camera access was refused. Allow the camera for this site and reload.");
       if (why === "NotFoundError") throw new Error("No camera was found on this device.");

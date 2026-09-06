@@ -35,6 +35,7 @@ mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("application/octet-stream", ".task")
 mimetypes.add_type("application/octet-stream", ".onnx")
+mimetypes.add_type("font/woff2", ".woff2")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 import source  # noqa: E402
@@ -183,10 +184,24 @@ def static(environ, start_response):
     target = (SITE / name).resolve()
     if not str(target).startswith(str(SITE)) or not target.is_file():
         return json_response(start_response, 404, {"error": "not found"})
+    # Cacheable: the models are seven megabytes and the page a few hundred
+    # kilobytes, and without these headers every visit re-fetched all of it
+    # through a function invocation.  Models and fonts change only with a
+    # deploy, which changes their mtime and so their ETag; the page's own
+    # files revalidate after five minutes.
+    stat = target.stat()
+    etag = f'"{stat.st_mtime_ns:x}-{stat.st_size:x}"'
+    cache = ("public, max-age=86400, stale-while-revalidate=604800"
+             if target.parent.name in ("models", "fonts")
+             else "public, max-age=300, must-revalidate")
+    if environ.get("HTTP_IF_NONE_MATCH") == etag:
+        start_response("304 Not Modified", [("ETag", etag), ("Cache-Control", cache)])
+        return [b""]
     body = target.read_bytes()
     content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
     start_response("200 OK", [("Content-Type", content_type),
-                              ("Content-Length", str(len(body)))])
+                              ("Content-Length", str(len(body))),
+                              ("ETag", etag), ("Cache-Control", cache)])
     return [body]
 
 

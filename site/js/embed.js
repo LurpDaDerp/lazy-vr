@@ -11,7 +11,7 @@
  * body.view in, camera angles out, every frame the view moved.
  */
 
-import { bestAllowedLevel } from "./quality.js";
+import { LEVEL_HEIGHTS, bestAllowedLevel } from "./quality.js";
 
 const DEG = Math.PI / 180;
 
@@ -96,6 +96,8 @@ export class EmbedPlayer {
     this.handlers = {};
     this.maxHeight = Infinity;
     this.fov = EMBED_FOV;
+    this.volume = 1;
+    this.muted = false;
     window.addEventListener("resize", () => this.fit());
   }
 
@@ -161,6 +163,7 @@ export class EmbedPlayer {
             if (event.data === YT.PlayerState.PLAYING) {
               this.forceBest();
               this.muteCaptions();
+              this.setSound(this.volume, this.muted);
             }
             if (event.data === YT.PlayerState.ENDED && this.handlers.onEnded) this.handlers.onEnded();
           },
@@ -220,6 +223,19 @@ export class EmbedPlayer {
     } catch { /* an older player build; nothing more to be done */ }
   }
 
+  /* Volume as a fraction, mute as a flag; remembered for a player that is
+   * not built yet and re-asserted when it is. */
+  setSound(volume, muted) {
+    this.volume = volume;
+    this.muted = muted;
+    const player = this.player;
+    if (!player || typeof player.setVolume !== "function") return;
+    try {
+      player.setVolume(Math.round(volume * 100));
+      if (muted) player.mute(); else player.unMute();
+    } catch { /* mid-load; applied on the next PLAYING */ }
+  }
+
   steer(view) {
     if (!this.player || typeof this.player.setSphericalProperties !== "function") return;
     const props = sphericalFromView(view);
@@ -258,6 +274,34 @@ export class EmbedPlayer {
   seek(delta) {
     if (!this.player || typeof this.player.getCurrentTime !== "function") return;
     this.player.seekTo(Math.max(0, this.player.getCurrentTime() + delta), true);
+  }
+
+  /* The tier the player is actually showing, in pixels of height, or null
+   * before it has said. */
+  currentHeight() {
+    const player = this.player;
+    if (!player || typeof player.getPlaybackQuality !== "function") return null;
+    try {
+      return LEVEL_HEIGHTS[player.getPlaybackQuality()] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /* Where the clip is, in the shape the raw <video> reports. */
+  status() {
+    const YT = window.YT;
+    const player = this.player;
+    if (!YT || !player || typeof player.getPlayerState !== "function") {
+      return { currentTime: 0, duration: NaN, paused: true, buffering: false };
+    }
+    const state = player.getPlayerState();
+    return {
+      currentTime: typeof player.getCurrentTime === "function" ? player.getCurrentTime() : 0,
+      duration: typeof player.getDuration === "function" ? player.getDuration() || NaN : NaN,
+      paused: state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING,
+      buffering: state === YT.PlayerState.BUFFERING,
+    };
   }
 
   /* Stand down, keeping the player for the next video (see open). */

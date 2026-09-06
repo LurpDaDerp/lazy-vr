@@ -4,10 +4,43 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="color-scheme" content="dark">
+<meta name="theme-color" content="#0b0e1c">
 <title>LazyVR</title>
-<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%230b0e1c'/%3E%3Ccircle cx='16' cy='16' r='9' fill='none' stroke='%233a4680' stroke-width='1.5'/%3E%3Ccircle cx='16' cy='16' r='3.5' fill='%23f0b56b'/%3E%3C/svg%3E">
+<link rel="preload" href="fonts/AtkinsonHyperlegibleNext-latin.woff2" as="font" type="font/woff2" crossorigin>
+<link rel="stylesheet" href="css/tokens.css">
+<link rel="stylesheet" href="css/base.css">
+<link rel="stylesheet" href="css/library.css">
+<link rel="stylesheet" href="css/overlay.css">
+<link rel="stylesheet" href="css/player.css">
+<link rel="stylesheet" href="css/settings.css">
 </head>
 <body class="browsing">
+
+<!-- One icon set, one stroke.  Referenced by <use href="#i-…"> everywhere. -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="6.5"/><path d="M16 16l4.5 4.5"/></symbol>
+    <symbol id="i-arrow-right" viewBox="0 0 24 24"><path d="M5 12h14M13 6l6 6-6 6"/></symbol>
+    <symbol id="i-arrow-left" viewBox="0 0 24 24"><path d="M19 12H5M11 6l-6 6 6 6"/></symbol>
+    <symbol id="i-chevron-left" viewBox="0 0 24 24"><path d="M14.5 6l-6 6 6 6"/></symbol>
+    <symbol id="i-chevron-right" viewBox="0 0 24 24"><path d="M9.5 6l6 6-6 6"/></symbol>
+    <symbol id="i-chevron-down" viewBox="0 0 24 24"><path d="M6 9.5l6 6 6-6"/></symbol>
+    <symbol id="i-gear" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2.8v2.4M12 18.8v2.4M21.2 12h-2.4M5.2 12H2.8M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7M18.5 18.5l-1.7-1.7M7.2 7.2L5.5 5.5"/></symbol>
+    <symbol id="i-close" viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></symbol>
+    <symbol id="i-play" viewBox="0 0 24 24"><path d="M7 4.5v15l12-7.5z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-pause" viewBox="0 0 24 24"><rect x="6" y="4.5" width="4" height="15" rx="1" fill="currentColor" stroke="none"/><rect x="14" y="4.5" width="4" height="15" rx="1" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-sound" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5z"/><path d="M15.5 9a4.2 4.2 0 0 1 0 6M18.2 6.5a8 8 0 0 1 0 11"/></symbol>
+    <symbol id="i-sound-off" viewBox="0 0 24 24"><path d="M4 9.5v5h3.5L12 18.5v-13L7.5 9.5z"/><path d="M16 9.5l5 5M21 9.5l-5 5"/></symbol>
+    <symbol id="i-eye" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><circle cx="12" cy="12" r="2.8"/></symbol>
+    <symbol id="i-eye-off" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6c1.6 0 3 .4 4.3 1M21.5 12s-3.5 6-9.5 6c-1.6 0-3-.4-4.3-1"/><path d="M4 4l16 16"/></symbol>
+    <symbol id="i-eye-one" viewBox="0 0 24 24"><path d="M2.5 12s3.5-6 9.5-6 9.5 6 9.5 6-3.5 6-9.5 6-9.5-6-9.5-6z"/><path d="M12 9.5v5M10.6 10.7l1.4-1.2"/></symbol>
+    <symbol id="i-sphere" viewBox="0 0 24 24"><circle cx="12" cy="12" r="8.5"/><ellipse cx="12" cy="12" rx="8.5" ry="3.2"/><path d="M12 3.5v17"/></symbol>
+    <symbol id="i-yt" viewBox="0 0 24 24"><rect x="3" y="5.5" width="18" height="13" rx="3.5"/><path d="M10 9.2v5.6l4.8-2.8z" fill="currentColor" stroke="none"/></symbol>
+    <symbol id="i-folder" viewBox="0 0 24 24"><path d="M3.5 7.5a1.5 1.5 0 0 1 1.5-1.5h4l2 2h8a1.5 1.5 0 0 1 1.5 1.5v8a1.5 1.5 0 0 1-1.5 1.5H5a1.5 1.5 0 0 1-1.5-1.5z"/></symbol>
+    <symbol id="i-film" viewBox="0 0 24 24"><rect x="3.5" y="5" width="17" height="14" rx="2"/><path d="M3.5 9h17M3.5 15h17M8 5v14M16 5v14"/></symbol>
+  </defs>
+</svg>
 
 <canvas id="view"></canvas>
 <!-- The fallback engine mounts youtube's own player here when the raw
@@ -22,39 +55,75 @@
      that cannot hand a camera to a worker. -->
 <video id="cam" playsinline muted autoplay></video>
 
+<!-- ==============================================================
+     Playback HUD: the awake layer.  Exists while the pointer moves,
+     while paused, while settings are open, under the youtube player.
+     ============================================================== -->
 <div id="hud">
-  <div class="panel" id="readout">
-    <div class="row"><span class="key">state</span><span class="val" id="state">starting</span></div>
-    <div class="row"><span class="key">heading</span><span class="val" id="heading">0&deg;</span></div>
-    <div class="row"><span class="key">gaze</span><span class="val" id="gaze">0.0, 0.0</span></div>
-    <div class="row"><span class="key">asked</span><span class="val" id="rate">+0, +0&deg;/s</span></div>
-    <div class="row"><span class="key">turning</span><span class="val" id="turn">+0, +0&deg;/s</span></div>
-    <div class="row"><span class="key">neck</span><span class="val" id="neck">free</span></div>
-    <div class="row"><span class="key">tracker</span><span class="val" id="perf">-</span></div>
+  <div id="hudtitle" class="hud-title"></div>
+
+  <div id="compass" class="hud-compass" aria-label="Heading">
+    <canvas id="ring" width="320" height="56"></canvas>
   </div>
 
-  <div class="panel" id="stickpanel">
-    <canvas id="stick" width="150" height="150"></canvas>
+  <div id="status" class="hud-status">
+    <span id="quality" class="mark" title="Stream quality"><span class="mark-text">—</span></span>
+    <span id="engine" class="mark" data-engine="stream" title="Raw stream">
+      <svg class="icon"><use id="engineicon" href="#i-sphere"/></svg><span class="mark-text"></span>
+    </span>
+    <span id="tracker" class="mark" data-health="ok" title="Gaze tracker">
+      <svg class="icon"><use id="trackericon" href="#i-eye"/></svg><span class="mark-text"></span>
+    </span>
+    <button type="button" id="hudgear" class="hud-btn" aria-label="Settings" title="Settings (S)">
+      <svg class="icon"><use href="#i-gear"/></svg>
+    </button>
+  </div>
+
+  <div id="transport" class="hud-transport">
+    <button type="button" id="playbtn" class="hud-btn" data-action="playpause" aria-label="Play or pause">
+      <svg class="icon"><use id="playicon" href="#i-play"/></svg>
+    </button>
+    <span id="clock" class="hud-clock"><span id="elapsed">0:00</span><span class="clock-sep">/</span><span id="duration">–:––</span></span>
+    <div id="timeline" class="hud-timeline"><div id="played" class="hud-played"></div></div>
+    <button type="button" id="mutebtn" class="hud-btn" data-action="mute" aria-label="Mute or unmute">
+      <svg class="icon"><use id="soundicon" href="#i-sound"/></svg>
+    </button>
+    <div id="volbar" class="hud-volbar"><div id="vollevel" class="hud-vollevel"></div></div>
+  </div>
+
+  <!-- Only the keys the screen cannot show a control for; the rest are
+       the universal ones (Space, arrows, M, F) or have a button. -->
+  <div id="keys" class="hud-keys">
+    <span><kbd>R</kbd> recentre</span>
+    <span><kbd>C</kbd> recalibrate</span>
+    <span><kbd>Esc</kbd> library</span>
+  </div>
+
+  <!-- Off by default; a setting brings it back for debugging a calibration. -->
+  <div id="diagnostics" class="hud-diagnostics">
+    <div class="diag-rows">
+      <div class="row"><span class="key">state</span><span class="val" id="d-state">starting</span></div>
+      <div class="row"><span class="key">heading</span><span class="val" id="d-heading">0°</span></div>
+      <div class="row"><span class="key">gaze</span><span class="val" id="d-gaze">0.0, 0.0</span></div>
+      <div class="row"><span class="key">asked</span><span class="val" id="d-rate">+0, +0°/s</span></div>
+      <div class="row"><span class="key">turning</span><span class="val" id="d-turn">+0, +0°/s</span></div>
+      <div class="row"><span class="key">neck</span><span class="val" id="d-neck">free</span></div>
+      <div class="row"><span class="key">tracker</span><span class="val" id="d-perf">-</span></div>
+    </div>
+    <canvas id="stick" width="96" height="96"></canvas>
   </div>
 </div>
 
-<div id="compass">
-  <div id="compassmarks"></div>
-  <div id="compassnorth"><span>0&deg;</span></div>
-  <div id="compassneedle"></div>
+<!-- The peripheral layer: seen without being looked at, and shown without
+     waking the chrome. -->
+<div id="periphery" aria-hidden="true">
+  <div id="bufferline" class="periph-buffer"></div>
+  <div id="edge" class="periph-edge" data-side=""></div>
+  <div id="facemark" class="periph-mark"><svg class="icon"><use href="#i-eye-off"/></svg><span>Face lost</span></div>
+  <div id="pausemark" class="periph-mark"><svg class="icon"><use href="#i-pause"/></svg><span>Paused</span></div>
 </div>
 
-<div id="keys">
-  <span><b>R</b> recentre</span>
-  <span><b>C</b> recalibrate</span>
-  <span><b>S</b> settings</span>
-  <span><b>Space</b> play/pause</span>
-  <span><b>F</b> fullscreen</span>
-  <span><b>&larr; &rarr;</b> seek</span>
-  <span><b>Esc</b> library</span>
-</div>
-
-<!-- No keyboard on a phone; the three that matter, as buttons. -->
+<!-- No keyboard on a phone: the actions that matter, as buttons. -->
 <div id="touchbar">
   <button type="button" data-action="library">Library</button>
   <button type="button" data-action="recentre">Recentre</button>
@@ -62,109 +131,185 @@
   <button type="button" data-action="settings">Settings</button>
 </div>
 
-<div id="fixation"></div>
-<div id="toast"></div>
+<div id="toast" role="status" aria-live="polite"></div>
 <div id="dropzone"><span>Drop to play it here</span></div>
 
-<!-- The start screen: youtube's 360 uploads, shelved by category, with a
-     search over the same 360-filtered index. -->
+<!-- ==============================================================
+     The library: youtube's 360 uploads, shelved by category, with a
+     search over the same 360-filtered index.
+     ============================================================== -->
 <main id="library">
   <header id="libhead">
-    <div class="wordmark">Lazy<span>VR</span></div>
+    <div class="brand">
+      <div class="wordmark">Lazy<span>VR</span></div>
+      <p class="tagline">Look around youtube's 360 videos with your eyes. The camera stays on this device.</p>
+    </div>
     <form id="search" role="search">
-      <input id="query" type="search" placeholder="Search youtube's 360 videos&hellip;"
+      <svg class="icon search-icon" aria-hidden="true"><use href="#i-search"/></svg>
+      <input id="query" type="search" placeholder="Search 360 videos"
              autocomplete="off" spellcheck="false" aria-label="Search youtube's 360 videos">
-      <button type="submit">Search</button>
+      <button type="submit" class="btn-icon search-go" aria-label="Search"><svg class="icon"><use href="#i-arrow-right"/></svg></button>
     </form>
-    <button id="local" type="button">Play a file&hellip;</button>
+    <button id="local" type="button" class="btn">Play a file…</button>
     <input id="localfile" type="file" accept="video/*" hidden>
-    <button id="gear" type="button" aria-label="Settings">settings</button>
+    <button id="gear" type="button" class="btn-icon" aria-label="Settings"><svg class="icon"><use href="#i-gear"/></svg></button>
   </header>
 
-  <p id="libnotice" hidden></p>
+  <p id="libnotice" class="notice" hidden></p>
 
-  <div id="libloading">
-    <span class="spinner"></span>
-    <span>Loading youtube's 360 shelves&hellip;</span>
+  <!-- The shelves' shape, before youtube answers. -->
+  <div id="libloading" aria-busy="true" aria-label="Loading youtube's 360 shelves">
+    <section class="shelf skeleton"><h2></h2><div class="shelfrow"><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
+    <section class="shelf skeleton"><h2></h2><div class="shelfrow"><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
+    <section class="shelf skeleton"><h2></h2><div class="shelfrow"><i></i><i></i><i></i><i></i><i></i><i></i></div></section>
   </div>
 
   <div id="home"></div>
 
   <div id="results" hidden>
     <div id="resulthead">
-      <button id="backhome" type="button">&larr; All categories</button>
-      <span id="resultline" class="mono"></span>
+      <button id="backhome" type="button" class="btn"><svg class="icon"><use href="#i-arrow-left"/></svg>All categories</button>
+      <span id="resultline"></span>
     </div>
     <div id="grid"></div>
   </div>
 
   <div id="libempty" hidden>
     <h2>Nothing came back</h2>
-    <p>The server could not fetch youtube's 360 listings. Check that
-       <span class="mono">server/app.py</span> is running and can reach the internet,
-       then reload.</p>
+    <p>The shelves could not be fetched from youtube. Reload in a moment, or play a
+       360 file from this device instead.</p>
+    <p class="libempty-tech">If you host this page: check that the server is running and can reach the internet.</p>
+    <button id="emptyfile" type="button" class="btn">Play a file…</button>
   </div>
 </main>
 
-<!-- Settings: live, saved on this device.  Open with the header button or
-     S during playback. -->
-<aside id="settings" hidden>
-  <div id="setshead">
+<!-- ==============================================================
+     Settings: live, saved on this device.  Open with the header
+     button or S during playback.  Inputs carry data-setting; the
+     panel is bound generically by settings.js.
+     ============================================================== -->
+<aside id="settings" hidden aria-label="Settings">
+  <div class="sets-head">
     <h2>Settings</h2>
-    <button id="setsclose" type="button" aria-label="Close settings">&times;</button>
+    <button id="setsclose" type="button" class="btn-icon" aria-label="Close settings"><svg class="icon"><use href="#i-close"/></svg></button>
   </div>
 
-  <label class="setrow">
-    <span class="setname">Sensitivity <em id="sensval">&times;1.00</em></span>
-    <input id="set-sens" type="range" min="0.4" max="2.5" step="0.05" value="1">
-    <span class="sethint">How fast the view turns per degree of gaze.</span>
-  </label>
+  <fieldset class="sets-group">
+    <legend>Steering</legend>
+    <label class="set-row">
+      <span class="set-name">Turn speed <span class="set-value" data-output="sens">×1.00</span></span>
+      <input type="range" data-setting="sens" min="0.4" max="2.5" step="0.05" value="1">
+      <span class="set-hint">How fast the view turns for a glance.</span>
+    </label>
+    <label class="set-row">
+      <span class="set-name">Hold zone <span class="set-value" data-output="deadzone">1.8°</span></span>
+      <input type="range" data-setting="deadzone" min="1" max="8" step="0.1" value="1.8">
+      <span class="set-hint">How far your eyes can wander before the view turns.</span>
+    </label>
+    <label class="set-switch">
+      <span class="set-name">Full 360° turning</span>
+      <input type="checkbox" data-setting="free">
+      <span class="set-hint">Off, the view has a neck and stops 120° either way.</span>
+    </label>
+    <label class="set-switch">
+      <span class="set-name">Invert horizontal</span>
+      <input type="checkbox" data-setting="invx">
+    </label>
+    <label class="set-switch">
+      <span class="set-name">Invert vertical</span>
+      <input type="checkbox" data-setting="invy">
+    </label>
+  </fieldset>
 
-  <label class="setrow">
-    <span class="setname">Deadzone <em id="dzval">1.8&deg;</em></span>
-    <input id="set-dz" type="range" min="1" max="8" step="0.1" value="1.8">
-    <span class="sethint">Gaze eccentricity that commands no motion.</span>
-  </label>
+  <fieldset class="sets-group">
+    <legend>Picture</legend>
+    <label class="set-row">
+      <span class="set-name">Field of view <span class="set-value" data-output="fov">75°</span></span>
+      <input type="range" data-setting="fov" min="60" max="100" step="1" value="75">
+      <span class="set-hint">Wider sees more and moves less; narrower zooms in.</span>
+    </label>
+    <label class="set-row">
+      <span class="set-name">Max quality</span>
+      <span class="select-wrap">
+        <select data-setting="quality">
+          <option value="auto">Auto — match this display</option>
+          <option value="1080">1080p</option>
+          <option value="1440">1440p (2K)</option>
+          <option value="2160">2160p (4K)</option>
+          <option value="4320">4320p (8K)</option>
+        </select>
+        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+      </span>
+      <span class="set-hint">A struggling machine still steps itself down.</span>
+    </label>
+    <label class="set-switch">
+      <span class="set-name">Motion blur on fast turns</span>
+      <input type="checkbox" data-setting="blur" checked>
+    </label>
+  </fieldset>
 
-  <label class="setrow">
-    <span class="setname">Field of view <em id="fovval">75&deg;</em></span>
-    <input id="set-fov" type="range" min="60" max="100" step="1" value="75">
-    <span class="sethint">Wider sees more and moves less; narrower zooms in.</span>
-  </label>
+  <fieldset class="sets-group">
+    <legend>Sound</legend>
+    <label class="set-row">
+      <span class="set-name">Volume <span class="set-value" data-output="volume">100%</span></span>
+      <input type="range" data-setting="volume" min="0" max="1" step="0.05" value="1">
+    </label>
+    <label class="set-switch">
+      <span class="set-name">Mute</span>
+      <input type="checkbox" data-setting="muted">
+    </label>
+  </fieldset>
 
-  <label class="setrow">
-    <span class="setname">Max quality</span>
-    <select id="set-qual">
-      <option value="auto">Auto &mdash; match this display</option>
-      <option value="1080">1080p</option>
-      <option value="1440">1440p (2K)</option>
-      <option value="2160">2160p (4K)</option>
-      <option value="4320">4320p (8K)</option>
-    </select>
-    <span class="sethint">A struggling machine still steps itself down.</span>
-  </label>
+  <fieldset class="sets-group">
+    <legend>Camera</legend>
+    <label class="set-row">
+      <span class="set-name">Device</span>
+      <span class="select-wrap">
+        <select data-setting="camera" id="set-camera">
+          <option value="">Default camera</option>
+        </select>
+        <svg class="icon" aria-hidden="true"><use href="#i-chevron-down"/></svg>
+      </span>
+      <span class="set-hint">Only read on this device; never sent anywhere.</span>
+    </label>
+  </fieldset>
 
-  <label class="setrow setcheckrow">
-    <span class="setcheck"><input id="set-free" type="checkbox"> Full 360&deg; turning</span>
-    <span class="sethint">Off, the view has a neck: 120&deg; either way, and it
-      tires as it nears the end. On, it turns for ever &mdash; looking up and
-      down still stops at 100&deg;.</span>
-  </label>
+  <fieldset class="sets-group">
+    <legend>Interface</legend>
+    <label class="set-switch">
+      <span class="set-name">Key hints during playback</span>
+      <input type="checkbox" data-setting="hints" checked>
+    </label>
+    <label class="set-switch">
+      <span class="set-name">Diagnostics readout</span>
+      <input type="checkbox" data-setting="diagnostics">
+      <span class="set-hint">The tracker's numbers and the gaze stick.</span>
+    </label>
+  </fieldset>
 
-  <label class="setcheck"><input id="set-blur" type="checkbox" checked> Motion blur on fast turns</label>
-  <label class="setcheck"><input id="set-invx" type="checkbox"> Invert horizontal</label>
-  <label class="setcheck"><input id="set-invy" type="checkbox"> Invert vertical</label>
-
-  <button id="setsreset" type="button">Reset to defaults</button>
-  <p class="setnote">Saved on this device.</p>
+  <button id="setsreset" type="button" class="btn">Reset to defaults</button>
+  <p class="set-note">Saved on this device.</p>
 </aside>
 
+<!-- ==============================================================
+     The overlay: status while a clip is fetched and the camera opens,
+     the calibration hold, and errors.  The fixation ring sits at the
+     exact centre of the screen; one line of text sits below it.
+     ============================================================== -->
 <div id="overlay" class="gone">
+  <div id="fixation" aria-hidden="true">
+    <svg viewBox="0 0 48 48" width="48" height="48">
+      <circle class="ring-track" cx="24" cy="24" r="21"/>
+      <circle class="ring-count" cx="24" cy="24" r="21" data-third="1"/>
+      <circle class="ring-count" cx="24" cy="24" r="21" data-third="2"/>
+      <circle class="ring-count" cx="24" cy="24" r="21" data-third="3"/>
+      <circle class="ring-fill" cx="24" cy="24" r="21"/>
+      <circle class="ring-dot" cx="24" cy="24" r="6"/>
+    </svg>
+  </div>
   <div id="overlaybox">
-    <h1>Lazy<span>VR</span></h1>
     <p id="overlaytext">Look around the video with your eyes.</p>
-    <div id="progresswrap"><div id="progress"></div></div>
-    <button id="retry" type="button" hidden>Try again</button>
+    <button id="retry" type="button" class="btn-primary" hidden>Try again</button>
   </div>
 </div>
 

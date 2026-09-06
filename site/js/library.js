@@ -40,6 +40,26 @@ export function formatViews(views) {
   return `${Intl.NumberFormat("en", { notation: "compact", maximumFractionDigits: 1 }).format(views)} views`;
 }
 
+/* Cards near the viewport are about to load; their strips may shimmer. */
+const loadWatcher = typeof IntersectionObserver === "function"
+  ? new IntersectionObserver((entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const strip = entry.target.parentNode;
+        if (strip && !strip.classList.contains("loaded") && !strip.classList.contains("blank")) {
+          strip.classList.add("loading");
+        }
+        loadWatcher.unobserve(entry.target);
+      }
+    }, { rootMargin: "600px" })
+  : null;
+
+/* One observer for every shelf row, released when the shelves are rebuilt,
+ * so a row that has gone from the page is not kept alive by its watcher. */
+const rowWatcher = typeof ResizeObserver === "function"
+  ? new ResizeObserver((entries) => { for (const entry of entries) entry.target.__update?.(); })
+  : null;
+
 export function makeCard(clip, onPick) {
   const root = document.createElement("button");
   root.className = "card";
@@ -52,7 +72,15 @@ export function makeCard(clip, onPick) {
   image.alt = "";
   image.loading = "lazy";
   image.decoding = "async";
+  // The seat and its shimmer show until the picture is there; a picture
+  // that never comes leaves a plain seat rather than a shimmer forever.
+  image.addEventListener("load", () => { strip.classList.remove("loading"); strip.classList.add("loaded"); }, { once: true });
+  image.addEventListener("error", () => { strip.classList.remove("loading"); strip.classList.add("blank"); }, { once: true });
+  // The shimmer starts when the browser is about to fetch the picture (the
+  // same margin a lazy image loads at), not the moment the card exists.
+  if (loadWatcher) loadWatcher.observe(image);
   image.src = clip.thumb;
+  if (image.complete && image.naturalWidth) strip.classList.add("loaded");
   const badge = document.createElement("span");
   badge.className = "badge";
   const length = formatDuration(clip.duration);
@@ -79,8 +107,49 @@ export function makeCard(clip, onPick) {
   return root;
 }
 
+/* A shelf's arrow: an icon button in the gutter, one per direction. */
+function makeArrow(dir) {
+  const arrow = document.createElement("button");
+  arrow.type = "button";
+  arrow.className = "btn-icon shelf-arrow";
+  arrow.dataset.dir = dir;
+  arrow.setAttribute("aria-label", dir === "prev" ? "Scroll back" : "Scroll forward");
+  arrow.innerHTML = `<svg class="icon"><use href="#i-chevron-${dir === "prev" ? "left" : "right"}"/></svg>`;
+  return arrow;
+}
+
+/* The arrows scroll the row by most of a screen, and each is disabled
+ * once the row cannot go further its way.  Disabling the arrow that holds
+ * keyboard focus would drop focus on the body, so it is handed across. */
+function armShelf(row, prev, next) {
+  const still = window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  const step = (sign) =>
+    row.scrollBy({ left: sign * row.clientWidth * 0.8, behavior: still ? "auto" : "smooth" });
+  const update = () => {
+    const end = row.scrollWidth - row.clientWidth;
+    const stuck = { prev: row.scrollLeft <= 1, next: row.scrollLeft >= end - 1 };
+    for (const arrow of [prev, next]) if (!stuck[arrow.dataset.dir]) arrow.disabled = false;
+    for (const arrow of [prev, next]) {
+      if (!stuck[arrow.dataset.dir] || arrow.disabled) continue;
+      const other = arrow === prev ? next : prev;
+      if (document.activeElement === arrow && !other.disabled) other.focus({ preventScroll: true });
+      arrow.disabled = true;
+    }
+  };
+  prev.addEventListener("click", () => step(-1));
+  next.addEventListener("click", () => step(1));
+  row.addEventListener("scroll", update, { passive: true });
+  // The row's width changes with the window and when the home page is
+  // hidden for a search and shown again; the observer reports both.
+  row.__update = update;
+  if (rowWatcher) rowWatcher.observe(row);
+  else window.addEventListener("resize", update);
+  update();
+}
+
 /* The home page: one horizontal shelf per category. */
 export function renderShelves(container, categories, onPick) {
+  if (rowWatcher) rowWatcher.disconnect();
   container.textContent = "";
   let total = 0;
   for (const category of categories) {
@@ -93,8 +162,11 @@ export function renderShelves(container, categories, onPick) {
     const row = document.createElement("div");
     row.className = "shelfrow";
     for (const clip of category.clips) row.appendChild(makeCard(clip, onPick));
-    section.append(head, row);
+    const prev = makeArrow("prev");
+    const next = makeArrow("next");
+    section.append(head, row, prev, next);
     container.appendChild(section);
+    armShelf(row, prev, next);
   }
   return total;
 }

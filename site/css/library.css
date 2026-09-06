@@ -1,0 +1,445 @@
+/* The start screen: a planetarium at showtime.
+ *
+ * Shelves of youtube's 360 uploads on the night-blue ground, the lamp on
+ * the one card under the pointer, and a search field that stays quiet
+ * until it is asked.  The markup is #library in index.html; the cards,
+ * shelves and shelf arrows are built by js/library.js.  Ids and classes
+ * are the contract; every value here is a token from tokens.css. */
+
+/* -- the room ------------------------------------------------------- */
+
+#library {
+  position: fixed;
+  inset: 0;
+  z-index: 30;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  /* A card focused from the keyboard scrolls into view below the sticky
+     header, never behind it. */
+  scroll-padding-top: calc(var(--s-16) + var(--s-12));
+  background: var(--vignette), var(--dome);
+  color: var(--star);
+  font: var(--t-body);
+  /* One card width, shared by the shelves, their skeletons and the arrows. */
+  --card-w: clamp(240px, 22vw, 320px);
+  /* The room fades slower than a control does: 320ms, not a token. */
+  transition: opacity 320ms var(--ease-out);
+}
+
+body:not(.browsing) #library { opacity: 0; pointer-events: none; }
+
+/* app.js hides sections by attribute; nothing below may set display over it. */
+#library [hidden] { display: none !important; }
+
+/* -- the header: brand, search, file, gear, on one baseline ---------- */
+
+#libhead {
+  position: sticky;
+  top: 0;
+  z-index: 3;
+  display: flex;
+  align-items: center;
+  gap: var(--s-4) var(--s-6);
+  /* The bottom padding holds 8px of solid ground under the tagline and
+     the 24px fade band below that, so nothing scrolling under the header
+     shows through beside its text. */
+  padding: var(--s-6) var(--gutter) var(--s-8);
+}
+
+/* Its ground is the page's own vignette and dome drawn again at the page's
+   size, so the two are one picture at rest, fading out along the bottom
+   24px so cards scroll under it cleanly. */
+#libhead::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  background-color: var(--dome);
+  background-image: var(--vignette);
+  background-size: 100% 100vh;
+  background-repeat: no-repeat;
+  -webkit-mask-image: linear-gradient(var(--dome) calc(100% - var(--s-6)), transparent);
+  mask-image: linear-gradient(var(--dome) calc(100% - var(--s-6)), transparent);
+}
+
+.brand { flex: none; min-width: 0; }
+
+.wordmark {
+  font: var(--t-display);
+  letter-spacing: var(--track-display);
+  color: var(--star);
+}
+.wordmark span { color: var(--lamp); }
+
+.tagline {
+  margin-top: var(--s-1);
+  font: var(--t-title);
+  color: var(--star-dim);
+  white-space: nowrap;
+}
+
+/* The search field: a seat with the magnifier inside at left and the go
+   button inside at right.  No filled button in the header; the lamp is
+   for the card under the pointer. */
+#search {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex: 1 1 320px;
+  min-width: 240px;
+  max-width: 560px;
+  height: var(--control);
+}
+
+.search-icon {
+  position: absolute;
+  left: var(--s-3);
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--star-dim);
+  pointer-events: none;
+  transition: color var(--t-base) var(--ease-out);
+}
+#search:focus-within .search-icon { color: var(--star); }
+
+#query {
+  flex: 1;
+  min-width: 0;
+  width: 100%;
+  padding: 0 var(--control);
+  border-radius: var(--r-md);
+}
+
+#search .search-go {
+  position: absolute;
+  right: 0;
+  top: 0;
+  border-color: transparent;
+  border-radius: var(--r-md);
+  background: transparent;
+}
+#search .search-go:hover { background: var(--seat-2); border-color: transparent; }
+
+/* The file button and the gear hug the right edge; the search stays
+   anchored to the brand however wide the window gets. */
+#local { flex: none; margin-left: auto; }
+#gear { flex: none; }
+
+/* Below 900px the search takes its own row (DESIGN.md, Layout). */
+@media (max-width: 900px) {
+  #libhead { flex-wrap: wrap; }
+  .brand { flex: 1; }
+  .tagline { white-space: normal; }
+  #search { order: 1; flex-basis: 100%; max-width: none; }
+}
+
+/* -- a quiet word when some shelves came back empty ------------------ */
+
+#libnotice {
+  width: fit-content;
+  max-width: calc(100% - 2 * var(--gutter));
+  margin: var(--s-2) var(--gutter) var(--s-4);
+  padding: var(--s-2) var(--s-3);
+  border: 1px solid color-mix(in srgb, var(--ember) 30%, transparent);
+  border-radius: var(--r-sm);
+  background: var(--ember-soft);
+  color: var(--ember);
+  font: var(--t-body);
+}
+
+/* -- shelves --------------------------------------------------------- */
+
+#home, #libloading { padding: var(--s-2) 0 var(--s-16); }
+
+.shelf { position: relative; }
+/* 32px here plus the row's 8px bottom padding: 40px between shelves. */
+.shelf + .shelf { margin-top: var(--s-8); }
+
+.shelf h2 {
+  padding: 0 var(--gutter);
+  margin-bottom: var(--s-2);
+  font: var(--t-headline);
+  letter-spacing: var(--track-headline);
+  color: var(--star);
+}
+
+/* The row scrolls sideways under the fades, no scrollbar.  The gutter on
+   both ends puts the first card under its heading and gives the last one
+   room; 8px above and below keeps the lift and the focus ring inside the
+   clip.  Snapping lands a card at the gutter, not under a fade. */
+.shelfrow {
+  display: flex;
+  /* Each card its own height: a stretched button centres its content, so a
+     one-line title would push its picture down. */
+  align-items: flex-start;
+  gap: var(--s-4);
+  overflow-x: auto;
+  overflow-y: hidden;
+  padding: var(--s-2) var(--gutter);
+  scroll-padding-inline: var(--gutter);
+  scroll-snap-type: x proximity;
+  scrollbar-width: none;
+}
+.shelfrow::-webkit-scrollbar { display: none; }
+
+.shelfrow > .card {
+  flex: 0 0 var(--card-w);
+  width: var(--card-w);
+  scroll-snap-align: start;
+}
+
+/* Edge fades: the dome laid over both ends of the row, so a card half out
+   of view slips into the dark rather than being cut. */
+.shelf::before, .shelf::after {
+  content: "";
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  z-index: 1;
+  /* Wider than the gutter: a card cut by the edge dissolves, title and
+     all, rather than ending hard at the viewport. */
+  width: calc(var(--gutter) + var(--s-6));
+  pointer-events: none;
+}
+.shelf::before { left: 0; background: linear-gradient(to right, var(--dome) 30%, transparent); }
+.shelf::after { right: 0; background: linear-gradient(to left, var(--dome) 30%, transparent); }
+
+/* The arrows sit in the gutters, centred on the pictures: the heading,
+   its margin and the row's top padding come to 40px, then half a 16:9
+   picture at the card width.  They appear for a hovered shelf or one
+   holding keyboard focus, and an arrow with nowhere to go is not offered. */
+.shelf-arrow {
+  position: absolute;
+  z-index: 2;
+  top: calc(var(--control) + var(--card-w) * 9 / 32);
+  transform: translateY(-50%);
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--t-base) var(--ease-out), background var(--t-base) var(--ease-out),
+              border-color var(--t-base) var(--ease-out), color var(--t-base) var(--ease-out),
+              transform var(--t-fast) var(--ease-out);
+}
+.shelf-arrow[data-dir="prev"] { left: max(var(--s-1), calc((var(--gutter) - var(--control)) / 2)); }
+.shelf-arrow[data-dir="next"] { right: max(var(--s-1), calc((var(--gutter) - var(--control)) / 2)); }
+.shelf-arrow:active { transform: translateY(calc(-50% + 1px)); }
+
+.shelf:hover .shelf-arrow:not(:disabled) { opacity: 1; pointer-events: auto; }
+/* Its own rule: an engine without :has() must still get the hover one. */
+.shelf:has(:focus-visible) .shelf-arrow:not(:disabled) { opacity: 1; pointer-events: auto; }
+.shelf-arrow:disabled { opacity: 0; pointer-events: none; }
+
+/* -- a card: the slide, its title, where it came from ---------------- */
+
+.card {
+  display: block;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: var(--star);
+  font: var(--t-title);
+  text-align: left;
+  cursor: pointer;
+  -webkit-tap-highlight-color: transparent;
+}
+/* The focus ring goes on the picture (below), not around the whole button. */
+.card:focus-visible { outline: none; }
+
+/* Seat while the picture is on its way; the image fades in over it once
+   it has arrived.  The shimmer is an honest one: only a strip whose image
+   the browser has actually started fetching (.loading, set from an
+   intersection observer in library.js) animates, so the forty cards past
+   the fold do not paint a gradient sixty times a second for nobody. */
+.strip {
+  position: relative;
+  display: block;
+  aspect-ratio: 16 / 9;
+  overflow: hidden;
+  border: 1px solid var(--rail);
+  border-radius: var(--r-md);
+  background-color: var(--seat);
+  transition: transform var(--t-slow) var(--ease-out), box-shadow var(--t-slow) var(--ease-out),
+              border-color var(--t-slow) var(--ease-out);
+}
+.strip.loading {
+  background-image: linear-gradient(100deg, var(--seat) 35%, var(--seat-2) 50%, var(--seat) 65%);
+  background-size: 240% 100%;
+  animation: shimmer 2.6s linear infinite;
+}
+/* Behind the picture the library is invisible, and an animation that keeps
+   painting there is main-thread time taken from the video. */
+body:not(.browsing) #library .strip { animation: none; }
+
+@keyframes shimmer {
+  from { background-position: 100% 0; }
+  to { background-position: 0 0; }
+}
+
+.strip img {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+  opacity: 0;
+  transition: opacity var(--t-slow) var(--ease-out), transform 400ms var(--ease-out);
+}
+.strip.loaded img { opacity: 1; }
+
+/* Under the pointer the slide is held up to the lamp: a 2px rise, the
+   lift, a lamp rim, and the picture breathing a little. */
+.card:hover .strip,
+.card:focus-visible .strip {
+  transform: translateY(-2px);
+  box-shadow: var(--lift);
+  border-color: var(--lamp-rim);
+}
+.card:hover .strip img,
+.card:focus-visible .strip img { transform: scale(1.03); }
+.card:focus-visible .strip {
+  outline: 2px solid var(--lamp);
+  outline-offset: 2px;
+}
+.card:active .strip { transform: translateY(0); }
+
+/* The duration, bottom-right inside the picture, on the scrim. */
+.badge {
+  position: absolute;
+  right: var(--s-2);
+  bottom: var(--s-2);
+  z-index: 1;
+  padding: 2px 6px;
+  border-radius: var(--r-xs);
+  background: var(--scrim);
+  color: var(--star);
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+}
+
+/* Two lines of title, 10px under the picture; the meta row 4px under that. */
+.cardtitle {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin-top: 10px;
+  font: var(--t-title);
+  color: var(--star);
+}
+
+.cardmeta {
+  display: flex;
+  align-items: center;
+  gap: var(--s-2);
+  margin-top: var(--s-1);
+  overflow: hidden;
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+  color: var(--star-dim);
+  white-space: nowrap;
+}
+.cardmeta > span { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.cardmeta i {
+  flex: none;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--star-faint);
+}
+
+/* -- the wait: the shelves' shape before youtube answers ------------- */
+
+.skeleton h2,
+.skeleton .shelfrow i::before,
+.skeleton .shelfrow i::after {
+  background-color: var(--seat);
+  background-image: linear-gradient(100deg, var(--seat) 35%, var(--seat-2) 50%, var(--seat) 65%);
+  background-size: 240% 100%;
+  animation: shimmer 2.6s linear infinite;
+}
+
+/* A heading bar in the space a heading takes: 4 + 16 + 12 = 24 + 8. */
+.skeleton h2 {
+  width: 120px;
+  height: var(--s-4);
+  margin: var(--s-1) 0 var(--s-3) var(--gutter);
+  padding: 0;
+  border-radius: var(--r-xs);
+}
+
+.skeleton .shelfrow { overflow: hidden; }
+.skeleton .shelfrow i {
+  flex: none;
+  display: block;
+  width: var(--card-w);
+}
+.skeleton .shelfrow i::before {
+  content: "";
+  display: block;
+  aspect-ratio: 16 / 9;
+  border: 1px solid var(--rail);
+  border-radius: var(--r-md);
+}
+/* Where the title will be. */
+.skeleton .shelfrow i::after {
+  content: "";
+  display: block;
+  width: 72%;
+  height: var(--s-3);
+  margin-top: calc(10px + var(--s-1));
+  border-radius: var(--r-xs);
+}
+
+/* -- search results: the same cards, in a grid ----------------------- */
+
+#results { padding: var(--s-2) 0 var(--s-16); }
+
+#resulthead {
+  display: flex;
+  align-items: center;
+  gap: var(--s-4);
+  padding: 0 var(--gutter) var(--s-6);
+}
+
+#resultline {
+  min-width: 0;
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+  color: var(--star-dim);
+}
+
+#grid {
+  display: grid;
+  align-items: start;
+  grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+  gap: var(--s-6) var(--s-4);
+  padding: 0 var(--gutter);
+}
+
+/* -- nothing came back ----------------------------------------------- */
+
+#libempty {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--s-3);
+  padding: var(--s-8) var(--gutter) var(--s-16);
+}
+#libempty h2 {
+  font: var(--t-headline);
+  letter-spacing: var(--track-headline);
+  color: var(--star);
+}
+#libempty p {
+  max-width: 52ch;
+  font: var(--t-body);
+  color: var(--star);
+}
+#libempty .libempty-tech {
+  font: var(--t-label);
+  letter-spacing: var(--track-label);
+  color: var(--star-dim);
+}
+#emptyfile { margin-top: var(--s-1); }
