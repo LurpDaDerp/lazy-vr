@@ -21,3 +21,8 @@ CLAUDE.md
 
 # Agent-authored docs and instruction files stay local.
 docs/superpowers/
+
+# Impeccable (design agent) artifacts stay local, like the other agent notes.
+PRODUCT.md
+DESIGN.md
+.impeccable/
