@@ -107,7 +107,17 @@ function harness({ worker = true, processor = true, camera = "open" } = {}) {
   Object.defineProperty(globalThis, "navigator", {
     value: {
       mediaDevices: {
-        getUserMedia: camera === "open" ? async () => stream : () => asked.promise,
+        getUserMedia: async ({ video }) => {
+          if (camera === "pending") return asked.promise;
+          // A webcam whose driver will not start the shape asked for, but
+          // which opens perfectly well when nothing in particular is asked.
+          if (camera === "fussy" && video !== true) {
+            const failed = new Error("Could not start video source");
+            failed.name = "AbortError";
+            throw failed;
+          }
+          return stream;
+        },
       },
     },
     configurable: true, writable: true,
@@ -283,4 +293,74 @@ test("once the camera is in, the wait is named for the stage the models are at",
   h.finishModels();
   await Promise.all([loading, opening]);
   assert.equal(said.at(-1), "Camera running");
+});
+
+// -- a camera let go of before it arrives --------------------------------
+
+test("a stop while the ask is still out releases the camera when it arrives", async () => {
+  // getUserMedia cannot be cancelled.  Escape, or the overlay's way back,
+  // calls stop() -- which finds this.stream still null and has nothing to
+  // stop -- and then the ask resolves onto a tracker nobody is watching.
+  // The track stays live: the camera light stays on with no session behind
+  // it, and the next ask finds the device held and fails with AbortError.
+  const h = harness({ camera: "pending" });
+  const tracker = new GazeTracker({ permissionGrace: 1e9 });
+  const opening = tracker.open(h.video).catch((error) => error);
+
+  await settle();
+  tracker.stop();          // the viewer pressed Escape while the prompt sat there
+  h.answerCamera();        // ...and the prompt was answered afterwards
+  h.finishModels();
+  await opening;
+
+  assert.equal(h.track.stopped, true, "the camera was left running with nobody holding it");
+  assert.equal(tracker.stream, null, "an abandoned stream was kept");
+  assert.equal(tracker.running, false);
+});
+
+test("a second ask retires the first rather than leaving two cameras open", async () => {
+  const h = harness({ camera: "pending" });
+  const tracker = new GazeTracker({ permissionGrace: 1e9 });
+  const first = tracker.open(h.video).catch((error) => error);
+  const second = tracker.open(h.video).catch((error) => error);
+
+  await settle();
+  h.answerCamera();
+  h.finishModels();
+  await Promise.all([first, second]);
+
+  assert.equal(tracker.mode, "worker");
+  assert.equal(h.posted.filter((m) => m.type === "stream").length, 1,
+    "both asks wired their frames to the worker");
+});
+
+// -- a camera that will not start the shape it was asked for --------------
+
+test("a driver that will not start the asked-for shape is asked again for any shape", async () => {
+  // Chrome answers "AbortError: Could not start video source" when the
+  // device is there and permitted but the mode it was asked for will not
+  // start.  A plain ask usually does, and the alternative was to tell the
+  // viewer the camera could not be opened when it could.
+  const h = harness({ camera: "fussy" });
+  const tracker = new GazeTracker();
+  const loading = tracker.load();
+  const opening = tracker.open(h.video);
+  await settle();
+  h.finishModels();
+  await Promise.all([loading, opening]);
+
+  assert.equal(tracker.mode, "worker");
+  assert.equal(tracker.stream, h.stream);
+});
+
+test("a camera that will not start at all says so in words", async () => {
+  const h = harness({ camera: "fussy" });
+  // ...even for the plain ask.
+  navigator.mediaDevices.getUserMedia = async () => {
+    const failed = new Error("Could not start video source");
+    failed.name = "AbortError";
+    throw failed;
+  };
+  const tracker = new GazeTracker();
+  await assert.rejects(tracker.open(h.video), /another app|in use|could not start/i);
 });

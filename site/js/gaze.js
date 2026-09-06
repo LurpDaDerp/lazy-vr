@@ -60,6 +60,10 @@ export class GazeTracker {
     this.engine = null;
     this.mode = "inline";
     this.runId = 0;
+    // Which ask for the camera is the live one.  getUserMedia cannot be
+    // cancelled, so this is what lets a stop() that lands while an ask is
+    // still out release what that ask is about to acquire.
+    this.openId = 0;
     this._mirror = true;
     this.ready = null;
     this.pendingLoad = null;
@@ -216,6 +220,7 @@ export class GazeTracker {
    * refused or absent.  `videoElement` carries the frames only on the paths
    * that need it; the worker prefers to hold the track itself. */
   async open(videoElement, deviceId = "") {
+    const mine = ++this.openId;
     if (!navigator.mediaDevices?.getUserMedia) {
       throw new Error(window.isSecureContext
         ? "This browser is too old to open a camera."
@@ -227,10 +232,16 @@ export class GazeTracker {
     // A chosen camera is asked for by id; otherwise whichever faces the
     // viewer.  An id that no longer exists (a webcam since unplugged) is
     // not an error worth stopping for: fall back to the default ask.
+    // The last rung is a bare ask, for a webcam whose driver will not start
+    // the shape wanted: chrome answers "AbortError: Could not start video
+    // source" for a device that is present and permitted but will not run
+    // at 1280x720x30, and the same device opens on `true`.  Ideal
+    // constraints are advisory and still choose a mode, so this is not the
+    // same rung twice.
     const shape = { width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } };
     const asks = deviceId
-      ? [{ deviceId: { exact: deviceId }, ...shape }, { facingMode: "user", ...shape }]
-      : [{ facingMode: "user", ...shape }];
+      ? [{ deviceId: { exact: deviceId }, ...shape }, { facingMode: "user", ...shape }, true]
+      : [{ facingMode: "user", ...shape }, true];
     // An ask that goes unanswered is nudged, never abandoned: the prompt may
     // still be sitting behind an omnibox icon, and answering it late has to
     // keep working.  All that changes is that the page stops claiming to be
@@ -240,27 +251,47 @@ export class GazeTracker {
         + "camera icon at the right of the address bar and choose Allow.");
     }, this.permissionGrace);
     let error = null;
+    let stream = null;
     try {
       for (const video of asks) {
         try {
-          this.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+          stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
           error = null;
           break;
         } catch (caught) {
           error = caught;
-          if (caught && caught.name === "NotAllowedError") break;
+          // A refusal and an empty desk are answers about the camera
+          // itself; only a failure to start is worth another shape.
+          if (caught && (caught.name === "NotAllowedError" || caught.name === "NotFoundError")) break;
         }
       }
     } finally {
       clearTimeout(nudge);
     }
+    // The ask outlived the session that made it -- Escape, or the overlay's
+    // way back, while the prompt was still on screen.  stop() ran when there
+    // was nothing yet to stop, so releasing this track is this branch's job
+    // and nobody else's: left running it holds the device with no session
+    // behind it, the light stays on, and the next ask finds the camera busy
+    // and fails with AbortError.
+    if (mine !== this.openId) {
+      if (stream) for (const track of stream.getTracks()) track.stop();
+      throw new Error("The camera was let go of before it finished opening.");
+    }
     if (error) {
       const why = error && error.name;
       if (why === "NotAllowedError") throw new Error("Camera access was refused. Allow the camera for this site and reload.");
       if (why === "NotFoundError") throw new Error("No camera was found on this device.");
-      if (why === "NotReadableError") throw new Error("The camera is in use by another app.");
+      // NotReadableError and AbortError are the same story from the viewer's
+      // side: the camera is there, it is allowed, and it will not start --
+      // almost always because something else has it.
+      if (why === "NotReadableError" || why === "AbortError") {
+        throw new Error("The camera would not start — it is probably in use by another app. "
+          + "Close anything else using it (Teams, Zoom, the Camera app) and try again.");
+      }
       throw new Error(`The camera could not be opened (${why || error}).`);
     }
+    this.stream = stream;
     this.video = videoElement;
 
     // Which of the three carries the frames depends on where the pipeline
@@ -286,6 +317,11 @@ export class GazeTracker {
     // whole of what the viewer ever sees.
     if (!this.loaded) this.onStatus(this.loadStage || "Loading the gaze pipeline…");
     await this.load().catch(() => {});
+    // Seconds can pass in there, and the same abandonment applies.
+    if (mine !== this.openId) {
+      this.stop();
+      throw new Error("The camera was let go of before it finished opening.");
+    }
 
     if (this.worker && typeof MediaStreamTrackProcessor !== "undefined") {
       const [track] = this.stream.getVideoTracks();
@@ -377,6 +413,9 @@ export class GazeTracker {
   stop() {
     this.running = false;
     this.runId += 1;
+    // Retires any ask still out, so that when it lands it lets go rather
+    // than opening a camera this session no longer wants.
+    this.openId += 1;
     this.inflight = false;
     if (this.worker) this.worker.postMessage({ type: "stop" });
     // Stopping the track also ends the transferred frame stream, so the
