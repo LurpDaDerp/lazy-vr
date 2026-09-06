@@ -4,7 +4,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { DEFAULTS as CONTROL } from "../../site/js/control.js";
+import { DEADZONE_FLOOR, DEFAULTS as CONTROL } from "../../site/js/control.js";
 import {
   SETTINGS_DEFAULTS, SETTINGS_VERSION, normalize, readSettings, writeSettings,
 } from "../../site/js/settings.js";
@@ -31,6 +31,24 @@ test("defaults: normalize never hands back the frozen defaults object", () => {
   assert.equal(SETTINGS_DEFAULTS.sens, 1);
 });
 
+test("migration: a setting this page no longer has is dropped, not carried", () => {
+  // The raw-stream engine is gone, and so are its keys.  Spreading the
+  // stored blob over the defaults would keep them in the object, write them
+  // back on the next save, and read them again for ever after.
+  const settings = normalize({ version: 2, engine: "stream", codecs: "vp9,av01", maxfps: 60 });
+  assert.deepEqual(Object.keys(settings).sort(), Object.keys(SETTINGS_DEFAULTS).sort());
+  assert.equal("engine" in settings, false);
+  assert.equal("codecs" in settings, false);
+  // And what a stored blob does still name is kept.
+  assert.equal(normalize({ version: 2, engine: "stream", sens: 1.6 }).sens, 1.6);
+});
+
+test("migration: a stored array or a stored string is not a settings object", () => {
+  assert.deepEqual(normalize([1, 2, 3]), { ...SETTINGS_DEFAULTS });
+  assert.deepEqual(normalize("nonsense"), { ...SETTINGS_DEFAULTS });
+  assert.deepEqual(normalize(null), { ...SETTINGS_DEFAULTS });
+});
+
 test("migration: a deadzone that was only ever a past default moves on", () => {
   assert.equal(normalize({ version: 1, deadzone: 3.0 }).deadzone, CONTROL.deadzoneYaw);
   assert.equal(normalize({ version: 2, deadzone: 1.5 }).deadzone, CONTROL.deadzoneYaw);
@@ -50,7 +68,9 @@ test("migration: a current-version save is never migrated, even at an old defaul
 test("bounds: numbers are clamped to their sliders, garbage falls back", () => {
   const settings = normalize({ sens: 9, deadzone: 0, fov: 200 });
   assert.equal(settings.sens, 2.5);
-  assert.equal(settings.deadzone, 1);
+  // Not 0, and not 1 either: below the noise floor a deadzone stops being a
+  // deadzone, and the bias in the calibrated centre walks the view.
+  assert.equal(settings.deadzone, DEADZONE_FLOOR);
   assert.equal(settings.fov, 100);
   const junk = normalize({ sens: "abc", deadzone: null, fov: undefined, version: SETTINGS_VERSION });
   assert.equal(junk.sens, 1);

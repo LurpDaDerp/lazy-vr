@@ -38,6 +38,31 @@ export const MAX_ASPECT = 6.0;
 export const MIN_SCALE = 0.2;
 export const MAX_SCALE = 5.0;
 
+/* The narrowest band of gaze that can still mean "not asking for anything".
+ *
+ * The aspect law above is about *gearing*, and gearing is a property of the
+ * screen.  A deadzone has a second job that is nothing to do with the
+ * screen: it has to be wider than the gaze estimate's own noise, or it stops
+ * being a deadzone at all.  Inside a band that the noise crosses freely, a
+ * standing error in the neutral is not suppressed -- it is passed through in
+ * proportion to how often the noise carries the reading out of the band, and
+ * then multiplied by a gain the aspect law has *raised*.
+ *
+ * Divided by 16/9 the shipped 1.8 degree band becomes 1.01, which is inside
+ * that noise, and the arithmetic is brutal: with eight tenths of a degree of
+ * estimator noise and half a degree of standing offset -- a viewer settling
+ * into their chair -- yaw creeps 0.7 degrees a minute and pitch creeps 32,
+ * on the same map and the same reading.  That is the reported "looking at
+ * the middle slowly tilts the camera up": nothing about the calibration dot,
+ * nothing about a sign, just a vertical deadzone geared down until it no
+ * longer covered the noise it was there to cover.
+ *
+ * So where gearing and the noise floor disagree, the floor wins.  Above the
+ * deadzone the aspect law is untouched: both axes still reach the same rate
+ * at the same share of their remaining travel.  A host that names a pitch
+ * deadzone outright has said what it wants and gets it. */
+export const DEADZONE_FLOOR = 1.5;
+
 export const DEFAULTS = Object.freeze({
   // Eye eccentricity that commands no motion, in degrees of visual angle.
   // People do not recruit the head for gaze shifts below roughly 18 degrees,
@@ -80,6 +105,28 @@ export const DEFAULTS = Object.freeze({
   // this long, and wander further than the tolerance and it starts again.
   calibrationHold: 1.4,
   calibrationTolerance: 2.5,
+  // The longest a reading may go missing mid-hold and still count as the
+  // same hold.  Generous enough for a couple of dropped frames at 30 Hz,
+  // tight enough that a blink, a hand across the lens or a glance the
+  // tracker could not read cannot be spliced over.
+  calibrationGap: 0.25,
+  // How fast the neutral follows a viewer who is not asking for anything.
+  //
+  // The view is an integrator with no way home: nothing pulls it back, so
+  // whatever mean rate survives the deadzone is turned into angle and kept,
+  // for as long as the clip lasts.  The calibrated centre is measured once,
+  // in a second and a half, and everything that moves afterwards -- a viewer
+  // settling into their chair, the estimator's own slow wander, the tiny
+  // sampling error in the mean itself -- lands on it as a standing error and
+  // comes out as a standing turn.
+  //
+  // So the neutral is not a constant: while the eyes are inside the deadzone
+  // -- while nothing at all is being asked for -- it eases towards where
+  // they actually are, with a time constant far longer than any glance.  A
+  // deliberate turn is never touched, because a deliberate turn is by
+  // definition outside the deadzone.  Set to 0 to pin the neutral where
+  // calibration left it.
+  neutralTau: 10.0,
   invertYaw: false,
   invertPitch: false,
 });
@@ -96,7 +143,11 @@ export function clampScale(scale) {
  * degree beyond it, saturating at `limit`.  `expo` above 1 trades
  * sensitivity near the centre for reach at the edges; 1 is proportional. */
 export function responseAngle(error, deadzone, gain, limit, expo = 1) {
-  if (!Number.isFinite(error)) return 0;
+  // Every one of these reaches the view as an angle that is added to the
+  // last one, so a single non-finite number here is not a bad frame -- it is
+  // a view that is NaN for the rest of the session and never comes back.
+  if (!Number.isFinite(error) || !Number.isFinite(deadzone)
+    || !Number.isFinite(gain) || !Number.isFinite(limit)) return 0;
   const magnitude = Math.abs(error);
   if (magnitude <= deadzone) return 0;
   let beyond = magnitude - deadzone;
@@ -156,6 +207,10 @@ export class GazeController {
     this.resetFixation();
     this.committed = false;
     this.outsideSince = null;
+    // When the neutral last eased towards the eyes; null means "no usable
+    // reading since", so the next one starts a fresh interval rather than
+    // settling across the gap.
+    this.settledAt = null;
   }
 
   // -- geometry ---------------------------------------------------------
@@ -188,8 +243,15 @@ export class GazeController {
     return this.config.rateYaw / this.scaleX;
   }
 
+  /* The one place the aspect law is overruled.  A pitch deadzone the host
+   * named is honoured as given; one this module derived is not allowed
+   * below the estimator's noise, at the size it will actually be used --
+   * hence after the viewport scaling, which can shrink it as easily as the
+   * aspect can. */
   get deadzonePitch() {
-    return (this.config.deadzonePitch ?? this.config.deadzoneYaw / this.referenceAspect) * this.scaleY;
+    const named = this.config.deadzonePitch;
+    if (named !== null && named !== undefined) return named * this.scaleY;
+    return Math.max(this.config.deadzoneYaw / this.referenceAspect * this.scaleY, DEADZONE_FLOOR);
   }
 
   get ratePitch() {
@@ -246,6 +308,7 @@ export class GazeController {
   resetFixation() {
     this.streak = [];
     this.streakStart = null;
+    this.streakAt = null;
     this.progress = 0;
   }
 
@@ -256,6 +319,7 @@ export class GazeController {
     this.generation += 1;
     this.resetFixation();
     this.release();
+    this.settledAt = null;
     return this.generation;
   }
 
@@ -268,6 +332,17 @@ export class GazeController {
    * off the dot is caught as surely as a jump. */
   fixate(yaw, pitch, timestamp) {
     const c = this.config;
+    // The hold is a *continuous* stretch of held-still readings, and the
+    // progress bar measures wall-clock time rather than samples -- so
+    // without this, a face lost mid-hold is silently spliced over.  Cover
+    // the lens for a second and uncover it and the very next sample sees
+    // the hold's full duration elapsed and finishes the pass on a centre
+    // averaged from the three frames taken before the gap.
+    if (this.streakAt !== null && timestamp - this.streakAt > c.calibrationGap) {
+      this.resetFixation();
+      this.resets += 1;
+    }
+    this.streakAt = timestamp;
     if (this.streak.length) {
       let meanYaw = 0, meanPitch = 0;
       for (const [y, p] of this.streak) { meanYaw += y; meanPitch += p; }
@@ -307,21 +382,32 @@ export class GazeController {
   /* `sample`: {yaw, pitch, tracked, confidence, timestamp (seconds)}. */
   update(sample) {
     const c = this.config;
-    const usable = sample.tracked && Number.isFinite(sample.yaw) && Number.isFinite(sample.pitch);
+    // The timestamp is as load-bearing as the angles: it drives the
+    // smoothing, the onset gate and the hold, and one non-finite value put
+    // through the smoother would leave it NaN for good -- a controller that
+    // never commands anything again and never says why.
+    const usable = sample.tracked && Number.isFinite(sample.yaw)
+      && Number.isFinite(sample.pitch) && Number.isFinite(sample.timestamp);
     if (!usable) {
       // A blink or a hand across the face must not command a turn, but it
       // must not fling the view back either: ask for a stop.
       this.yawEma.reset();
       this.pitchEma.reset();
       this.release();
+      this.settledAt = null;
       return this.still("lost", 0, 0, sample.confidence);
     }
 
     const yaw = this.yawEma.update(sample.yaw, sample.timestamp);
     const pitch = this.pitchEma.update(sample.pitch, sample.timestamp);
+    const trusted = !(sample.confidence < c.minConfidence);
 
     if (!this.calibrated) {
-      this.fixate(yaw, pitch, sample.timestamp);
+      // A reading too poor to steer on is too poor to *measure* on.  It
+      // used to go straight into the streak, so a half-seen face during the
+      // hold could put its own offset into the one number every later error
+      // is taken against -- and the deadzone is not wide enough to hide it.
+      if (trusted) this.fixate(yaw, pitch, sample.timestamp);
       return this.still("calibrating", 0, 0, sample.confidence);
     }
 
@@ -329,8 +415,9 @@ export class GazeController {
     const yawError = yaw - centre[0];
     const pitchError = pitch - centre[1];
 
-    if (sample.confidence < c.minConfidence) {
+    if (!trusted) {
       this.release();
+      this.settledAt = null;
       return this.still("low confidence", yawError, pitchError, sample.confidence);
     }
 
@@ -344,6 +431,11 @@ export class GazeController {
       if (this.outsideSince === null) this.outsideSince = sample.timestamp;
       if (sample.timestamp - this.outsideSince >= c.onset) this.committed = true;
     }
+
+    // Inside the deadzone nothing is being asked for, which is exactly when
+    // the neutral is allowed to learn where "nothing" is.
+    this.settle(outside, yawError, pitchError, sample.timestamp);
+
     if (!this.committed) {
       return this.still(outside ? "committing" : "holding", yawError, pitchError, sample.confidence);
     }
@@ -360,6 +452,33 @@ export class GazeController {
       confidence: sample.confidence,
       committed: true,
     };
+  }
+
+  /* Ease the neutral towards the eyes while they are asking for nothing.
+   *
+   * `outside` is the whole gate, and it is deliberately the *reading*, not
+   * the commitment: a glance that is still waiting out the onset is already
+   * a request, and letting the neutral chase it would quietly eat the very
+   * turn about to be committed.  Inside the deadzone there is nothing to
+   * eat, so the only thing this can follow is where the viewer's straight
+   * ahead has actually got to.
+   *
+   * A gap in the readings is not settled across.  While the face was gone
+   * the eyes were anywhere, and one long interval would put an alpha of
+   * nearly one on a single sample -- the neutral snapping to wherever the
+   * viewer happened to be looking when the tracker found them again.  What
+   * counts as a gap is the same tolerance the hold uses: readings that far
+   * apart are not one continuous look at anything. */
+  settle(outside, yawError, pitchError, timestamp) {
+    const last = this.settledAt;
+    this.settledAt = timestamp;
+    const tau = this.config.neutralTau;
+    if (outside || last === null || !(tau > 0)) return;
+    const dt = timestamp - last;
+    if (!(dt > 0) || dt > this.config.calibrationGap) return;
+    const alpha = 1 - Math.exp(-dt / tau);
+    this.centre[0] += alpha * yawError;
+    this.centre[1] += alpha * pitchError;
   }
 
   release() {

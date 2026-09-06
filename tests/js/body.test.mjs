@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 
 import {
   A_MAX, Body, DEG, MAX_ROLL, NECK_COMFORT, PITCH_LIMIT, YAW_LIMIT, neckRadius, neckStrain,
+  wrapDegrees,
 } from "../../site/js/body.js";
 
 const DT = 1 / 60;
@@ -66,6 +67,28 @@ test("blur follows speed and is zero at rest", () => {
   assert.equal(body.view.blur, 0);
   run(body, 128, 0, 1);
   assert.ok(body.view.blur > 0);
+});
+
+test("a frame with no usable time or rate in it leaves the posture alone", () => {
+  const body = run(new Body(), 90, 45, 0.5);
+  const was = { yaw: body.yaw, pitch: body.pitch, yawRate: body.yawRate, pitchRate: body.pitchRate };
+  // The body integrates, so one NaN would be every frame after it too.
+  for (const bad of [NaN, Infinity, 0, -DT]) body.step(ask(90, 45), bad);
+  assert.deepEqual({ yaw: body.yaw, pitch: body.pitch, yawRate: body.yawRate, pitchRate: body.pitchRate }, was);
+  body.step({ yawRate: NaN, pitchRate: undefined, committed: true, maxRateYaw: 128, maxRatePitch: 128 }, DT);
+  for (const v of [body.yaw, body.pitch, body.view.yaw, body.view.pitch, body.view.roll, body.view.blur]) {
+    assert.ok(Number.isFinite(v), `${v}`);
+  }
+});
+
+test("wrapDegrees names every bearing once, in [-180, 180)", () => {
+  for (const angle of [0, 1, 179, 180, 181, 359, 360, 540, -180, -181, -540, 1e6]) {
+    const wrapped = wrapDegrees(angle);
+    assert.ok(wrapped >= -180 && wrapped < 180, `${angle} -> ${wrapped}`);
+    // The same bearing, not a different one: a whole number of turns apart.
+    assert.ok(Math.abs((angle - wrapped) % 360) < 1e-9, `${angle} -> ${wrapped}`);
+  }
+  assert.equal(wrapDegrees(180), -180);
 });
 
 // -- the sway ----------------------------------------------------------

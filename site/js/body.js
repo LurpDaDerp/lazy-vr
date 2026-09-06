@@ -66,9 +66,11 @@ export function clamp(value, limit) {
   return Math.max(-limit, Math.min(limit, value));
 }
 
-/* The same bearing, named in (-180, 180].  Free yaw would otherwise count
+/* The same bearing, named in [-180, 180).  Free yaw would otherwise count
  * up for as long as the clip lasts, and a recentre from +540 would sweep
- * one and a half turns to reach the same place as a turn of -180. */
+ * one and a half turns to reach the same place as a turn of -180.  Exactly
+ * half a turn is named -180 rather than +180; the two are the same bearing,
+ * and the sweep home is the same length either way. */
 export function wrapDegrees(angle) {
   return ((angle + 180) % 360 + 360) % 360 - 180;
 }
@@ -185,8 +187,14 @@ export class Body {
   /* One display frame.  `request`: {yawRate, pitchRate, committed,
    * maxRateYaw, maxRatePitch}; `dt` in seconds. */
   step(request, dt) {
-    let askedYaw = request.yawRate || 0;
-    let askedPitch = request.pitchRate || 0;
+    // Posture is carried from frame to frame, so a single non-finite number
+    // is not one bad frame -- it is a view that is NaN for the rest of the
+    // session, with nothing downstream able to tell why or bring it back.
+    // A frame with no time in it has nothing to integrate either: every
+    // term below is multiplied by dt.
+    if (!Number.isFinite(dt) || dt <= 0) return this.view;
+    let askedYaw = Number.isFinite(request.yawRate) ? request.yawRate : 0;
+    let askedPitch = Number.isFinite(request.pitchRate) ? request.pitchRate : 0;
 
     if (this.homing) {
       // R means R: gaze is ignored until the view is home.  The sweep is
@@ -241,9 +249,11 @@ export class Body {
     this.view.yaw = (this.yaw + swayYaw + tremorYaw) * DEG;
     this.view.pitch = (this.pitch + swayPitch + tremorPitch) * DEG;
     this.view.roll = this.roll * DEG;
-    // Smear along the direction of travel over one exposure: what a turning
-    // head sees, and cover for the judder a 30 Hz gaze pipeline puts into a
-    // fast rotation.
+    // Smear over one exposure: what a turning head sees, and cover for the
+    // judder a 30 Hz gaze pipeline puts into a fast rotation.  Yaw only, and
+    // deliberately so -- the renderer smears its taps about the vertical
+    // axis, so a number from a vertical sweep would draw a sideways streak
+    // for a movement that went up.
     this.view.blur = Math.min(MAX_BLUR, Math.abs(this.yawRate) * DEG * dt);
     return this.view;
   }

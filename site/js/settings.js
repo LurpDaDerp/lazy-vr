@@ -6,7 +6,7 @@
  * they *are*.
  */
 
-import { DEFAULTS as CONTROL } from "./control.js";
+import { DEADZONE_FLOOR, DEFAULTS as CONTROL } from "./control.js";
 
 export const SETTINGS_KEY = "lazyvr.settings";
 export const SETTINGS_VERSION = 3;
@@ -47,10 +47,20 @@ const bound = (value, lo, hi, fallback) => {
   return Number.isFinite(n) ? Math.min(hi, Math.max(lo, n)) : fallback;
 };
 
-/* A stored object, of any age, into a complete and sane settings object. */
+/* A stored object, of any age, into a complete and sane settings object.
+ *
+ * The keys are *picked* off the defaults rather than spread over them, so a
+ * setting this page no longer has is dropped on the way through instead of
+ * being carried in the object, written back by the next save, and read
+ * again for ever after.  That is what a version number is for; spreading
+ * the stored blob would leave the raw engine's codec preference in storage
+ * long after the engine that read it was deleted. */
 export function normalize(stored) {
   const raw = stored && typeof stored === "object" ? stored : {};
-  const settings = { ...SETTINGS_DEFAULTS, ...raw };
+  const settings = { ...SETTINGS_DEFAULTS };
+  for (const key of Object.keys(SETTINGS_DEFAULTS)) {
+    if (key in raw) settings[key] = raw[key];
+  }
 
   /* Sensitivity is a multiplier, so a stored 1 follows the default wherever
    * it goes.  The deadzone is not: it is an absolute number of degrees, so a
@@ -71,7 +81,12 @@ export function normalize(stored) {
 
   // Old or hand-edited storage must not be able to break the map.
   settings.sens = bound(settings.sens, 0.4, 2.5, 1);
-  settings.deadzone = bound(settings.deadzone, 1, 8, CONTROL.deadzoneYaw);
+  // Not below the floor: under about a degree and a half the band sits
+  // inside the gaze estimate's own noise, and every scrap of bias in the
+  // calibrated centre then reads as a slow standing turn.  The derived
+  // pitch deadzone is held to the same floor in control.js -- a slider that
+  // could go under it would simply move the drift onto yaw instead.
+  settings.deadzone = bound(settings.deadzone, DEADZONE_FLOOR, 8, CONTROL.deadzoneYaw);
   settings.fov = bound(settings.fov, 60, 100, 75);
   settings.volume = bound(settings.volume, 0, 1, 1);
   settings.blur = settings.blur !== false;
