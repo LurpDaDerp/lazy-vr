@@ -66,7 +66,7 @@ function fakeVideo() {
 /* The page's side of the world: a camera that answers at once, a worker
  * whose models arrive only when the test says so, and the frame-stream
  * transport the best path needs. */
-function harness({ worker = true, processor = true } = {}) {
+function harness({ worker = true, processor = true, camera = "open" } = {}) {
   const posted = [];
   const load = held();
   const track = { stopped: false, stop() { this.stopped = true; } };
@@ -81,6 +81,8 @@ function harness({ worker = true, processor = true } = {}) {
       postMessage(message) {
         posted.push(message);
         if (message.type === "load") {
+          // The real worker reports each stage as it reaches it.
+          Promise.resolve().then(() => this.onmessage({ data: { type: "status", text: "Loading the face model…" } }));
           load.promise.then((ok) => this.onmessage({ data: { type: ok ? "loaded" : "loadfailed" } }));
         }
       }
@@ -98,8 +100,16 @@ function harness({ worker = true, processor = true } = {}) {
     delete globalThis.MediaStreamTrackProcessor;
   }
 
+  // A camera that answers at once, or one the browser never answers for:
+  // an unshown permission prompt leaves getUserMedia pending for as long as
+  // the page is open, and that is the case worth having a test for.
+  const asked = held();
   Object.defineProperty(globalThis, "navigator", {
-    value: { mediaDevices: { getUserMedia: async () => stream } },
+    value: {
+      mediaDevices: {
+        getUserMedia: camera === "open" ? async () => stream : () => asked.promise,
+      },
+    },
     configurable: true, writable: true,
   });
 
@@ -114,6 +124,7 @@ function harness({ worker = true, processor = true } = {}) {
     posted, stream, track, video: fakeVideo(),
     finishModels: () => load.release(true),
     failModels: () => load.release(false),
+    answerCamera: () => asked.release(stream),
     get worker() { return instance; },
   };
 }
@@ -222,4 +233,54 @@ test("a load that failed can be asked again", async () => {
   globalThis.__gazeStub.engineLoad = Promise.resolve();
   await tracker.load();
   assert.ok(tracker.engine.loaded);
+});
+
+// -- a wait the page can read --------------------------------------------
+
+test("a prompt the browser never shows says so rather than waiting in silence", async () => {
+  // getUserMedia has no timeout of its own, and a prompt the browser
+  // decides not to put on screen -- chrome's quiet permission UI, one
+  // deferred until the tab is looked at -- leaves it pending for as long as
+  // the page is open.  The page sat on "Waiting for the camera…" forever,
+  // with no error, nothing to click and nothing to read.
+  const h = harness({ camera: "pending" });
+  const said = [];
+  const tracker = new GazeTracker({ onStatus: (text) => said.push(text), permissionGrace: 5 });
+  const opening = tracker.open(h.video);
+  await settle();
+
+  assert.match(said.at(-1), /allow|permission/i, `the page was left on: ${said.at(-1)}`);
+
+  // The ask is nudged, never abandoned: answering the prompt late still works.
+  let opened = false;
+  opening.then(() => { opened = true; });
+  await settle();
+  assert.equal(opened, false, "the camera ask was given up on");
+  h.answerCamera();
+  h.finishModels();
+  await opening;
+  assert.equal(tracker.mode, "worker");
+});
+
+test("once the camera is in, the wait is named for the stage the models are at", async () => {
+  // Every stage the pipeline reports is reported while the shelves are up,
+  // where the page shows none of them.  By the time the overlay is on
+  // screen the load is mid-stage and silent, so the camera's own message
+  // stood there as the answer to a question it had stopped being.
+  const h = harness();
+  const said = [];
+  const tracker = new GazeTracker({ onStatus: (text) => said.push(text) });
+  const loading = tracker.load();
+  await settle();  // the shelves are up and the stage has been and gone
+  assert.equal(said.at(-1), "Loading the face model…");
+
+  const opening = tracker.open(h.video);
+  await settle();
+
+  assert.equal(said.at(-1), "Loading the face model…",
+    `the page was left on: ${said.at(-1)}`);
+
+  h.finishModels();
+  await Promise.all([loading, opening]);
+  assert.equal(said.at(-1), "Camera running");
 });

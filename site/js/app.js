@@ -700,6 +700,11 @@ function toast(message) {
 
 /* ---------- picking a clip ---------- */
 
+/* How long the camera and the models get before the overlay admits that
+ * something is wrong and offers the way back.  Comfortably past a cold
+ * model load on a slow line; well short of giving up on the session. */
+const STARTUP_PATIENCE_MS = 12000;
+
 async function selectClip(clip) {
   if (!browsing || !renderer) return;
   const my = ++session;
@@ -782,14 +787,24 @@ async function selectClip(clip) {
   // The camera prompt also wants the click's activation.  Ask for it now,
   // while the models finish loading in parallel.
   const camera = ensureCamera();
+  // A wait this long is a wait that has gone wrong -- a permission prompt
+  // the browser never put on screen, models that are not going to arrive --
+  // and the overlay has just hidden the one control that lets go of it,
+  // leaving a page reload as the only way back to the shelves.  Put it back.
+  const stuck = setTimeout(() => {
+    if (session === my && !calibrated) el.retry.hidden = false;
+  }, STARTUP_PATIENCE_MS);
   try {
     await ensureEngine();
     await camera;
   } catch (error) {
+    clearTimeout(stuck);
     if (session === my) fail(error.message, true);
     return;
   }
+  clearTimeout(stuck);
   if (session !== my) return;
+  el.retry.hidden = true;
   if (askFirst) await fullscreenAfterCamera(my);
   if (session !== my) return;
 

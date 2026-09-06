@@ -29,13 +29,27 @@
 
 import { GazeEngine } from "./gaze-core.js";
 
+/* How long a camera ask may go unanswered before the page is told why it is
+ * waiting.  getUserMedia has no timeout of its own: a prompt the browser
+ * decides not to put on screen -- chrome's quiet permission UI after a few
+ * dismissals, one deferred until the tab is looked at -- leaves the promise
+ * pending for as long as the page is open.  Long enough that a granted
+ * camera never trips it, short enough to beat the viewer's patience. */
+const PERMISSION_GRACE_MS = 6000;
+
 export class GazeTracker {
   /* `models`: URL of the folder with gaze_direct.onnx, the .task file, the
    * metadata and the permutation.  `onStatus(text)` reports loading stages,
    * `onReading(reading)` gets every frame, tracked or not. */
-  constructor({ models = "models", onStatus = () => {}, onReading = () => {} } = {}) {
+  constructor({ models = "models", onStatus = () => {}, onReading = () => {},
+    permissionGrace = PERMISSION_GRACE_MS } = {}) {
     this.models = models.replace(/\/$/, "");
     this.onStatus = onStatus;
+    this.permissionGrace = permissionGrace;
+    // The pipeline's own last word, and whether it has said its last.  Both
+    // are for open(): see the note there.
+    this.loadStage = "";
+    this.loaded = false;
     this.onReading = onReading;
     this.video = null;
     this.stream = null;
@@ -70,6 +84,14 @@ export class GazeTracker {
 
   // -- loading ----------------------------------------------------------
 
+  /* A stage the pipeline reached, passed on and remembered.  Every one of
+   * them is reported while the shelves are up, where the page shows none of
+   * them; open() is the one that needs to say it again. */
+  pipelineStatus(text) {
+    this.loadStage = text;
+    this.onStatus(text);
+  }
+
   /* The pipeline, loaded once.  Two callers want it finished -- the page,
    * which starts it as soon as the shelves are up, and open() below, which
    * cannot choose a transport until it knows where the pipeline ended up --
@@ -86,11 +108,12 @@ export class GazeTracker {
   }
 
   async loadOnce() {
-    if (await this.loadWorker()) return;
+    if (await this.loadWorker()) { this.loaded = true; return; }
     this.mode = "inline";
-    this.engine = new GazeEngine({ models: this.models, onStatus: this.onStatus });
+    this.engine = new GazeEngine({ models: this.models, onStatus: (text) => this.pipelineStatus(text) });
     this.engine.mirror = this._mirror;
     await this.engine.load();
+    this.loaded = true;
   }
 
   /* Build the worker and have it load the models.  Returns false for any
@@ -128,7 +151,7 @@ export class GazeTracker {
   fromWorker(data) {
     switch (data.type) {
       case "status":
-        this.onStatus(data.text);
+        this.pipelineStatus(data.text);
         break;
       case "loaded":
       case "loadfailed":
@@ -208,16 +231,28 @@ export class GazeTracker {
     const asks = deviceId
       ? [{ deviceId: { exact: deviceId }, ...shape }, { facingMode: "user", ...shape }]
       : [{ facingMode: "user", ...shape }];
+    // An ask that goes unanswered is nudged, never abandoned: the prompt may
+    // still be sitting behind an omnibox icon, and answering it late has to
+    // keep working.  All that changes is that the page stops claiming to be
+    // waiting on a camera when it is really waiting on a person.
+    const nudge = setTimeout(() => {
+      this.onStatus("Still waiting for permission to use the camera — look for the "
+        + "camera icon at the right of the address bar and choose Allow.");
+    }, this.permissionGrace);
     let error = null;
-    for (const video of asks) {
-      try {
-        this.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
-        error = null;
-        break;
-      } catch (caught) {
-        error = caught;
-        if (caught && caught.name === "NotAllowedError") break;
+    try {
+      for (const video of asks) {
+        try {
+          this.stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+          error = null;
+          break;
+        } catch (caught) {
+          error = caught;
+          if (caught && caught.name === "NotAllowedError") break;
+        }
       }
+    } finally {
+      clearTimeout(nudge);
     }
     if (error) {
       const why = error && error.name;
@@ -242,6 +277,14 @@ export class GazeTracker {
     // still warm, and waiting before it would spend that.  A load that
     // failed is the caller's to report; all that matters here is that it is
     // no longer in flight.
+
+    // From here the wait belongs to the pipeline, so name the pipeline's
+    // stage.  Its own statuses were all spent while the shelves were up,
+    // where the page shows none of them, so by now "Waiting for the camera…"
+    // is the answer to a question that has stopped being asked -- and where
+    // the models are slow, or a CDN has gone quiet, that stale line is the
+    // whole of what the viewer ever sees.
+    if (!this.loaded) this.onStatus(this.loadStage || "Loading the gaze pipeline…");
     await this.load().catch(() => {});
 
     if (this.worker && typeof MediaStreamTrackProcessor !== "undefined") {
