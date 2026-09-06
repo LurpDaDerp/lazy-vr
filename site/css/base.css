@@ -82,10 +82,9 @@ svg.icon {
   z-index: -1;
 }
 
-#sound { display: none; }
-
-/* The fallback engine: youtube's iframe where the sphere would be.  It
-   keeps its pointer events -- an ad's skip button must stay clickable. */
+/* youtube's iframe, where the sphere would be.  It keeps its pointer
+   events -- an ad's skip button must stay clickable -- so the only thing
+   ever laid over it is #wake, and only while the chrome sleeps. */
 #embed {
   position: fixed;
   inset: 0;

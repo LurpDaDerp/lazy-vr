@@ -1,7 +1,7 @@
 # Fly.io: fly launch --copy-config --name <your-app>   then   fly deploy
 #
 # The machine stops when nobody is watching and wakes on the next visit.
-# If yt-dlp resolves run out of memory, raise memory to "1gb".
+# If yt-dlp searches run out of memory, raise memory to "1gb".
 
 app = "lazyvr"
 primary_region = "sea"

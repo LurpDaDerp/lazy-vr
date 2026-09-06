@@ -5,7 +5,7 @@ import { test } from "node:test";
 
 import { PITCH_LIMIT, YAW_LIMIT } from "../../site/js/body.js";
 import {
-  engineLabel, formatClock, neckEdge, qualityLabel, trackerHealth,
+  HUD_IDLE_MS, engineLabel, formatClock, hudAwake, neckEdge, qualityLabel, trackerHealth,
 } from "../../site/js/hud.js";
 
 test("clock: minutes and seconds, hours only when there are some", () => {
@@ -27,10 +27,11 @@ test("quality: the tier, with the frame rate only when it is high", () => {
 });
 
 test("engine: named for the viewer", () => {
-  assert.equal(engineLabel("stream"), "Raw stream");
   assert.equal(engineLabel("embed"), "youtube player");
   assert.equal(engineLabel("local"), "This device");
   assert.equal(engineLabel("nonsense"), "");
+  // The raw-stream engine is gone; nothing may still name it.
+  assert.equal(engineLabel("stream"), "");
 });
 
 test("tracker: lost beats stale beats one-pass beats fine", () => {
@@ -40,6 +41,50 @@ test("tracker: lost beats stale beats one-pass beats fine", () => {
   assert.equal(trackerHealth({ state: "lost", mirror: true, stale: false }), "lost");
   assert.equal(trackerHealth({ state: "lost", mirror: false, stale: true }), "lost");
   assert.equal(trackerHealth({ state: "low confidence", mirror: true, stale: false }), "dim");
+});
+
+/* Watching a clip, pointer long since still: the one state the chrome is
+ * allowed to fade in.  Each test below turns exactly one thing on. */
+const watching = {
+  browsing: false, started: true, calibrated: true,
+  settingsOpen: false, paused: false, focused: true,
+  sincePointerMs: HUD_IDLE_MS + 1,
+};
+
+test("chrome: it fades once the pointer has been still long enough", () => {
+  assert.equal(hudAwake(watching), false);
+  assert.equal(hudAwake({ ...watching, sincePointerMs: HUD_IDLE_MS - 1 }), true);
+  assert.equal(hudAwake({ ...watching, sincePointerMs: 0 }), true);
+});
+
+test("chrome: it fades under youtube's player exactly as over the sphere", () => {
+  // The engine is not an input any more: the wake catcher reports the
+  // pointer over the iframe, so there is nothing left to except.  These
+  // two fail the day someone puts an engine exemption back.
+  assert.equal(hudAwake({ ...watching, engineMode: "embed" }), false);
+  assert.equal(hudAwake({ ...watching, engineMode: "local" }), false);
+});
+
+test("chrome: focus in our own iframe still fades; focus lost to another app does not", () => {
+  // app.js reads `focused` from document.hasFocus() *or* an active iframe
+  // inside #embed, so clicking into youtube's player is not a lost window.
+  assert.equal(hudAwake({ ...watching, focused: true }), false);
+  assert.equal(hudAwake({ ...watching, focused: false }), true);
+});
+
+test("chrome: the library, the calibration, the panel and a pause keep it up", () => {
+  assert.equal(hudAwake({ ...watching, browsing: true }), true);
+  assert.equal(hudAwake({ ...watching, started: false }), true);
+  assert.equal(hudAwake({ ...watching, calibrated: false }), true);
+  assert.equal(hudAwake({ ...watching, settingsOpen: true }), true);
+  assert.equal(hudAwake({ ...watching, paused: true }), true);
+});
+
+test("chrome: an exemption outranks the idle timer, never the other way", () => {
+  const forever = { ...watching, sincePointerMs: 1e9 };
+  assert.equal(hudAwake({ ...forever, paused: true }), true);
+  assert.equal(hudAwake({ ...forever, settingsOpen: true }), true);
+  assert.equal(hudAwake(forever), false);
 });
 
 test("neck: no strain, no edge", () => {

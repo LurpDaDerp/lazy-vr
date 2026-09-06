@@ -24,8 +24,6 @@ async function getJson(url) {
 
 export const fetchHome = () => getJson("api/home");
 export const fetchSearch = (query) => getJson(`api/search?q=${encodeURIComponent(query)}`);
-export const fetchStreams = (id, prefs) =>
-  getJson(`api/streams/${encodeURIComponent(id)}?codecs=${prefs.codecs}&max=${prefs.max}`);
 
 export function formatDuration(seconds) {
   if (!seconds || !isFinite(seconds)) return null;

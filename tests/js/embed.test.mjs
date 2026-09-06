@@ -3,7 +3,10 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { EMBED_FOV, movedEnough, overscanFor, sphericalFromView } from "../../site/js/embed.js";
+// The constructor listens for resize; nothing here needs a real window.
+globalThis.window = { addEventListener() {} };
+
+import { EMBED_FOV, EmbedPlayer, movedEnough, overscanFor, sphericalFromView } from "../../site/js/embed.js";
 
 const DEG = Math.PI / 180;
 const near = (a, b, tol = 1e-9) => assert.ok(Math.abs(a - b) <= tol, `${a} vs ${b}`);
@@ -78,4 +81,61 @@ test("gate: movement on any axis opens it", () => {
 test("gate: the yaw seam at 0/360 is not movement", () => {
   assert.ok(!movedEnough({ yaw: 359.995, pitch: 0, roll: 0 }, { yaw: 0.005, pitch: 0, roll: 0 }));
   assert.ok(movedEnough({ yaw: 359, pitch: 0, roll: 0 }, { yaw: 1, pitch: 0, roll: 0 }));
+});
+
+// -- one player, many videos -----------------------------------------------
+
+/* A live player that has already been built: `open()` takes the reuse
+ * branch, which is every pick after the first. */
+function reused() {
+  const calls = [];
+  const player = new EmbedPlayer({ clientWidth: 1280, clientHeight: 720, appendChild() {} });
+  player.player = {
+    cueVideoById: (id) => calls.push(["cue", id]),
+    loadVideoById: (id) => calls.push(["load", id]),
+    stopVideo: () => calls.push(["stop"]),
+    getIframe: () => null,
+  };
+  return { player, calls };
+}
+
+const pending = (promise) => {
+  let done = false;
+  promise.then(() => { done = true; }, () => { done = true; });
+  return () => done;
+};
+
+test("a second video is cued, not loaded: an autoplay would race the hold", async () => {
+  // loadVideoById autoplays, and app.js pauses for calibration immediately
+  // afterwards.  When the pause lost, the clip played -- audibly -- under
+  // the calibration overlay, seconds in by the time the ring filled.
+  const { player, calls } = reused();
+  const opening = player.open("abc123");
+  const settled = pending(opening);
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.deepEqual(calls, [["cue", "abc123"]]);
+  assert.equal(settled(), false, "open() resolved before the player had the video");
+
+  player.settleCue();
+  await opening;
+  assert.equal(settled(), true);
+});
+
+test("a session let go of mid-cue is told, not left waiting", async () => {
+  const { player } = reused();
+  const opening = player.open("abc123");
+  await new Promise((r) => setTimeout(r, 0));
+  player.close();
+  await assert.rejects(opening, /let go of/);
+});
+
+test("a cue that is already settled cannot be settled twice", async () => {
+  const { player } = reused();
+  const opening = player.open("abc123");
+  await new Promise((r) => setTimeout(r, 0));
+  player.settleCue();
+  await opening;
+  player.settleCue(new Error("too late"));  // must not throw or reject anything
+  assert.equal(player.pendingCue, null);
 });

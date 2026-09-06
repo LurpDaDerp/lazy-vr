@@ -1,13 +1,12 @@
 /* The HUD: what the viewer is told about the session, and how.
  *
  * Two layers.  The awake layer is chrome: it exists while the pointer moves,
- * while paused, while the settings panel is open, and under the youtube
- * player fallback -- the moments a viewer is handling the page rather than
- * looking around.  The peripheral layer is a handful of marks that have to
- * be seen without being looked at, because with a 1.8 degree deadzone
- * looking at anything in a corner turns the sphere toward it: the face is
- * lost, the neck is at its end, the stream is buffering, the picture is
- * paused.
+ * while paused, and while the settings panel is open -- the moments a
+ * viewer is handling the page rather than looking around.  The peripheral
+ * layer is a handful of marks that have to be seen without being looked at,
+ * because with a 1.8 degree deadzone looking at anything in a corner turns
+ * the sphere toward it: the face is lost, the neck is at its end, the
+ * picture is buffering, the picture is paused.
  *
  * The pure helpers at the top decide what the marks say; the painter at
  * the bottom puts it on the page and is the only part that touches the
@@ -17,7 +16,8 @@
 import { PITCH_LIMIT, YAW_LIMIT } from "./body.js";
 
 /* Seconds into a clock: "1:05", "1:01:01".  Null for anything that is not
- * a finite number, which is what a stream with no metadata yet reports. */
+ * a finite number, which is what both engines report for a duration they do
+ * not know yet. */
 export function formatClock(seconds) {
   if (!Number.isFinite(seconds)) return null;
   const whole = Math.max(0, Math.round(seconds));
@@ -37,11 +37,34 @@ export function qualityLabel(height, fps) {
 /* Which player is in use, named for the viewer, not the code. */
 export function engineLabel(mode) {
   switch (mode) {
-    case "stream": return "Raw stream";
     case "embed": return "youtube player";
     case "local": return "This device";
     default: return "";
   }
+}
+
+/* How long the chrome stays up after the pointer stops. */
+export const HUD_IDLE_MS = 3000;
+
+/* Whether the playback chrome is up.  A pure reading of the session, so
+ * that the one rule with five exemptions lives in one testable place
+ * rather than in a handful of timers.
+ *
+ * Four of the exemptions are the moments the chrome is the thing being
+ * used rather than the thing in the way: the library, the run-up to a
+ * calibration, the settings panel, and a paused picture, which is being
+ * read rather than watched.  The fifth is the pointer itself: `focused` is
+ * false only when the window has lost the focus to another application,
+ * and a window that cannot see the pointer would have nothing able to
+ * bring the chrome back.  Focus that has gone into youtube's iframe does
+ * not count -- the catcher over it reports the pointer for us -- so the
+ * chrome fades under the embed exactly as it does over the sphere. */
+export function hudAwake({ browsing, started, calibrated, settingsOpen, paused, focused, sincePointerMs }) {
+  if (browsing || !started || !calibrated) return true;
+  if (settingsOpen) return true;
+  if (paused) return true;
+  if (!focused) return true;
+  return sincePointerMs < HUD_IDLE_MS;
 }
 
 /* One word for the tracker's health, worst first.  `state` is the control
@@ -73,8 +96,8 @@ export function neckEdge({ yaw, pitch, strain, freeYaw }) {
 
 /* ---------- the painter ---------- */
 
-const ENGINE_ICON = { stream: "#i-sphere", embed: "#i-yt", local: "#i-folder" };
-const ENGINE_TEXT = { stream: "", embed: "youtube player", local: "This device" };
+const ENGINE_ICON = { embed: "#i-yt", local: "#i-folder" };
+const ENGINE_TEXT = { embed: "youtube player", local: "This device" };
 const HEALTH_ICON = { ok: "#i-eye", onepass: "#i-eye-one", dim: "#i-eye", stale: "#i-eye-off", lost: "#i-eye-off" };
 const HEALTH_TEXT = { ok: "", onepass: "1-pass", dim: "low light", stale: "no signal", lost: "no face" };
 const HEALTH_TITLE = {
@@ -241,7 +264,7 @@ export function createHud(doc = document) {
       el.quality.querySelector(".mark-text").textContent = quality || "—";
       el.quality.hidden = !quality;
       el.engine.dataset.engine = engine;
-      el.engineIcon.setAttribute("href", ENGINE_ICON[engine] || "#i-sphere");
+      el.engineIcon.setAttribute("href", ENGINE_ICON[engine] || "#i-yt");
       el.engine.querySelector(".mark-text").textContent = ENGINE_TEXT[engine] || "";
       el.engine.title = engineLabel(engine);
       el.tracker.dataset.health = tracker;

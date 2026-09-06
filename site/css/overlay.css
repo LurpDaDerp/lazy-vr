@@ -1,7 +1,8 @@
 /* The overlay: the house lights going down.  Status lines while the tracker
- * starts, the camera opens and the stream resolves; the one calibration
- * hold; errors with a button.  Nearly opaque, so the HUD and the picture
- * beneath stay quiet: the fixation ring is the only lit thing on it. */
+ * starts, the camera opens and the player is built; the calibration's
+ * get-ready and its hold; errors with a button.  Nearly opaque, so the HUD
+ * and the picture beneath stay quiet: the fixation ring is the only lit
+ * thing on it. */
 
 #overlay {
   position: fixed;
@@ -70,9 +71,11 @@
 }
 
 /* The countdown: three arcs, a third of the circumference each (2π·21 / 3,
-   less a 4px gap), starting at twelve o'clock and going clockwise. */
+   less a 4px gap), starting at twelve o'clock and going clockwise.  Brass,
+   not lamp: these only ever show during the get-ready phase, and the lamp
+   is what says the tracker has started reading. */
 .ring-count {
-  stroke: var(--lamp);
+  stroke: var(--brass);
   stroke-width: 2;
   stroke-dasharray: 39.98 999;
   transform-origin: 24px 24px;
@@ -105,7 +108,20 @@
 .ring-dot {
   fill: var(--lamp);
   filter: drop-shadow(0 0 10px var(--lamp-glow));
-  transition: fill var(--t-fast) var(--ease-out);
+  transition: fill var(--t-fast) var(--ease-out), filter var(--t-fast) var(--ease-out);
+}
+
+/* Getting ready: the three seconds before the tracker reads anything.  A
+   viewer who cannot tell the run-up from the measuring holds their breath
+   through the countdown and relaxes exactly when it starts to matter, so
+   the two phases are lit differently.  Here the whole ring is brass and
+   unlit -- engraved, not live -- and the lamp and its glow come on with the
+   hold.  Colour and nothing else: the dot marks the centre the calibration
+   is measured against, and moving it by a pixel would tilt the map. */
+#fixation.getready .ring-track { stroke: var(--rail); }
+#fixation.getready .ring-dot {
+  fill: var(--brass);
+  filter: none;
 }
 
 /* A look-away: track and dot flash ember for the 600ms the class is on. */
@@ -138,26 +154,6 @@
 
 /* base.css gives the button a display; the attribute must still win. */
 #overlay [hidden] { display: none !important; }
-
-/* -- the background-tab hint ------------------------------------------ */
-
-/* Made by app.js when a stream starts; it toggles the inline display. */
-#bghint {
-  display: none;
-  position: fixed;
-  bottom: var(--s-16);
-  left: 50%;
-  z-index: 37;
-  transform: translateX(-50%);
-  max-width: calc(100% - 2 * var(--gutter));
-  padding: var(--s-2) var(--s-4);
-  border: 1px solid var(--ember);
-  border-radius: var(--r-sm);
-  background: var(--seat);
-  color: var(--ember);
-  font: var(--t-title);
-  text-align: center;
-}
 
 /* No scale on the ring for anyone who asked for less motion. */
 @media (prefers-reduced-motion: reduce) {

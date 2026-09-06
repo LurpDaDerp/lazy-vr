@@ -6,22 +6,21 @@
  * asking for; body.js carries that request out at display rate as a head
  * would; render.js draws the sphere.  Clips come from this site's own
  * server -- /api/home and /api/search list youtube's 360-filtered uploads,
- * /api/streams resolves one into proxied tracks, and avsync.js keeps the
- * separate audio on the video's clock -- or from the viewer's own disk,
- * which needs no server at all.  This file is the page: the shelves, the
+ * which youtube's own iframe player then plays, steered through its
+ * spherical API -- or from the viewer's own disk, which needs no server at
+ * all and goes onto the sphere.  This file is the page: the shelves, the
  * search, the file picker, the calibration step, the HUD, the keys, and the
  * wiring between them.
  */
 
-import { AVSync } from "./avsync.js";
 import { Body, YAW_LIMIT } from "./body.js";
 import { DEFAULTS, GazeController } from "./control.js";
 import { EmbedPlayer } from "./embed.js";
 import { GazeTracker } from "./gaze.js";
-import { fetchHome, fetchSearch, fetchStreams, renderResults, renderShelves } from "./library.js";
+import { fetchHome, fetchSearch, renderResults, renderShelves } from "./library.js";
 import { screenTier, tierBelow } from "./quality.js";
 import { Renderer } from "./render.js";
-import { createHud, neckEdge, qualityLabel, trackerHealth } from "./hud.js";
+import { createHud, hudAwake, neckEdge, qualityLabel, trackerHealth } from "./hud.js";
 import {
   SETTINGS_DEFAULTS, bindSettingsPanel, fillCameraOptions, readSettings, readSettingsPanel,
   renderSettingsPanel, writeSettings,
@@ -31,7 +30,7 @@ const DEG = Math.PI / 180;
 const $ = (id) => document.getElementById(id);
 
 const el = {
-  canvas: $("view"), embed: $("embed"), video: $("video"), sound: $("sound"), cam: $("cam"),
+  canvas: $("view"), embed: $("embed"), video: $("video"), cam: $("cam"),
   overlay: $("overlay"), overlaytext: $("overlaytext"), retry: $("retry"), dot: $("fixation"),
   toast: $("toast"),
   home: $("home"), results: $("results"), resultline: $("resultline"), backhome: $("backhome"),
@@ -46,7 +45,6 @@ const el = {
 const body = new Body();
 const controller = new GazeController();
 const tracker = new GazeTracker({ models: "models", onStatus: showStatus, onReading: onReading });
-const sync = new AVSync(el.video, el.sound);
 const embedPlayer = new EmbedPlayer(el.embed);
 const hud = createHud();
 
@@ -57,21 +55,10 @@ try {
   fail(error.message);
 }
 
-/* What this browser can decode, asked once; the server picks within it. */
-const prefs = (() => {
-  const probe = document.createElement("video");
-  const codecs = [];
-  if (probe.canPlayType('video/webm; codecs="vp09.00.50.08"')) codecs.push("vp9");
-  if (probe.canPlayType('video/mp4; codecs="av01.0.16M.08"')) codecs.push("av01");
-  if (probe.canPlayType('video/mp4; codecs="avc1.640033"')) codecs.push("avc1");
-  return {
-    codecs: codecs.join(",") || "avc1",
-    // The best tier that still fits the *display* -- its full physical
-    // pixels, fullscreen-sized, not the window.  A 1440p monitor gets the
-    // 1440p track, never an 8K decode it cannot show.
-    max: screenTier(screen.width, screen.height, window.devicePixelRatio || 1),
-  };
-})();
+/* The best tier that still fits the *display* -- its full physical pixels,
+ * fullscreen-sized, not the window.  A 1440p monitor pins youtube's player
+ * to its 1440p level, never an 8K decode it cannot show. */
+const screenMax = screenTier(screen.width, screen.height, window.devicePixelRatio || 1);
 
 /* ---------- settings ---------- */
 
@@ -88,7 +75,7 @@ function saveSettings() {
 }
 
 function qualityCap() {
-  return settings.quality === "auto" ? prefs.max : Number(settings.quality);
+  return settings.quality === "auto" ? screenMax : Number(settings.quality);
 }
 
 /* Push the current settings into every part that obeys them. */
@@ -117,13 +104,11 @@ function applySettings() {
   }
 }
 
-/* Volume and mute reach every engine: the raw pair (the >720p path plays
- * its sound from the shadow <audio>), and youtube's player. */
+/* Volume and mute reach both engines: the <video> a file off this device
+ * plays through, and youtube's player. */
 function applySound() {
-  for (const media of [el.video, el.sound]) {
-    media.volume = settings.volume;
-    media.muted = settings.muted;
-  }
+  el.video.volume = settings.volume;
+  el.video.muted = settings.muted;
   embedPlayer.setSound(settings.volume, settings.muted);
 }
 
@@ -174,16 +159,16 @@ let started = false;
 let calibrated = false;
 let everCalibrated = false;
 let playing = null;
-let engine = "idle";  // idle | loading | ready | failed
 
-/* Picking a clip is a little journey -- resolve, camera, calibration -- and
- * pressing Esc half-way through must strand every step still in flight. */
+/* Picking a clip is a little journey -- the player, the camera, the
+ * calibration -- and pressing Esc half-way through must strand every step
+ * still in flight. */
 let session = 0;
-let streamsReady = false;
+let playerReady = false;
 let pendingPlay = false;
 let retryAction = "library";
 let qualityLine = null;
-let engineMode = "stream";  // stream (raw, ad-free) | embed (the fallback) | local (this device)
+let engineMode = "embed";   // embed (youtube's player) | local (this device)
 let currentMax = 0;         // the quality cap in force for this video
 let frameMs = 16;           // smoothed frame time: the renderer's own vote
 let slowSince = 0;
@@ -229,8 +214,14 @@ function frame(now) {
  * remembers the viewport the viewer calibrated in and rescales the map
  * against it, so a windowed calibration stays correct in fullscreen. */
 function reportScreen() {
-  const width = el.canvas.clientWidth;
-  const height = el.canvas.clientHeight;
+  // What the eyes cross is the window, and the canvas is only the same
+  // thing while it is the one drawing: under the embed it is display:none
+  // and measures 0x0, which used to bail out of this function entirely --
+  // so every youtube session kept the controller's 16:9 default, took the
+  // wrong pitch gearing and deadzone for the display, and never noticed a
+  // resize either, because considerRecalibration is only reached from here.
+  const width = el.canvas.clientWidth || window.innerWidth;
+  const height = el.canvas.clientHeight || window.innerHeight;
   if (width < 2 || height < 2) return;
   if (Math.abs(width - reportedW) < 2 && Math.abs(height - reportedH) < 2) return;
   reportedW = width;
@@ -259,9 +250,9 @@ function considerRecalibration() {
 }
 
 /* The renderer's own vote on quality.  A sustained sag in frame time means
- * the machine cannot decode and draw what it was given -- an 8K stream on
- * a software decoder, usually -- so the cap steps down one tier at a time,
- * at most once every ten seconds, never below 1080. */
+ * the machine cannot decode and draw what it was given -- an 8K level on a
+ * software decoder, usually -- so the cap steps down one tier at a time, at
+ * most once every ten seconds, never below 1080. */
 const SLOW_MS = 28;
 const SLOW_FOR_MS = 3000;
 const DROP_COOLDOWN_MS = 10000;
@@ -295,29 +286,11 @@ function considerDownshift(now) {
   applyQualityCap(lower);
 }
 
-async function applyQualityCap(maxHeight) {
-  if (engineMode === "embed") {
-    embedPlayer.capHeight(maxHeight);
-    return;
-  }
-  if (engineMode === "local" || !playing) return;
-  const my = session;
-  const at = el.video.currentTime;
-  // What the viewer wants, not what the panel did: a swap asked for from
-  // the settings panel finds the video paused *by the panel*, and closing
-  // the panel is what resumes it.
-  const resume = !el.video.paused || pausedBySettings;
-  try {
-    const streams = await fetchStreams(playing.id, { codecs: prefs.codecs, max: maxHeight });
-    if (session !== my) return;
-    sync.set(streams.video.src, streams.audio && streams.audio.src);
-    qualityText = qualityLabel(streams.video.height, streams.video.fps);
-    el.video.addEventListener("loadedmetadata", () => {
-      if (session !== my) return;
-      el.video.currentTime = at;
-      if (resume && !pausedBySettings) el.video.play().catch(() => {});
-    }, { once: true });
-  } catch { /* the swap failed; keep what is playing */ }
+/* The ceiling, handed to whichever engine can honour it.  A file off this
+ * device has only the one encode, so only youtube's player has anything to
+ * do here. */
+function applyQualityCap(maxHeight) {
+  if (engineMode === "embed") embedPlayer.capHeight(maxHeight);
 }
 
 /* ---------- gaze readings ---------- */
@@ -340,7 +313,7 @@ function onReading(reading) {
     } else if (awayShown && controller.calibrationProgress > 0) {
       // Back on the dot: the warning has done its job.
       awayShown = false;
-      setOverlayLine("Hold still.");
+      setOverlayLine(HOLD_LINE);
     }
     if (controller.calibrated) finishCalibration();
   }
@@ -370,26 +343,36 @@ let hudHidden = false;
  * video and comes back on the first twitch of the pointer.  Whether it is
  * up is *derived* -- from the tick below and from the pointer -- rather
  * than toggled, so pausing, calibrating, the settings panel and the library
- * all get their say without a timer each. */
-const HUD_IDLE_MS = 3000;
+ * all get their say without a timer each.  hud.js owns the decision itself;
+ * this file only reads the state it is made of. */
 let lastPointerAt = 0;
 
-function hudAwake(now) {
-  if (browsing || !started || !calibrated) return true;
-  if (!el.settings.hidden) return true;   // the panel is chrome too
-  if (mediaPaused()) return true;         // a paused video is being read, not watched
-  // The chrome may only fade while this document is the one the pointer is
-  // moving over.  Under the youtube-player fallback it is not: the iframe
-  // covers the window, and a pointer moving inside another document never
-  // crosses back -- so all four ways up are dead there, and chrome that
-  // went would have nothing left able to bring it back.  A window that has
-  // lost the focus cannot see the pointer either.
-  if (engineMode === "embed" || !document.hasFocus()) return true;
-  return now - lastPointerAt < HUD_IDLE_MS;
+/* Whether the pointer is still ours to see.  A window that has lost the
+ * focus to another application cannot see it, and chrome that went down
+ * then would have nothing left able to bring it back.  Focus sitting in
+ * youtube's iframe is not that case: the iframe is part of this window, the
+ * wake catcher over it still reports the pointer, and the chrome may fade
+ * there exactly as it does over the sphere. */
+function pointerIsOurs() {
+  if (document.hasFocus()) return true;
+  const active = document.activeElement;
+  return Boolean(active && active.tagName === "IFRAME" && el.embed.contains(active));
+}
+
+function chromeAwake(now) {
+  return hudAwake({
+    browsing,
+    started,
+    calibrated,
+    settingsOpen: !el.settings.hidden,
+    paused: mediaPaused(),
+    focused: pointerIsOurs(),
+    sincePointerMs: now - lastPointerAt,
+  });
 }
 
 function updateHud() {
-  const hide = !hudAwake(performance.now());
+  const hide = !chromeAwake(performance.now());
   if (hide === hudHidden) return;
   hudHidden = hide;
   document.body.classList.toggle("hidden-hud", hide);
@@ -407,6 +390,10 @@ function wakeHud() {
   if (hudHidden) updateHud();
 }
 
+/* These four listen on the document, so #wake -- the transparent sheet
+ * that covers youtube's iframe while the chrome is down -- feeds them by
+ * bubbling, and the pointer that would otherwise vanish into another
+ * document is seen after all. */
 document.addEventListener("pointermove", wakeHud);
 document.addEventListener("pointerdown", wakeHud);
 document.addEventListener("wheel", wakeHud, { passive: true });
@@ -430,7 +417,7 @@ window.addEventListener("blur", () => {
 
 let lastOut = null;         // the control law's last word
 let readingsStale = false;  // no reading for 400 ms: the tracker has gone quiet
-let qualityText = null;     // "2160p60", once the stream is known
+let qualityText = null;     // "2160p", once a local file's metadata is in
 
 function currentHeading() {
   return ((-body.view.yaw / DEG) % 360 + 360) % 360;
@@ -491,9 +478,8 @@ let loading = null;
  * is picked. */
 function ensureEngine() {
   if (!loading) {
-    engine = "loading";
-    loading = tracker.load().then(() => { engine = "ready"; })
-      .catch((error) => { engine = "failed"; loading = null; throw error; });
+    loading = tracker.load()
+      .catch((error) => { loading = null; throw error; });
   }
   return loading;
 }
@@ -711,11 +697,11 @@ async function selectClip(clip) {
   browsing = false;
   started = true;
   playing = clip;
-  streamsReady = false;
+  playerReady = false;
   pendingPlay = false;
   retryAction = "library";
-  engineMode = clip.local ? "local" : "stream";
-  document.body.classList.remove("embedded");
+  engineMode = clip.local ? "local" : "embed";
+  document.body.classList.toggle("embedded", !clip.local);
   currentMax = qualityCap();
   frameMs = 16;
   slowSince = 0;
@@ -723,10 +709,9 @@ async function selectClip(clip) {
   el.notice.hidden = true;
   document.body.classList.remove("browsing");
 
-  // Wake both media elements inside the click, so the browser will let a
+  // Wake the media element inside the click, so the browser will let a
   // later, programmatic play() through once calibration is done.
   el.video.load();
-  el.sound.load();
 
   // Fullscreen for the whole session: only this click can grant it, and
   // calibration is best done at the size the video will play at.  The one
@@ -745,43 +730,16 @@ async function selectClip(clip) {
   qualityText = null;
 
   if (clip.local) {
-    // Nothing to resolve and nobody to ask: the file is already here, and
-    // its sound is muxed into it, so the shadow audio element stands down.
-    sync.set(clip.src, null);
+    // Nothing to fetch and nobody to ask: the file is already here, and its
+    // sound is muxed into it.
+    el.video.src = clip.src;
     qualityLine = "Playing from this device";
-    streamsReady = true;
+    playerReady = true;
   } else {
-    // Resolving the stream takes yt-dlp a few seconds; run it underneath the
-    // camera prompt and the calibration countdown rather than before them.
-    fetchStreams(clip.id, { codecs: prefs.codecs, max: currentMax })
-      .then((streams) => {
-        if (session !== my) return;
-        sync.set(streams.video.src, streams.audio && streams.audio.src);
-        qualityText = qualityLabel(streams.video.height, streams.video.fps);
-        qualityLine = `${qualityText} · raw stream`;
-        // A deep link arrives with no title; youtube's answer carries one.
-        if (streams.title && playing === clip && clip.title === "Direct link") {
-          clip.title = streams.title;
-          hud.setTitle(clip.title);
-        }
-        streamsReady = true;
-        if (pendingPlay) {
-          pendingPlay = false;
-          el.overlay.classList.add("gone");
-          tryPlay();
-        }
-      })
-      .catch((error) => {
-        if (session !== my) return;
-        // The raw, ad-free stream was refused -- a bot-challenged host, a
-        // region lock, an expired URL.  youtube will always play its own
-        // videos, though: fall back to its player, steered by the same body.
-        // Say what youtube actually objected to: "refused" on its own has
-        // sent more than one afternoon looking in the wrong place.
-        console.warn("LazyVR: the raw stream was refused", error);
-        toast(`Raw stream refused (${error.message}) — using the youtube player`);
-        embedFallback(clip, my, error);
-      });
+    // Building youtube's player takes a few seconds; let it happen
+    // underneath the camera prompt and the calibration countdown rather
+    // than before them.
+    openEmbed(clip, my);
   }
 
   // The camera prompt also wants the click's activation.  Ask for it now,
@@ -816,16 +774,14 @@ async function selectClip(clip) {
   } else {
     runCalibration("Look at the dot.");
   }
-  watchForBackgroundedTab();
+  watchTabVisibility();
 }
 
-/* The fallback engine: youtube's own iframe player, gaze-steered through
- * its spherical API.  It joins the same handshake the stream path uses, so
- * calibration and the play gate need not know which engine won. */
-async function embedFallback(clip, my, why) {
+/* Everything from youtube plays in youtube's own iframe player, gaze-steered
+ * through its spherical API.  It joins the same handshake the local path
+ * uses, so calibration and the play gate need not know which engine won. */
+async function openEmbed(clip, my) {
   try {
-    engineMode = "embed";
-    document.body.classList.add("embedded");
     await embedPlayer.open(clip.id, {
       onEnded: () => { if (session === my) returnToLibrary(); },
       onError: (error) => {
@@ -834,11 +790,20 @@ async function embedFallback(clip, my, why) {
         notify(`“${clip.title}”: ${error.message}`);
       },
     });
-    if (session !== my) { embedPlayer.close(); return; }
+    // Not close(): there is one player for the life of the page, so it
+    // would stop whatever is loaded *now*.  A session only ends through
+    // returnToLibrary, which has closed the player already.
+    if (session !== my) return;
     embedPlayer.capHeight(currentMax);
-    embedPlayer.pause();  // hold for calibration, like the stream path
+    embedPlayer.pause();  // hold for calibration, like the local path
+    // A deep link arrives with no title; the player has the real one.
+    const title = embedPlayer.title();
+    if (title && playing === clip && clip.title === "Direct link") {
+      clip.title = title;
+      hud.setTitle(title);
+    }
     qualityLine = "youtube player — ads possible";
-    streamsReady = true;
+    playerReady = true;
     if (pendingPlay) {
       pendingPlay = false;
       el.overlay.classList.add("gone");
@@ -847,11 +812,11 @@ async function embedFallback(clip, my, why) {
   } catch (error) {
     if (session !== my) return;
     returnToLibrary();
-    notify(`“${clip.title}” would not stream (${why.message}), and the fallback failed too: ${error.message}`);
+    notify(`“${clip.title}” would not play: ${error.message}`);
   }
 }
 
-/* One remote for two engines: the raw <video> pair, or the embed. */
+/* One remote for two engines: the local <video>, or the embed. */
 function mediaPlay() {
   return engineMode === "embed" ? embedPlayer.ensurePlaying() : el.video.play();
 }
@@ -870,17 +835,17 @@ function mediaSeek(delta) {
   else el.video.currentTime = Math.max(0, Math.min(el.video.duration || 1e9, el.video.currentTime + delta));
 }
 
-/* Whether the picture is stalled waiting for bytes.  The raw pair says so
- * through the <video> element's events -- `waiting` when playback has run
- * out of buffer, cleared by anything that means frames are moving again --
- * and youtube's player through its state. */
+/* Whether the picture is stalled waiting for bytes.  The <video> says so
+ * through its own events -- `waiting` when playback has run out of buffer,
+ * cleared by anything that means frames are moving again -- and youtube's
+ * player through its state. */
 let videoBuffering = false;
 el.video.addEventListener("waiting", () => { videoBuffering = true; });
 for (const name of ["playing", "canplay", "pause", "seeked", "emptied"]) {
   el.video.addEventListener(name, () => { videoBuffering = false; });
 }
 
-/* Where the clip is, for the HUD: one shape for both engines. */
+/* Where the clip is, for the HUD: one shape from both engines. */
 function mediaStatus() {
   if (engineMode === "embed") return embedPlayer.status();
   return {
@@ -891,16 +856,16 @@ function mediaStatus() {
   };
 }
 
-/* Playback starts when the slower of the two journeys finishes: the stream
- * resolving, or the viewer calibrating. */
+/* Playback starts when the slower of the two journeys finishes: the player
+ * becoming ready, or the viewer calibrating. */
 function maybePlay() {
-  if (streamsReady) {
+  if (playerReady) {
     el.overlay.classList.add("gone");
     tryPlay();
   } else {
     pendingPlay = true;
     el.overlay.classList.remove("gone");
-    el.overlaytext.textContent = "Fetching the stream from youtube…";
+    el.overlaytext.textContent = "Starting youtube's player…";
   }
 }
 
@@ -951,10 +916,10 @@ function returnToLibrary() {
   awaitingGeneration = null;
   pendingPlay = false;
   retryAction = "library";
-  sync.clear();
+  clearVideo();
   releaseLocal();
   embedPlayer.close();
-  engineMode = "stream";
+  engineMode = "embed";
   document.body.classList.remove("embedded");
   body.rest();
   // The camera belongs to a playing session, not to browsing the shelves:
@@ -977,9 +942,17 @@ function returnToLibrary() {
   paintPeripheral();
   // The chrome is display:none while browsing, but the next pick lifts that
   // before its overlay is up; nothing of the last clip may linger in it.
-  hud.paintStatus({ quality: null, engine: "stream", tracker: "ok" });
+  hud.paintStatus({ quality: null, engine: "embed", tracker: "ok" });
   hud.paintTransport({ currentTime: 0, duration: NaN, paused: true, volume: settings.volume, muted: settings.muted });
   if (document.fullscreenElement) document.exitFullscreen().catch(() => {});
+}
+
+/* Let the element go: paused, pointed at nothing, and reloaded, so the
+ * decoder lets the last file's frames go with it. */
+function clearVideo() {
+  el.video.pause();
+  el.video.removeAttribute("src");
+  el.video.load();
 }
 
 // A file off this device has one quality: the one it was encoded at.
@@ -988,14 +961,13 @@ el.video.addEventListener("loadedmetadata", () => {
 });
 
 el.video.addEventListener("ended", returnToLibrary);
+// Only a local file ever reaches this element, so a decode that fails is a
+// file this browser cannot read rather than anything to do with the network.
 el.video.addEventListener("error", () => {
   if (browsing || !el.video.getAttribute("src")) return;
   const title = playing ? playing.title : "That video";
-  const local = engineMode === "local";
   returnToLibrary();
-  notify(local
-    ? `“${title}” would not play. This browser may not decode that file — H.264 or VP9 in MP4 or WebM is the safe pair.`
-    : `“${title}” stopped streaming. The signed stream may have expired — pick it again.`);
+  notify(`“${title}” would not play. This browser may not decode that file — H.264 or VP9 in MP4 or WebM is the safe pair.`);
 });
 
 /* ---------- the settings panel ---------- */
@@ -1011,7 +983,7 @@ bindSettingsPanel(el.settings, () => {
   const cap = qualityCap();
   if (cap !== capBefore) {
     currentMax = cap;
-    if (started) applyQualityCap(cap);  // swap in place, mid-video
+    if (started) applyQualityCap(cap);  // re-pin the level, mid-video
   }
 });
 
@@ -1071,7 +1043,6 @@ el.emptyfile.addEventListener("click", () => el.localfile.click());
 
 let awaitingGeneration = null;
 let seenResets = 0;
-let calibrationHeadline = "Look at the dot.";
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -1079,20 +1050,27 @@ let awayShown = false;
 
 /* The fixation ring says everything the countdown and the hold used to say
  * in words, so the eye never has a reason to leave the dot: three arcs
- * light one per second, then the ring fills with the hold. */
+ * light one per second, then the ring fills with the hold.
+ *
+ * The two phases are told apart by colour, not by position -- nothing here
+ * moves the dot, which sits on the exact centre the calibration measures
+ * against.  Counting down, the dot and its arcs are brass: the tracker is
+ * not reading yet.  The hold lights the lamp, the page's one live mark. */
 function ringCountdown(remaining) {
+  el.dot.classList.add("getready");
   for (const arc of el.dot.querySelectorAll(".ring-count")) {
     arc.classList.toggle("on", Number(arc.dataset.third) <= 4 - remaining);
   }
 }
 
 function ringHold(fraction) {
+  el.dot.classList.remove("getready");
   el.dot.classList.add("holding");
   el.dot.style.setProperty("--fill", String(Math.max(0, Math.min(1, fraction))));
 }
 
 function ringReset() {
-  el.dot.classList.remove("on", "holding", "away");
+  el.dot.classList.remove("on", "getready", "holding", "away");
   el.dot.style.setProperty("--fill", "0");
   for (const arc of el.dot.querySelectorAll(".ring-count")) arc.classList.remove("on");
 }
@@ -1101,6 +1079,10 @@ function ringReset() {
 function setOverlayLine(text) {
   el.overlaytext.textContent = text;
 }
+
+/* The line the measuring phase owns, in one place: a look-away puts it back
+ * when the eye returns, and the two must not drift apart. */
+const HOLD_LINE = "Hold still — measuring.";
 
 function lookAgain() {
   awayShown = true;
@@ -1123,7 +1105,6 @@ async function runCalibration(headline) {
   goFullscreen().catch(() => {});
   calibrated = false;
   awaitingGeneration = null;
-  calibrationHeadline = headline;
   seenResets = controller.resets;
   body.rest();
   el.overlay.classList.remove("gone");
@@ -1131,16 +1112,24 @@ async function runCalibration(headline) {
   el.retry.hidden = true;
   ringReset();
   el.dot.classList.add("on");
-  setOverlayLine(headline);
   // Count down before the hold starts, so it begins while the viewer is
   // already fixed on the dot rather than still moving onto it.  The count
   // is drawn on the ring, where the eyes already are.
+  //
+  // These three seconds are not the calibration, and a viewer who thinks
+  // they are will hold their breath through them and relax exactly when
+  // the measuring starts.  So the countdown says it is only the run-up --
+  // in a word after the headline, and in brass rather than lamp -- and the
+  // hold announces itself when it actually begins.  Every headline this is
+  // called with ends in "look at the dot", so the clause reads on from all
+  // of them.
+  setOverlayLine(`${headline} Get ready…`);
   for (let count = 3; count > 0; count--) {
     ringCountdown(count);
     await wait(1000);
     if (run !== calibrationRun || browsing) return;
   }
-  setOverlayLine("Hold still.");
+  setOverlayLine(HOLD_LINE);
   ringHold(0);
   awayShown = false;
   awaitingGeneration = controller.recalibrate();
@@ -1202,26 +1191,15 @@ el.touchbar.addEventListener("click", (event) => {
   else if (action === "settings") toggleSettings();
 });
 
-/* Chrome will not fetch media for a tab that is not in the foreground: the
- * request is simply never issued, so the sphere stays black with no error
- * anywhere.  Say so, and retry the moment the tab is looked at. */
+/* A tab nobody is looking at needs no camera: the light goes off, the
+ * machine gets its cycles back, and the camera is reopened the moment the
+ * tab is looked at again. */
 let watchingTab = false;
-function watchForBackgroundedTab() {
+function watchTabVisibility() {
   if (watchingTab) return;
   watchingTab = true;
-  const hint = document.createElement("div");
-  hint.id = "bghint";
-  hint.textContent = "Bring this tab to the front — the browser will not load video in a background tab.";
-  document.body.appendChild(hint);
-  setInterval(() => {
-    const stuck = engineMode === "stream" && el.video.readyState === 0 && started;
-    // "block", not "": the stylesheet rests the hint at display none, and
-    // an empty inline value only hands control back to it.
-    hint.style.display = stuck && document.visibilityState === "hidden" ? "block" : "none";
-  }, 1000);
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
-      // A background tab needs no camera: light off, cycles saved.
       if (cameraOpen) {
         tracker.stop();
         cameraOpen = false;
@@ -1230,11 +1208,6 @@ function watchForBackgroundedTab() {
       return;
     }
     if (started) ensureCamera().catch(() => {});
-    if (engineMode === "stream" && el.video.readyState === 0 && started) {
-      el.video.load();
-      el.video.play().catch(() => {});
-      if (renderer) renderer.watchFrames();
-    }
   });
 }
 
@@ -1270,4 +1243,4 @@ loadHome().then(() => {
 });
 
 // For a console or a test harness.
-window.lazyvr = { body, controller, tracker, sync, hud, embed: embedPlayer, get request() { return request; }, get reading() { return lastReading; }, get settings() { return settings; }, get engineMode() { return engineMode; }, YAW_LIMIT };
+window.lazyvr = { body, controller, tracker, hud, embed: embedPlayer, get request() { return request; }, get reading() { return lastReading; }, get settings() { return settings; }, get engineMode() { return engineMode; }, YAW_LIMIT };

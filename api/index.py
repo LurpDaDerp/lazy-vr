@@ -1,20 +1,20 @@
-"""LazyVR on Vercel: one serverless function for search, streams and media.
+"""LazyVR on Vercel: one serverless function for search and the page.
 
-Vercel has no long-lived process, so this adapts server/app.py's three jobs
-to a function's constraints:
+Vercel has no long-lived process, so this adapts server/app.py's jobs to a
+function's constraints:
 
-* Resolved stream URLs live in module globals -- a warm instance keeps them,
-  a cold start re-resolves.  googlevideo URLs are IP-bound, so a chunk
-  served by a different instance than the one that resolved gets a 403 and
-  re-resolves in place; that is expected, not an error.
-* The media relay clamps every response to one small chunk: the platform
-  buffers function bodies with a hard ceiling, and the <video> element's own
-  range requests do the rest of the work naturally.
+* The TTL cache lives in module globals -- a warm instance keeps its
+  shelves, a cold start fetches them again.
 * Shelves are fetched with a small thread pool to fit the time budget.
 
-Any path that is not /api or /media is served from ../site, so the app is
-whole on its own: the platform may serve the static files itself (in which
-case those requests never arrive here), or route everything through this
+Video never comes through here: a youtube clip plays in youtube's own
+embedded player, straight from the visitor's browser, and a local file
+never leaves the device.  A function that cannot hold a socket open is a
+bad place to move media anyway, which is what this used to try.
+
+Any path that is not /api is served from ../site, so the app is whole on
+its own: the platform may serve the static files itself (in which case
+those requests never arrive here), or route everything through this
 service -- both work.
 """
 
@@ -23,13 +23,10 @@ from __future__ import annotations
 import json
 import mimetypes
 import os
-import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from urllib.error import HTTPError
 from urllib.parse import parse_qs
-from urllib.request import Request, urlopen
 
 mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("application/wasm", ".wasm")
@@ -40,13 +37,10 @@ mimetypes.add_type("font/woff2", ".woff2")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "server"))
 import source  # noqa: E402
 
-CHUNK = 3_500_000  # stay under the platform's response-body ceiling
 HOME_LIMIT = 8
 SEARCH_LIMIT = 24
 CATEGORY_TTL = 6 * 3600
 SEARCH_TTL = 15 * 60
-URL_MARGIN = 5 * 60
-KNOWN_CODECS = ("vp9", "av01", "avc1")
 
 CACHE = source.TTLCache()
 
@@ -57,44 +51,6 @@ def cached(key, producer, ttl):
         value = producer()
         CACHE.put(key, value, ttl)
     return value
-
-
-def prefs_from(params) -> tuple[tuple[str, ...], int]:
-    asked = [c for c in (params.get("codecs", [""])[0]).split(",") if c in KNOWN_CODECS]
-    codecs = tuple(asked) or KNOWN_CODECS
-    try:
-        max_height = max(144, min(4320, int(params.get("max", ["4320"])[0])))
-    except ValueError:
-        max_height = 4320
-    return codecs, max_height
-
-
-def picked_for(vid: str, codecs: tuple[str, ...], max_height: int, force: bool = False) -> dict:
-    import time
-    key = f"pick:{vid}:{','.join(codecs)}:{max_height}"
-    if force:
-        CACHE.drop(key)
-        CACHE.drop(f"info:{vid}")
-    picked = CACHE.get(key)
-    if picked is not None:
-        return picked
-    info = cached(f"info:{vid}", lambda: source.resolve(vid), 30 * 60)
-    chosen = source.pick_streams(info, max_height, codecs, prefer_mp4a="vp9" not in codecs)
-    picked = {"title": info.get("title"), "duration": info.get("duration"),
-              "combined": chosen["combined"], "video": chosen["video"], "audio": chosen["audio"]}
-    expires = [source.stream_expiry(picked["video"]["url"])]
-    if picked["audio"]:
-        expires.append(source.stream_expiry(picked["audio"]["url"]))
-    CACHE.put(key, picked, max(60.0, min(expires) - time.time() - URL_MARGIN))
-    return picked
-
-
-def track_json(vid, kind, fmt, codecs, max_height):
-    query = f"codecs={','.join(codecs)}&max={max_height}"
-    return {"src": f"/media/{vid}/{kind}?{query}", "height": fmt.get("height"),
-            "width": fmt.get("width"), "fps": fmt.get("fps"),
-            "codec": source.codec_family(fmt["vcodec"]) if kind == "video" else fmt.get("acodec"),
-            "ext": fmt.get("ext")}
 
 
 # ---------------------------------------------------------------- handlers
@@ -122,57 +78,6 @@ def api_search(params):
     except Exception as error:
         return 502, {"error": str(error)[:200]}
     return 200, {"query": query, "clips": clips}
-
-
-def api_streams(vid, params):
-    codecs, max_height = prefs_from(params)
-    try:
-        picked = picked_for(vid, codecs, max_height)
-    except LookupError as error:
-        return 415, {"error": str(error)}
-    except Exception as error:
-        return 502, {"error": str(error)[:200]}
-    return 200, {"id": vid, "title": picked["title"], "duration": picked["duration"],
-                 "combined": picked["combined"],
-                 "video": track_json(vid, "video", picked["video"], codecs, max_height),
-                 "audio": track_json(vid, "audio", picked["audio"], codecs, max_height)
-                 if picked["audio"] else None}
-
-
-def media(environ, start_response, vid, kind, params):
-    codecs, max_height = prefs_from(params)
-    # Clamp whatever range the browser asked for to one bounded chunk: the
-    # platform buffers function bodies with a hard ceiling, and googlevideo
-    # refuses an open-ended range on some signed urls anyway.  The <video>
-    # element comes back for the next chunk on its own.
-    asked = source.bounded_range(environ.get("HTTP_RANGE"), window=CHUNK)
-
-    for attempt in (1, 2):
-        try:
-            picked = picked_for(vid, codecs, max_height, force=attempt > 1)
-        except Exception as error:
-            return json_response(start_response, 502, {"error": str(error)[:200]})
-        fmt = picked.get(kind)
-        if not fmt:
-            return json_response(start_response, 404, {"error": f"no separate {kind} track"})
-        request = Request(fmt["url"], headers={"Range": asked})
-        try:
-            with urlopen(request, timeout=40) as upstream:
-                body = upstream.read()
-                headers = [("Cache-Control", "no-store"), ("Accept-Ranges", "bytes")]
-                for name in ("Content-Type", "Content-Range"):
-                    if upstream.headers.get(name):
-                        headers.append((name, upstream.headers[name]))
-                headers.append(("Content-Length", str(len(body))))
-                start_response(f"{upstream.status} {'Partial Content' if upstream.status == 206 else 'OK'}", headers)
-                return [body]
-        except HTTPError as error:
-            if error.code in (403, 410) and attempt == 1:
-                continue  # the signed URL went stale, or another instance resolved it
-            return json_response(start_response, 502, {"error": f"upstream said {error.code}"})
-        except OSError as error:
-            return json_response(start_response, 502, {"error": str(error)[:200]})
-    return json_response(start_response, 502, {"error": "youtube keeps refusing the stream"})
 
 
 SITE = Path(__file__).resolve().parents[1] / "site"
@@ -209,8 +114,7 @@ def static(environ, start_response):
 
 def json_response(start_response, status, obj):
     body = json.dumps(obj).encode()
-    reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 415: "Unsupported Media Type",
-               502: "Bad Gateway"}
+    reasons = {200: "OK", 400: "Bad Request", 404: "Not Found", 502: "Bad Gateway"}
     start_response(f"{status} {reasons.get(status, 'Error')}",
                    [("Content-Type", "application/json"), ("Cache-Control", "no-store"),
                     ("Content-Length", str(len(body)))])
@@ -225,7 +129,7 @@ def route_of(environ, params):
     if vkind:
         return vkind, [p for p in vpath.split("/") if p]
     parts = [p for p in environ.get("PATH_INFO", "").split("/") if p]
-    if parts and parts[0] in ("api", "media"):
+    if parts and parts[0] == "api":
         return parts[0], parts[1:]
     return "", []
 
@@ -238,12 +142,6 @@ def app(environ, start_response):
             status, obj = api_home()
         elif kind == "api" and parts == ["search"]:
             status, obj = api_search(params)
-        elif kind == "api" and len(parts) == 2 and parts[0] == "streams" and \
-                re.match(r"^[A-Za-z0-9_-]{11}$", parts[1]):
-            status, obj = api_streams(parts[1], params)
-        elif kind == "media" and len(parts) == 2 and parts[1] in ("video", "audio") and \
-                re.match(r"^[A-Za-z0-9_-]{11}$", parts[0]):
-            return media(environ, start_response, parts[0], parts[1], params)
         elif kind == "":
             return static(environ, start_response)
         else:

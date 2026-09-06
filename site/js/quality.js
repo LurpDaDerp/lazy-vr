@@ -8,8 +8,9 @@
  * so a tier's width is what must cover the screen's width, which is the
  * tier height times 16/9 -- hence the 9/16 below.
  *
- * Shared by both engines: the stream picker takes the tier as max height,
- * the embed pins the matching named level.
+ * The cap is a tier height, and youtube's player is the one engine that can
+ * act on it: it pins the named level that matches (LEVEL_HEIGHTS below).  A
+ * file off this device has only the encode it was made with.
  */
 
 export const TIERS = [144, 240, 360, 480, 720, 1080, 1440, 2160, 2880, 4320];

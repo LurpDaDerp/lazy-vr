@@ -1,14 +1,17 @@
-/* The fallback engine: youtube's own player in an iframe, steered by the
- * same body.
+/* The engine for everything from youtube: its own player in an iframe,
+ * steered by the same body.
  *
- * Used when the raw stream is refused -- a bot-challenged host, a region
- * lock, an expired URL.  Playback always works here, because it is youtube
- * playing to youtube; the price is youtube's own presentation, ads included
- * when a clip carries them, and the loss of our renderer's motion blur.
+ * Playback always works here, because it is youtube playing to youtube; the
+ * price is ads when a clip carries them, and the loss of our renderer's
+ * motion blur.
  *
  * The IFrame API exposes setSphericalProperties() on 360 uploads, so the
  * gaze pipeline steers this player exactly as it steers the WebGL sphere:
  * body.view in, camera angles out, every frame the view moved.
+ *
+ * Its own chrome is off (see playerVars): LazyVR draws a transport, a
+ * title and a heading of its own, and two of each would fight.  Every
+ * control the page needs it drives through this class instead.
  */
 
 import { LEVEL_HEIGHTS, bestAllowedLevel } from "./quality.js";
@@ -93,6 +96,7 @@ export class EmbedPlayer {
     this.container = container;
     this.player = null;
     this.sent = null;
+    this.pendingCue = null;
     this.handlers = {};
     this.maxHeight = Infinity;
     this.fov = EMBED_FOV;
@@ -118,8 +122,16 @@ export class EmbedPlayer {
     this.handlers = handlers;
     this.sent = null;
     if (this.player) {
-      this.player.loadVideoById(videoId);
       this.fit();
+      // Cue, not load: cueVideoById brings the video up without starting it,
+      // which is exactly the hold calibration wants -- loadVideoById
+      // autoplays, and raced the pause() the caller makes straight
+      // afterwards, so a clip could be several seconds in and audible under
+      // the calibration overlay.  And wait for it: returning here as soon
+      // as the call was made meant `playerReady` said yes while the player
+      // still held the *previous* video, so capHeight, pause and title all
+      // spoke to the wrong clip.
+      await this.cued(videoId);
       return;
     }
     const YT = await iframeApi();
@@ -138,8 +150,16 @@ export class EmbedPlayer {
         videoId,
         width: Math.round(width * overscan),
         height: Math.round(height * overscan),
+        // youtube's own chrome, off: `controls` takes the bottom bar and
+        // the hover gradients that would sit under our transport,
+        // `modestbranding` the logo, `rel` the end-screen grid, and
+        // `iv_load_policy` the annotations.  `disablekb` keeps its
+        // shortcuts off Space, the arrows, M and F, which app.js binds;
+        // `fs` because LazyVR owns fullscreen for the whole session.  None
+        // of this reaches the ad UI, which youtube draws regardless -- a
+        // skip button must stay there, and stay clickable.
         playerVars: {
-          autoplay: 1, controls: 0, rel: 0, iv_load_policy: 3,
+          autoplay: 1, controls: 0, modestbranding: 1, rel: 0, iv_load_policy: 3,
           playsinline: 1, disablekb: 1, fs: 0, origin: location.origin,
         },
         events: {
@@ -155,11 +175,14 @@ export class EmbedPlayer {
               settled = true;
               clearTimeout(timer);
               reject(error);
+            } else if (this.pendingCue) {
+              this.settleCue(error);
             } else if (this.handlers.onError) {
               this.handlers.onError(error);
             }
           },
           onStateChange: (event) => {
+            if (event.data === YT.PlayerState.CUED) this.settleCue();
             if (event.data === YT.PlayerState.PLAYING) {
               this.forceBest();
               this.muteCaptions();
@@ -171,6 +194,26 @@ export class EmbedPlayer {
       });
     });
     this.fit();
+  }
+
+  /* Hand the live player a new video and wait until it says it has it.
+   * The player keeps one onStateChange for its whole life, so CUED lands
+   * here however many videos have been through it. */
+  cued(videoId) {
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => this.settleCue(new Error("youtube's player never took the video")), 15000);
+      this.pendingCue = { resolve, reject, timer };
+      this.player.cueVideoById(videoId);
+    });
+  }
+
+  settleCue(error) {
+    const pending = this.pendingCue;
+    if (!pending) return;
+    this.pendingCue = null;
+    clearTimeout(pending.timer);
+    if (error) pending.reject(error);
+    else pending.resolve();
   }
 
   /* Size the reused iframe for the current window and pixel density, and
@@ -288,7 +331,20 @@ export class EmbedPlayer {
     }
   }
 
-  /* Where the clip is, in the shape the raw <video> reports. */
+  /* The video's own title, once the player has it.  A deep link arrives
+   * with nothing but an id, and this is the only place the real title
+   * exists now that nothing else asks youtube about the clip. */
+  title() {
+    const player = this.player;
+    if (!player || typeof player.getVideoData !== "function") return null;
+    try {
+      return (player.getVideoData() || {}).title || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /* Where the clip is, in the shape the <video> element reports. */
   status() {
     const YT = window.YT;
     const player = this.player;
@@ -308,6 +364,10 @@ export class EmbedPlayer {
   close() {
     this.handlers = {};
     this.sent = null;
+    // A session let go of while its video was still arriving: whoever is
+    // waiting on the cue is told, rather than left on a promise the state
+    // change for this video will never resolve.
+    this.settleCue(new Error("the video was let go of before it loaded"));
     if (this.player) {
       try { this.player.stopVideo(); } catch { /* mid-load; it will stop */ }
     }

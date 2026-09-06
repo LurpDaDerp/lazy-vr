@@ -1,4 +1,4 @@
-# LazyVR: the static page plus the search/stream server, one container.
+# LazyVR: the static page plus the search server, one container.
 #
 #   docker build -t lazyvr .
 #   docker run -p 8360:8360 lazyvr

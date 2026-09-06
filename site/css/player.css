@@ -2,10 +2,10 @@
  *
  * Looking at a corner steers the view, so nothing here may need reading
  * during playback.  Two layers.  The awake layer (#hud) is chrome: pinned
- * to the edges, up while the pointer moves, while paused, while settings
- * are open, under the youtube player; it fades when the viewer is only
- * looking around.  The peripheral layer (#periphery) is a handful of marks
- * seen without fixation, and it never fades with the chrome.
+ * to the edges, up while the pointer moves, while paused and while settings
+ * are open; it fades when the viewer is only looking around, whichever
+ * engine is playing.  The peripheral layer (#periphery) is a handful of
+ * marks seen without fixation, and it never fades with the chrome.
  *
  * No panels behind text: every mark sits straight on the picture with the
  * scrim as a text shadow (a drop shadow for the glyphs and tracks). */
@@ -59,6 +59,21 @@ body:has(#overlay:not(.gone)) #hud {
   transition: opacity var(--t-slow) var(--ease-out), visibility 0s var(--t-slow);
 }
 body.hidden-hud { cursor: none; }
+
+/* The wake catcher.  youtube's player is another document: a pointer moving
+   over it never reaches this one, so chrome that went down under it would
+   have nothing left able to bring it back.  This sheet lies over the iframe
+   and takes the pointer -- but only while the chrome is down, so the moment
+   it wakes the player's own ad controls are clickable again.  It carries no
+   listeners of its own; app.js waits on the document, and these events
+   bubble to it. */
+#wake {
+  position: fixed;
+  inset: 0;
+  z-index: 13;      /* over #hud, which is inert while asleep, and the iframe */
+  pointer-events: none;
+}
+body.embedded.hidden-hud #wake { pointer-events: auto; }
 
 /* The library needs no chrome and no marks. */
 body.browsing #hud,
