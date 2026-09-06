@@ -37,6 +37,12 @@ import { GazeEngine } from "./gaze-core.js";
  * camera never trips it, short enough to beat the viewer's patience. */
 const PERMISSION_GRACE_MS = 6000;
 
+/* A camera that is there and allowed but will not run.  Chrome says one of
+ * these two for a device it opened and could not start, and they are the
+ * only failures where trying a different camera is worth anything. */
+const cannotStart = (error) => Boolean(error)
+  && (error.name === "AbortError" || error.name === "NotReadableError");
+
 export class GazeTracker {
   /* `models`: URL of the folder with gaze_direct.onnx, the .task file, the
    * metadata and the permutation.  `onStatus(text)` reports loading stages,
@@ -251,19 +257,38 @@ export class GazeTracker {
         + "camera icon at the right of the address bar and choose Allow.");
     }, this.permissionGrace);
     let error = null;
-    let stream = null;
-    try {
-      for (const video of asks) {
+    const walk = async (list) => {
+      for (const video of list) {
         try {
-          stream = await navigator.mediaDevices.getUserMedia({ video, audio: false });
+          const got = await navigator.mediaDevices.getUserMedia({ video, audio: false });
           error = null;
-          break;
+          return got;
         } catch (caught) {
           error = caught;
           // A refusal and an empty desk are answers about the camera
-          // itself; only a failure to start is worth another shape.
-          if (caught && (caught.name === "NotAllowedError" || caught.name === "NotFoundError")) break;
+          // itself; only a failure to start is worth another ask.
+          if (caught && (caught.name === "NotAllowedError" || caught.name === "NotFoundError")) return null;
         }
+      }
+      return null;
+    };
+    let stream = null;
+    try {
+      stream = await walk(asks);
+      // Every ask so far has left the choice of camera to the browser, and
+      // chrome makes that choice from a ranking it keeps -- which can still
+      // name a webcam long since unplugged.  It opens the ghost, cannot
+      // start it, and answers AbortError with a working camera sitting
+      // behind it in the list; nothing about the ask can talk it out of
+      // that, so ask for the others by name instead.  A failure to start is
+      // the only failure worth this: by now permission has been granted, so
+      // the ids enumerate for real.
+      if (!stream && cannotStart(error)) {
+        const spent = new Set([deviceId]);
+        const named = (await GazeTracker.cameras())
+          .filter((camera) => camera.id && !spent.has(camera.id))
+          .map((camera) => ({ deviceId: { exact: camera.id }, ...shape }));
+        if (named.length) stream = await walk(named);
       }
     } finally {
       clearTimeout(nudge);
@@ -285,9 +310,10 @@ export class GazeTracker {
       // NotReadableError and AbortError are the same story from the viewer's
       // side: the camera is there, it is allowed, and it will not start --
       // almost always because something else has it.
-      if (why === "NotReadableError" || why === "AbortError") {
-        throw new Error("The camera would not start — it is probably in use by another app. "
-          + "Close anything else using it (Teams, Zoom, the Camera app) and try again.");
+      if (cannotStart(error)) {
+        throw new Error("No camera on this device would start — not the one the browser "
+          + "chose, nor any other it lists. Something else may have them open: close "
+          + "Teams, Zoom or the Camera app and try again.");
       }
       throw new Error(`The camera could not be opened (${why || error}).`);
     }

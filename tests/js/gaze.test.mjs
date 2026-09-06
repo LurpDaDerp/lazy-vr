@@ -104,18 +104,29 @@ function harness({ worker = true, processor = true, camera = "open" } = {}) {
   // an unshown permission prompt leaves getUserMedia pending for as long as
   // the page is open, and that is the case worth having a test for.
   const asked = held();
+  // Two cameras, and the one the browser reaches for first is a stale entry
+  // for a webcam that is no longer plugged in.
+  const devices = [
+    { kind: "videoinput", deviceId: "ghost", label: "USB 2.0 Camera" },
+    { kind: "videoinput", deviceId: "real", label: "NexiGo N60 FHD Webcam" },
+  ];
+  const wontStart = () => {
+    const failed = new Error("Could not start video source");
+    failed.name = "AbortError";
+    return failed;
+  };
   Object.defineProperty(globalThis, "navigator", {
     value: {
       mediaDevices: {
+        enumerateDevices: async () => devices,
         getUserMedia: async ({ video }) => {
           if (camera === "pending") return asked.promise;
           // A webcam whose driver will not start the shape asked for, but
           // which opens perfectly well when nothing in particular is asked.
-          if (camera === "fussy" && video !== true) {
-            const failed = new Error("Could not start video source");
-            failed.name = "AbortError";
-            throw failed;
-          }
+          if (camera === "fussy" && video !== true) throw wontStart();
+          // A browser whose own first choice is the camera that is not there:
+          // only naming the working one by id gets a picture.
+          if (camera === "ranked" && video?.deviceId?.exact !== "real") throw wontStart();
           return stream;
         },
       },
@@ -362,5 +373,37 @@ test("a camera that will not start at all says so in words", async () => {
     throw failed;
   };
   const tracker = new GazeTracker();
-  await assert.rejects(tracker.open(h.video), /another app|in use|could not start/i);
+  // Not "(AbortError)": a name the viewer cannot act on is not an answer.
+  await assert.rejects(tracker.open(h.video), /would start.*close|close.*would start/is);
+});
+
+// -- the browser's own first choice is not there --------------------------
+
+test("a browser that reaches for a camera that is gone is told to try the others", async () => {
+  // Chrome keeps a ranking of cameras and hands an unqualified ask its
+  // first choice, and that ranking can still name a webcam long since
+  // unplugged: the device opens, fails to start, and the ask comes back
+  // AbortError with a working camera sitting behind it in the list.
+  const h = harness({ camera: "ranked" });
+  const tracker = new GazeTracker();
+  const loading = tracker.load();
+  const opening = tracker.open(h.video);
+  await settle();
+  h.finishModels();
+  await Promise.all([loading, opening]);
+
+  assert.equal(tracker.stream, h.stream);
+  assert.equal(tracker.mode, "worker");
+});
+
+test("naming a camera that is gone still finds the one that is there", async () => {
+  const h = harness({ camera: "ranked" });
+  const tracker = new GazeTracker();
+  const loading = tracker.load();
+  const opening = tracker.open(h.video, "ghost");
+  await settle();
+  h.finishModels();
+  await Promise.all([loading, opening]);
+
+  assert.equal(tracker.stream, h.stream);
 });
