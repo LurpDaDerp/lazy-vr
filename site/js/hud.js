@@ -34,6 +34,20 @@ export function qualityLabel(height, fps) {
   return `${Math.round(height)}p${high}`;
 }
 
+/* How much of a HUD track is filled, 0..1: the timeline against the
+ * duration, the volume bar against 1.
+ *
+ * Every input is guarded because the answer reaches the DOM as a width
+ * percentage, and the CSSOM *silently drops* "NaN%": the bar would then
+ * keep whatever width it last had -- the previous clip's, in the worst
+ * case -- rather than showing an honest zero.  youtube's player answers
+ * getCurrentTime() with undefined between a load and its first frame,
+ * which is exactly that case with a duration already known. */
+export function trackFraction(value, span) {
+  if (!Number.isFinite(value) || !Number.isFinite(span) || span <= 0) return 0;
+  return Math.min(1, Math.max(0, value / span));
+}
+
 /* Which player is in use, named for the viewer, not the code. */
 export function engineLabel(mode) {
   switch (mode) {
@@ -280,7 +294,7 @@ export function createHud(doc = document) {
     paintTransport({ currentTime, duration, paused, volume, muted }) {
       const elapsed = formatClock(currentTime) || "0:00";
       const total = formatClock(duration);
-      const fraction = total && duration > 0 ? Math.min(1, Math.max(0, currentTime / duration)) : 0;
+      const fraction = trackFraction(currentTime, duration);
       const clockKey = `${elapsed}|${total}|${fraction.toFixed(4)}`;
       if (clockKey !== shownClock) {
         shownClock = clockKey;
@@ -296,7 +310,7 @@ export function createHud(doc = document) {
         const silent = muted || volume <= 0;
         el.soundIcon.setAttribute("href", silent ? "#i-sound-off" : "#i-sound");
         el.muteBtn.setAttribute("aria-label", silent ? "Unmute" : "Mute");
-        el.vollevel.style.width = `${Math.round((muted ? 0 : volume) * 100)}%`;
+        el.vollevel.style.width = `${Math.round(trackFraction(muted ? 0 : volume, 1) * 100)}%`;
       }
     },
 

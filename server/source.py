@@ -16,6 +16,14 @@ answer is in ``impersonate_options`` and ``cookie_options``: look like a
 browser while asking, and authenticate as the host configured if youtube
 challenges the address anyway.
 
+This module is also where the two deployments meet.  server/app.py and
+api/index.py answer the same two endpoints in two different runtimes, and
+the owner develops against the first and ships the second, so anything
+they would otherwise each decide for themselves -- how many clips a shelf
+holds, how long an answer is cached, how an error is worded, what
+Cache-Control a file gets -- is decided once, here, where a difference
+between local and production cannot hide.
+
 Everything here that decides -- what counts as a clip, how yt-dlp is
 configured -- is a pure function over yt-dlp's dictionaries or the
 environment, so the tests need neither yt-dlp nor the network.  Only
@@ -25,6 +33,8 @@ environment, so the tests need neither yt-dlp nor the network.  Only
 from __future__ import annotations
 
 import os
+import re
+import threading
 import time
 from urllib.parse import urlencode
 
@@ -45,6 +55,28 @@ CATEGORIES = [
 
 # Shorter than this is stingers and loops, not something to sit inside.
 MIN_SECONDS = 30
+
+# ------------------------------------------------- what both deployments answer
+#
+# server/app.py (aiohttp, for a container) and api/index.py (one WSGI
+# function, for Vercel) serve the same two endpoints from the same search.
+# Every number that shapes an answer therefore lives here and nowhere else:
+# the owner develops against the aiohttp server and deploys to Vercel, so a
+# constant copied into both files is a difference nobody sees until
+# production shows a different page from the one that was tested.
+
+HOME_LIMIT = 12
+SEARCH_LIMIT = 24
+CATEGORY_TTL = 6 * 3600
+SEARCH_TTL = 15 * 60
+
+# Models and fonts change only with a deploy; the page's own files
+# revalidate after five minutes.  The API is never cacheable: its answers
+# already come out of the server's own cache, and a proxy holding a stale
+# one on top of that is only confusing.
+ASSET_CACHE = "public, max-age=86400, stale-while-revalidate=604800"
+PAGE_CACHE = "public, max-age=300, must-revalidate"
+LONG_CACHED = ("models", "fonts")
 
 
 def search_url(query: str) -> str:
@@ -81,33 +113,83 @@ class TTLCache:
 
     Expired entries are dropped when read; entries never read again would
     otherwise pile up for the life of the process, so a put on a cache past
-    SWEEP_AT sweeps the dead ones out first."""
+    SWEEP_AT sweeps the dead ones out first.
+
+    Locked, because the Vercel function fetches the home page's eight
+    shelves across a thread pool: the sweep walks the dict, and a walk that
+    another thread inserts into raises "dictionary changed size during
+    iteration" -- a 500 for the whole page, from the cache of all places."""
 
     SWEEP_AT = 512
 
     def __init__(self, clock=time.time):
         self._values: dict = {}
         self._clock = clock
+        self._lock = threading.Lock()
 
     def get(self, key):
-        item = self._values.get(key)
-        if item is None:
-            return None
-        value, expires = item
-        if expires <= self._clock():
-            self._values.pop(key, None)
-            return None
-        return value
+        with self._lock:
+            item = self._values.get(key)
+            if item is None:
+                return None
+            value, expires = item
+            if expires <= self._clock():
+                self._values.pop(key, None)
+                return None
+            return value
 
     def put(self, key, value, ttl: float):
-        if len(self._values) >= self.SWEEP_AT:
-            now = self._clock()
-            for stale in [k for k, (_, expires) in self._values.items() if expires <= now]:
-                self._values.pop(stale, None)
-        self._values[key] = (value, self._clock() + ttl)
+        with self._lock:
+            if len(self._values) >= self.SWEEP_AT:
+                now = self._clock()
+                for stale in [k for k, (_, expires) in self._values.items() if expires <= now]:
+                    self._values.pop(stale, None)
+                # Sweeping only helps if something has actually expired, and
+                # a search key is whatever the visitor typed: a script asking
+                # a fresh nonsense question every second mints unbounded
+                # *live* entries, and on a 512mb machine that ends with the
+                # OOM killer.  When the sweep frees nothing, the oldest go.
+                while len(self._values) >= self.SWEEP_AT:
+                    self._values.pop(next(iter(self._values)))
+            self._values[key] = (value, self._clock() + ttl)
 
     def drop(self, key):
-        self._values.pop(key, None)
+        with self._lock:
+            self._values.pop(key, None)
+
+
+# An empty result is usually not the truth.  youtube answers a challenged
+# request with a results page that has no entries rather than with an
+# error, so "no clips" and "we are being blocked right now" look identical
+# from here -- and caching that under CATEGORY_TTL leaves the home page
+# blank for six hours after one bad minute.  Keep an empty answer only long
+# enough that a reloading visitor does not hammer youtube.
+EMPTY_TTL = 60
+
+
+def cache_ttl(value, ttl: float) -> float:
+    """How long an answer is worth keeping, given what the answer was."""
+    return ttl if value else EMPTY_TTL
+
+
+def clean_error(error: Exception, env=os.environ) -> str:
+    """What a viewer may be told when the search does not come back.
+
+    Two things have to come off first.  yt-dlp writes for a terminal, so
+    its messages arrive wearing log prefixes -- ``ERROR: [youtube:tab]
+    <id>:`` -- that mean nothing on a shelf.  And they quote whatever they
+    were configured with, so a failed request can carry the proxy URL,
+    credentials included, or the path of the cookie jar into an HTTP
+    response; both are named here and struck out by value.  The length cap
+    keeps a stack-trace-sized message out of the JSON."""
+    text = re.sub(r"^ERROR:\s*", "", str(error))
+    text = re.sub(r"\[[\w:]+\]\s*[\w-]*:?\s*", "", text)
+    for secret in ((env.get("LAZYVR_PROXY") or "").strip(),
+                   (env.get("LAZYVR_COOKIES_FILE") or "").strip(),
+                   _cookie_path or ""):
+        if secret:
+            text = text.replace(secret, "<redacted>")
+    return text.strip()[:200] or "unavailable"
 
 
 # ---------------------------------------------------------------- yt-dlp
@@ -174,18 +256,26 @@ def impersonate_options(env=os.environ) -> dict:
 # wiki recommends a throwaway.
 
 _cookie_path: str | None = None
+_cookie_lock = threading.Lock()
 
 
 def _materialized(content: str) -> str:
-    """The passed-by-value cookies, as the file yt-dlp insists on."""
+    """The passed-by-value cookies, as the file yt-dlp insists on.
+
+    Written once per process and guarded, because the Vercel function fans
+    the home page's shelves out across a thread pool: on a cold instance
+    four threads reach this at the same moment, and unguarded they each
+    write their own temp file and three of them leak for the life of the
+    instance."""
     global _cookie_path
-    if _cookie_path is None:
-        import tempfile
-        handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
-        handle.write(content)
-        handle.close()
-        _cookie_path = handle.name
-    return _cookie_path
+    with _cookie_lock:
+        if _cookie_path is None:
+            import tempfile
+            handle = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False, encoding="utf-8")
+            handle.write(content)
+            handle.close()
+            _cookie_path = handle.name
+        return _cookie_path
 
 
 def cookie_options(env=os.environ) -> dict:

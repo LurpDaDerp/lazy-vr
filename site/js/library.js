@@ -52,6 +52,17 @@ const loadWatcher = typeof IntersectionObserver === "function"
     }, { rootMargin: "600px" })
   : null;
 
+/* Cards about to be dropped, released from the watcher above first.  An
+ * IntersectionObserver holds a strong reference to everything it is still
+ * observing, so a card whose picture never came into view would keep its
+ * <img> -- and the strip around it -- alive for the life of the page: run
+ * the same search half a dozen times and every result set is still there.
+ * The row watcher below is disconnected for exactly this reason. */
+function releaseCards(container) {
+  if (!loadWatcher) return;
+  for (const image of container.querySelectorAll("img")) loadWatcher.unobserve(image);
+}
+
 /* One observer for every shelf row, released when the shelves are rebuilt,
  * so a row that has gone from the page is not kept alive by its watcher. */
 const rowWatcher = typeof ResizeObserver === "function"
@@ -148,6 +159,7 @@ function armShelf(row, prev, next) {
 /* The home page: one horizontal shelf per category. */
 export function renderShelves(container, categories, onPick) {
   if (rowWatcher) rowWatcher.disconnect();
+  releaseCards(container);
   container.textContent = "";
   let total = 0;
   for (const category of categories) {
@@ -171,6 +183,7 @@ export function renderShelves(container, categories, onPick) {
 
 /* Search results: a plain grid. */
 export function renderResults(grid, clips, onPick) {
+  releaseCards(grid);
   grid.textContent = "";
   for (const clip of clips) grid.appendChild(makeCard(clip, onPick));
   return clips.length;

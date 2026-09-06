@@ -61,9 +61,17 @@ export function overscanFor(width, height, dpr = 1) {
  * body never quite holds still -- the idle sway alone would otherwise post a
  * message every frame for the length of the clip, and the player would
  * redraw for a movement no one can see.  A real turn is 0.2 degrees per
- * frame at its slowest, so nothing the viewer asked for is ever missed. */
+ * frame at its slowest, so nothing the viewer asked for is ever missed.
+ *
+ * The field of view is judged exactly instead, because it is the one
+ * property here that moves only when the viewer asks: nothing nudges it past
+ * a threshold on its own.  Left out of the gate, a new field of view sat
+ * unsent until the body happened to drift a tenth of a degree -- so the
+ * slider did nothing for as long as the viewer held still to see what it had
+ * done, which is exactly when they are looking. */
 export function movedEnough(last, next, epsilon = 0.1) {
   if (!last) return true;
+  if (last.fov !== next.fov) return true;
   const yawGap = Math.abs((((next.yaw - last.yaw) % 360) + 540) % 360 - 180);
   return yawGap > epsilon
     || Math.abs(next.pitch - last.pitch) > epsilon
@@ -98,6 +106,10 @@ export class EmbedPlayer {
     this.sent = null;
     this.pendingCue = null;
     this.handlers = {};
+    // Which era of the page the player belongs to.  close() moves it on, so
+    // an open that is still building can find out that the session it was
+    // built for has gone (see open).
+    this.released = 0;
     this.maxHeight = Infinity;
     this.fov = EMBED_FOV;
     this.volume = 1;
@@ -121,6 +133,17 @@ export class EmbedPlayer {
   async open(videoId, handlers = {}) {
     this.handlers = handlers;
     this.sent = null;
+    const era = this.released;
+    // A pick that starts while youtube's script is still downloading must
+    // not build a second player: this.player is only assigned once the
+    // build below finishes, so the reuse check would miss it, append a
+    // second mount to #embed, and orphan the first player's iframe, its
+    // message listeners and its workers for the life of the page.  Join the
+    // build in flight instead and then cue into the one player, as every
+    // later pick does.  A build that failed is nobody's to inherit.
+    if (this.building) {
+      try { await this.building; } catch { /* it failed; build again below */ }
+    }
     if (this.player) {
       this.fit();
       // Cue, not load: cueVideoById brings the video up without starting it,
@@ -134,19 +157,35 @@ export class EmbedPlayer {
       await this.cued(videoId);
       return;
     }
+    let finished;
+    this.building = new Promise((resolve) => { finished = resolve; });
+    try {
+      await this.build(videoId, era);
+    } finally {
+      this.building = null;
+      finished();
+    }
+  }
+
+  /* The one player this page ever builds. */
+  async build(videoId, era) {
     const YT = await iframeApi();
     const mount = document.createElement("div");
     this.container.appendChild(mount);
     const width = this.container.clientWidth || window.innerWidth;
     const height = this.container.clientHeight || window.innerHeight;
     const overscan = overscanFor(width, height, window.devicePixelRatio || 1);
+    // Held apart from this.player, because what this call has to answer for
+    // is the player it made itself: a pick that raced youtube's script load
+    // can have put another one there by the time this build finishes.
+    let built = null;
     await new Promise((resolve, reject) => {
       let settled = false;
       const timer = setTimeout(() => {
         settled = true;
         reject(new Error("youtube's player never became ready"));
       }, 15000);
-      this.player = new YT.Player(mount, {
+      built = this.player = new YT.Player(mount, {
         videoId,
         width: Math.round(width * overscan),
         height: Math.round(height * overscan),
@@ -193,6 +232,15 @@ export class EmbedPlayer {
         },
       });
     });
+    // Escape while youtube's script and its player were still loading.
+    // close() ran when there was nothing yet to stop, and playerVars carries
+    // autoplay -- so this player came up talking, in a library where the
+    // chrome is gone, the overlay is down and nothing is left to pause it,
+    // and it kept talking until the viewer picked something else.
+    if (this.released !== era) {
+      try { built.stopVideo(); } catch { /* it never got as far as playing */ }
+      throw new Error("the video was let go of before it loaded");
+    }
     this.fit();
   }
 
@@ -203,7 +251,16 @@ export class EmbedPlayer {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => this.settleCue(new Error("youtube's player never took the video")), 15000);
       this.pendingCue = { resolve, reject, timer };
-      this.player.cueVideoById(videoId);
+      try {
+        this.player.cueVideoById(videoId);
+      } catch (error) {
+        // A player that was built but never became ready has none of its
+        // methods yet.  Letting the throw out of the executor rejects this
+        // promise but leaves pendingCue standing, and that stale record then
+        // swallows the next onError and fires its timer into somebody else's
+        // cue a quarter of a minute later.  Settle it here instead.
+        this.settleCue(error instanceof Error ? error : new Error(String(error)));
+      }
     });
   }
 
@@ -364,6 +421,9 @@ export class EmbedPlayer {
   close() {
     this.handlers = {};
     this.sent = null;
+    // Everything still on its way here belongs to a session that has ended;
+    // a build that has not finished reads this and stands down (see open).
+    this.released += 1;
     // A session let go of while its video was still arriving: whoever is
     // waiting on the cue is told, rather than left on a promise the state
     // change for this video will never resolve.

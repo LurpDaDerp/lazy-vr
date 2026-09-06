@@ -48,11 +48,19 @@ const tracker = new GazeTracker({ models: "models", onStatus: showStatus, onRead
 const embedPlayer = new EmbedPlayer(el.embed);
 const hud = createHud();
 
+/* The sphere, if this browser has one.  It draws the local-file engine and
+ * nothing else now -- a youtube clip is an iframe -- so a machine with no
+ * WebGL2 (a blocklisted GPU, software rendering off) loses "Play a file…"
+ * and keeps the rest.  It used to lose the whole page: the frame loop was
+ * never started, and selectClip refused every pick, including the ones that
+ * need no sphere at all. */
 let renderer = null;
+let rendererError = null;
 try {
   renderer = new Renderer(el.canvas, el.video);
 } catch (error) {
-  fail(error.message);
+  rendererError = error;
+  console.warn("LazyVR: no WebGL2 sphere —", error.message);
 }
 
 /* The best tier that still fits the *display* -- its full physical pixels,
@@ -97,9 +105,7 @@ function applySettings() {
   // the new one.  Calibration is kept -- the centre is a property of the
   // eyes, not of the lens -- and C is there if the new angle wants it.
   if (started && cameraOpen && settings.camera !== cameraInUse) {
-    tracker.stop();
-    cameraOpen = false;
-    el.cam.srcObject = null;
+    releaseCamera();
     ensureCamera().catch((error) => toast(error.message));
   }
 }
@@ -194,18 +200,16 @@ function frame(now) {
   if (browsing) return;
   frameMs += 0.05 * (Math.min(dt * 1000, 100) - frameMs);
   considerDownshift(now);
-  if (renderer) {
-    renderer.resize();
-    reportScreen();
-    if (started && calibrated) body.step(request, dt);
-    if (neckPending && !body.homing) {
-      neckPending = false;
-      body.freeYaw = settings.free;
-    }
-    if (!settings.blur) body.view.blur = 0;
-    if (engineMode === "embed") embedPlayer.steer(body.view);
-    else renderer.draw(body.view);
+  if (renderer) renderer.resize();
+  reportScreen();
+  if (started && calibrated) body.step(request, dt);
+  if (neckPending && !body.homing) {
+    neckPending = false;
+    body.freeYaw = settings.free;
   }
+  if (!settings.blur) body.view.blur = 0;
+  if (engineMode === "embed") embedPlayer.steer(body.view);
+  else if (renderer) renderer.draw(body.view);
   if (!hudHidden) hud.paintCompass(currentHeading());
 }
 
@@ -468,7 +472,12 @@ function paintPeripheral(media = null) {
 /* ---------- the gaze engine ---------- */
 
 function showStatus(text) {
-  if (!browsing && !calibrated) el.overlaytext.textContent = text;
+  // Not while the dots are up: a camera reopened mid-calibration (the tab
+  // came back, or the camera was changed in Settings) would replace
+  // "Hold still — measuring." with "Waiting for the camera…", and nothing
+  // would ever put the calibration's own line back.
+  if (browsing || calibrated || el.overlay.classList.contains("calibrating")) return;
+  el.overlaytext.textContent = text;
 }
 
 let loading = null;
@@ -486,14 +495,40 @@ function ensureEngine() {
 
 let cameraOpen = false;
 let cameraInUse = "";  // the device id the open camera was asked for
+let cameraOpening = null;  // the one ask in flight, shared by everyone waiting
 
-async function ensureCamera() {
-  if (cameraOpen) return;
+/* One ask at a time.  The tracker retires an open that is still out when a
+ * second one starts -- the older ask lets its stream go and throws -- so a
+ * tab switched away and back while the permission prompt raised by the pick
+ * was still on screen used to kill the very session that had asked for it,
+ * with "The camera was let go of before it finished opening." over a Try
+ * again button.  Everyone who wants the camera now waits on the same ask. */
+function ensureCamera() {
+  if (cameraOpen) return Promise.resolve();
+  if (cameraOpening) return cameraOpening;
   const wanted = settings.camera;
-  await tracker.open(el.cam, wanted);
-  cameraOpen = true;
-  cameraInUse = wanted;
-  tracker.start();
+  const mine = tracker.open(el.cam, wanted).then(() => {
+    cameraOpen = true;
+    cameraInUse = wanted;
+    tracker.start();
+  }).finally(() => {
+    // Only if it is still ours: releaseCamera may already have put a newer
+    // ask, for a different camera, in its place.
+    if (cameraOpening === mine) cameraOpening = null;
+  });
+  cameraOpening = mine;
+  return mine;
+}
+
+/* Let the camera go, wherever it has got to.  An ask still in flight is
+ * retired inside the tracker, so the promise standing for it has to go too:
+ * left there, the next ensureCamera would hand out a wait on a camera that
+ * is never coming. */
+function releaseCamera() {
+  tracker.stop();
+  cameraOpen = false;
+  cameraOpening = null;
+  el.cam.srcObject = null;
 }
 
 /* Has the camera already been granted?  Chrome shows a prompt by taking the
@@ -573,6 +608,10 @@ el.searchForm.addEventListener("submit", async (event) => {
   el.query.blur();
   el.results.hidden = false;
   el.home.hidden = true;
+  // loadHome is the only other thing that puts the skeleton away, so a
+  // search that beats it home left three shimmering shelves stacked over
+  // the results until the shelves happened to arrive.
+  el.loading.hidden = true;
   el.grid.textContent = "";
   el.resultline.textContent = `Searching youtube's 360 videos for “${query}”…`;
   try {
@@ -692,7 +731,12 @@ function toast(message) {
 const STARTUP_PATIENCE_MS = 12000;
 
 async function selectClip(clip) {
-  if (!browsing || !renderer) return;
+  if (!browsing) return;
+  // Only the file off this device needs the sphere.
+  if (clip.local && !renderer) {
+    notify(`This browser has no WebGL2, so a file off your device cannot be drawn${rendererError ? ` (${rendererError.message})` : ""}.`);
+    return;
+  }
   const my = ++session;
   browsing = false;
   started = true;
@@ -745,6 +789,11 @@ async function selectClip(clip) {
   // The camera prompt also wants the click's activation.  Ask for it now,
   // while the models finish loading in parallel.
   const camera = ensureCamera();
+  // The engine is awaited first, and a failure there returns without ever
+  // reaching the camera.  A refusal that then arrives has nobody listening
+  // for it, which the browser reports as an unhandled rejection; this marks
+  // it handled without taking the await below out of the story.
+  camera.catch(() => {});
   // A wait this long is a wait that has gone wrong -- a permission prompt
   // the browser never put on screen, models that are not going to arrive --
   // and the overlay has just hidden the one control that lets go of it,
@@ -924,9 +973,7 @@ function returnToLibrary() {
   body.rest();
   // The camera belongs to a playing session, not to browsing the shelves:
   // release it, light and all, until the next video is picked.
-  tracker.stop();
-  cameraOpen = false;
-  el.cam.srcObject = null;
+  releaseCamera();
   lastReadingAt = 0;
   lastOut = null;
   readingsStale = false;
@@ -1099,6 +1146,13 @@ async function runCalibration(headline) {
   // -- must not wake up later and fight the pass that replaced it.
   const run = ++calibrationRun;
   mediaPause();
+  // A play that was only waiting for youtube's player is now waiting for
+  // this instead.  Left standing, the moment the player said it was ready it
+  // would take the overlay away -- ring, dot, line and all -- and start the
+  // clip, and the pass would go on measuring, unseen, against wherever the
+  // viewer's eyes had followed the picture to.  finishCalibration asks again
+  // when the dots are done.
+  pendingPlay = false;
   // Calibration belongs in fullscreen: the size the video plays at.  A key
   // press or a tap carries the permission; a programmatic rerun without a
   // gesture is refused quietly and calibrates where it is.
@@ -1173,6 +1227,10 @@ document.addEventListener("keydown", (event) => {
   else if (key === "r") recentre();
   else if (key === "c") recalibrate();
   else if (key === "m") toggleMute();
+  // The play button is gated on a finished calibration; these were not, and
+  // Space during the hold started the clip behind the overlay -- the dots
+  // then measured against a moving picture the viewer's eyes had followed.
+  else if (!calibrated) { /* the dots first */ }
   else if (key === " ") { event.preventDefault(); mediaPaused() ? mediaPlay().catch(() => {}) : mediaPause(); }
   else if (key === "f") {
     document.fullscreenElement ? document.exitFullscreen() : goFullscreen().catch(() => {});
@@ -1200,11 +1258,7 @@ function watchTabVisibility() {
   watchingTab = true;
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "hidden") {
-      if (cameraOpen) {
-        tracker.stop();
-        cameraOpen = false;
-        el.cam.srcObject = null;
-      }
+      if (cameraOpen) releaseCamera();
       return;
     }
     if (started) ensureCamera().catch(() => {});
@@ -1233,7 +1287,7 @@ async function selfTest() {
 
 renderSettingsPanel(el.settings, settings);
 applySettings();
-if (renderer) requestAnimationFrame(frame);
+requestAnimationFrame(frame);
 loadHome().then(() => {
   const params = new URLSearchParams(location.search);
   if (params.has("selftest")) selfTest();

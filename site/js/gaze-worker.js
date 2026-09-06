@@ -50,11 +50,14 @@ async function handle(image, width, height, atMs) {
 
 /* Read the camera straight through, for as long as this run lasts. */
 async function pump(stream, mine) {
-  reader = stream.getReader();
+  // Its own reader, not whatever the module-level slot holds by the time
+  // this run unwinds: see release().
+  const own = stream.getReader();
+  reader = own;
   while (runId === mine) {
     let frame;
     try {
-      const next = await reader.read();
+      const next = await own.read();
       if (next.done) break;
       frame = next.value;
     } catch {
@@ -66,14 +69,21 @@ async function pump(stream, mine) {
     }
     frame.close();
   }
-  release();
+  release(own);
 }
 
-function release() {
-  if (!reader) return;
-  const finished = reader;
-  reader = null;
-  try { finished.cancel(); } catch { /* already finished */ }
+/* Let go of a reader -- by default the live one, but a finished pump names
+ * its own.  That distinction is the whole point: a pump is suspended in
+ * read() or mid-inference when its run is retired, and the next camera can
+ * be open and pumping by the time it resumes.  A release that only ever
+ * looked at the module-level slot then cancelled the *new* pump's reader as
+ * the old one unwound, and the camera light stayed on with no reading ever
+ * coming back -- which is exactly what a mid-session camera change and a
+ * return from a hidden tab both do. */
+function release(which = reader) {
+  if (!which) return;
+  if (which === reader) reader = null;
+  try { which.cancel(); } catch { /* already finished */ }
 }
 
 self.onmessage = async (event) => {
@@ -96,7 +106,9 @@ self.onmessage = async (event) => {
 
     case "stream":
       release();
-      pump(message.stream, ++runId);
+      // Not awaited -- the pump runs for the whole session -- so its failure
+      // has to be caught here or it is an unhandled rejection nobody sees.
+      pump(message.stream, ++runId).catch((error) => say({ type: "error", message: reason(error) }));
       break;
 
     case "frame":

@@ -51,6 +51,18 @@ export function bestAllowedLevel(levels, maxHeight) {
     }
   }
   if (best) return best;
-  const real = (levels || []).filter((level) => LEVEL_HEIGHTS[level]);
-  return real.length ? real[real.length - 1] : null;
+  // Nothing on offer fits, so take the least bad: the *lowest* real level,
+  // found by its height.  Taking the last of the list would only be the
+  // lowest while youtube keeps answering getAvailableQualityLevels() tallest
+  // first, which it has never promised -- and the one time it did not, this
+  // would hand a 1440p display the 8K decode the cap exists to refuse.
+  let floor = null;
+  let floorHeight = Infinity;
+  for (const level of levels || []) {
+    const height = LEVEL_HEIGHTS[level];
+    if (!height || height >= floorHeight) continue;
+    floor = level;
+    floorHeight = height;
+  }
+  return floor;
 }

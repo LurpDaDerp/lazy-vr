@@ -9,6 +9,8 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
+import vm from "node:vm";
+import { readFile } from "node:fs/promises";
 import { registerHooks } from "node:module";
 
 const STUB = "stub:gaze-core";
@@ -60,7 +62,57 @@ function fakeVideo() {
     videoWidth: 1280, videoHeight: 720, currentTime: 0,
     play: async () => {},
     addEventListener() {},
+    removeEventListener() {},
   };
+}
+
+/* The worker's own side, run for real.  gaze-worker.js is a classic worker
+ * script, not a module, so it is read and evaluated in a context holding the
+ * three globals it uses -- and never told to "load", which is the one branch
+ * that reaches for the CDN. */
+async function workerHarness() {
+  const source = await readFile(new URL("../../site/js/gaze-worker.js", import.meta.url), "utf8");
+  const sent = [];
+  const scope = {};
+  const sandbox = {
+    self: scope,
+    postMessage: (message) => sent.push(message),
+    performance: { timeOrigin: 0, now: () => Date.now() },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(source, sandbox);
+  return { sent, send: (data) => scope.onmessage({ data }) };
+}
+
+/* A frame stream the test hands frames to, and whose reader remembers being
+ * cancelled -- which is the whole question here. */
+function fakeFrames() {
+  let waiting = null;
+  const queued = [];
+  const reader = {
+    cancelled: false,
+    read() {
+      if (queued.length) return Promise.resolve(queued.shift());
+      return new Promise((resolve) => { waiting = resolve; });
+    },
+    cancel() {
+      reader.cancelled = true;
+      if (waiting) { waiting({ done: true }); waiting = null; }
+      return Promise.resolve();
+    },
+  };
+  return {
+    reader,
+    readable: { getReader: () => reader },
+    push(value) {
+      if (waiting) { waiting({ done: false, value }); waiting = null; }
+      else queued.push({ done: false, value });
+    },
+  };
+}
+
+function fakeFrame() {
+  return { displayWidth: 640, displayHeight: 480, closed: false, close() { this.closed = true; } };
 }
 
 /* The page's side of the world: a camera that answers at once, a worker
@@ -406,4 +458,121 @@ test("naming a camera that is gone still finds the one that is there", async () 
   await Promise.all([loading, opening]);
 
   assert.equal(tracker.stream, h.stream);
+});
+
+// -- a camera let go of on the very last stretch ---------------------------
+
+test("a stop while the element is still finding its size lets go rather than claiming success", async () => {
+  // The page carries the frames, so open() waits for the element to reach
+  // loadedmetadata.  A stop landing in there has already stopped the track,
+  // and a stopped track never reaches it: the await held open() for the life
+  // of the page, and the one time it did come back it said "Camera running"
+  // for a session with no camera -- which the page believes, marks open, and
+  // never asks about again.
+  const h = harness({ processor: false });
+  h.video.videoWidth = 0;
+  const tracker = new GazeTracker();
+  const loading = tracker.load();
+  const opening = tracker.open(h.video).then(() => "opened", (error) => error.message);
+  await settle();
+  h.finishModels();
+  await loading;
+  await settle();
+
+  tracker.stop();
+  const outcome = await Promise.race([
+    opening,
+    new Promise((resolve) => setTimeout(() => resolve("hung"), 800)),
+  ]);
+  assert.match(String(outcome), /let go of/,
+    outcome === "hung" ? "open() never came back" : `open() said: ${outcome}`);
+});
+
+// -- models that never arrive ---------------------------------------------
+
+test("models that never arrive say where they are coming from", async () => {
+  // gaze-core.js imports MediaPipe and onnxruntime off jsDelivr, and an
+  // import that a filter or a blocker stalls never settles and never
+  // rejects.  The overlay sat on the loading line with nothing to read.
+  const h = harness();
+  const said = [];
+  const tracker = new GazeTracker({ onStatus: (text) => said.push(text), modelGrace: 1 });
+  const opening = tracker.open(h.video);
+  await settle();
+
+  assert.match(said.at(-1), /cdn|jsdelivr|blocker/i, `the page was left on: ${said.at(-1)}`);
+
+  // Named, not abandoned: a slow line that gets there is still a success.
+  h.finishModels();
+  await opening;
+  assert.equal(said.at(-1), "Camera running");
+});
+
+// -- one slot, two askers -------------------------------------------------
+
+test("a second self-test retires the first rather than stranding it", async () => {
+  const h = harness();
+  const tracker = new GazeTracker();
+  const loading = tracker.load();
+  h.finishModels();
+  await loading;
+
+  const first = tracker.selfTest().then(() => "resolved", (error) => error.message);
+  const second = tracker.selfTest();
+  assert.match(await first, /took this one's place/);
+
+  tracker.fromWorker({ type: "selftest", worst: 1e-6 });
+  assert.equal(await second, 1e-6);
+});
+
+test("a self-test with no pipeline behind it says so", async () => {
+  harness({ worker: false });
+  const tracker = new GazeTracker();
+  await assert.rejects(tracker.selfTest(), /not loaded/);
+});
+
+// -- the worker's own reader ----------------------------------------------
+
+test("a second camera's frames are not cancelled by the first pump unwinding", async () => {
+  // A pump is suspended in read(), or mid-inference, when its run is
+  // retired, and the next camera can be open and pumping by the time it
+  // resumes -- which is what a camera change in the settings panel and a
+  // return from a hidden tab both do.  Releasing whatever the module-level
+  // slot held by then cancelled the *new* reader, so the camera light came
+  // on and not one reading ever came back.
+  const w = await workerHarness();
+  const first = fakeFrames();
+  const second = fakeFrames();
+
+  w.send({ type: "stream", stream: first.readable });
+  w.send({ type: "stream", stream: second.readable });
+  await settle();
+
+  assert.equal(first.reader.cancelled, true, "the retired pump kept its reader");
+  assert.equal(second.reader.cancelled, false, "the old pump cancelled the new pump's reader");
+
+  const frame = fakeFrame();
+  second.push(frame);
+  await settle();
+  assert.equal(frame.closed, true, "the second camera's frames were never read");
+});
+
+test("a stop lets go of the reader and the frames stop being read", async () => {
+  const w = await workerHarness();
+  const frames = fakeFrames();
+  w.send({ type: "stream", stream: frames.readable });
+  await settle();
+
+  w.send({ type: "stop" });
+  await settle();
+  assert.equal(frames.reader.cancelled, true);
+
+  // And the pump is really gone: a frame offered afterwards is left where it
+  // is rather than read, so the retired run cannot go on posting readings
+  // over the top of whatever session comes next.
+  const frame = fakeFrame();
+  frames.push(frame);
+  await settle();
+  assert.equal(frame.closed, false, "a retired pump was still reading");
+  assert.deepEqual(w.sent, []);
 });

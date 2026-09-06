@@ -5,7 +5,8 @@ import { test } from "node:test";
 
 import { PITCH_LIMIT, YAW_LIMIT } from "../../site/js/body.js";
 import {
-  HUD_IDLE_MS, engineLabel, formatClock, hudAwake, neckEdge, qualityLabel, trackerHealth,
+  HUD_IDLE_MS, engineLabel, formatClock, hudAwake, neckEdge, qualityLabel, trackFraction,
+  trackerHealth,
 } from "../../site/js/hud.js";
 
 test("clock: minutes and seconds, hours only when there are some", () => {
@@ -24,6 +25,29 @@ test("quality: the tier, with the frame rate only when it is high", () => {
   assert.equal(qualityLabel(1080, 59.94), "1080p60");
   assert.equal(qualityLabel(0, 30), null);
   assert.equal(qualityLabel(undefined), null);
+});
+
+test("tracks: the played and heard parts, clamped to their own ends", () => {
+  assert.equal(trackFraction(0, 120), 0);
+  assert.equal(trackFraction(60, 120), 0.5);
+  assert.equal(trackFraction(120, 120), 1);
+  assert.equal(trackFraction(200, 120), 1);      // past the end: still full
+  assert.equal(trackFraction(-5, 120), 0);
+  assert.equal(trackFraction(0.35, 1), 0.35);    // the volume bar
+});
+
+test("tracks: a number that is not one never reaches the DOM as NaN%", () => {
+  // The CSSOM drops width:"NaN%" without a word, which would leave the bar
+  // at the width it last had -- the previous clip's -- instead of at zero.
+  // youtube's player answers getCurrentTime() with undefined between a load
+  // and its first frame, with the duration already known.
+  assert.equal(trackFraction(undefined, 120), 0);
+  assert.equal(trackFraction(NaN, 120), 0);
+  assert.equal(trackFraction(Infinity, 120), 0);
+  assert.equal(trackFraction(30, NaN), 0);       // a duration nobody knows yet
+  assert.equal(trackFraction(30, Infinity), 0);  // a live stream
+  assert.equal(trackFraction(30, 0), 0);
+  assert.equal(trackFraction(30, -10), 0);
 });
 
 test("engine: named for the viewer", () => {

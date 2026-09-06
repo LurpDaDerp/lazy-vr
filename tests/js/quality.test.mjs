@@ -43,6 +43,14 @@ test("levels: when everything offered is too tall, take the lowest real one", ()
   assert.equal(bestAllowedLevel(["hd2160", "hd1440", "auto"], 720), "hd1440");
 });
 
+test("levels: the lowest is found by its height, not by its place in the list", () => {
+  // youtube answers tallest first today and has never promised to keep
+  // doing so.  Read the other way round, taking the last entry would hand
+  // a 720p cap the 8K decode the cap exists to refuse.
+  assert.equal(bestAllowedLevel(["auto", "hd1440", "hd2160", "highres"], 720), "hd1440");
+  assert.equal(bestAllowedLevel(["hd1440", "highres", "hd2160"], 720), "hd1440");
+});
+
 test("levels: junk offerings yield nothing", () => {
   assert.equal(bestAllowedLevel(["auto", "default"], 2160), null);
   assert.equal(bestAllowedLevel([], 2160), null);

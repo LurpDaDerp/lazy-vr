@@ -114,7 +114,10 @@ body.browsing #periphery { display: none; }
   position: absolute;
   top: var(--hud-inset);
   left: var(--hud-inset);
-  max-width: 34vw;
+  /* Yielding to the compass, which 34vw alone did not do: the ring's left
+     edge is 50vw - 160px, so a title running to 24px + 34vw crossed into it
+     below about 1150px and reached the lit arc by 800px. */
+  max-width: min(34vw, calc(50vw - 160px - var(--hud-inset) - var(--s-4)));
   font: var(--t-title);
   white-space: nowrap;
   overflow: hidden;

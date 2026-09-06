@@ -27,8 +27,6 @@
  * left lands, so looking left gives atan2(x, z) > 0.
  */
 
-import { GazeEngine } from "./gaze-core.js";
-
 /* How long a camera ask may go unanswered before the page is told why it is
  * waiting.  getUserMedia has no timeout of its own: a prompt the browser
  * decides not to put on screen -- chrome's quiet permission UI after a few
@@ -36,6 +34,15 @@ import { GazeEngine } from "./gaze-core.js";
  * pending for as long as the page is open.  Long enough that a granted
  * camera never trips it, short enough to beat the viewer's patience. */
 const PERMISSION_GRACE_MS = 6000;
+
+/* And how long the models may take before the page says where they are
+ * coming from.  gaze-core.js imports MediaPipe and onnxruntime straight off
+ * jsDelivr; if that host is slow, blocked by a filter or shot down by an
+ * extension, the import never settles and never rejects.  The wait is not
+ * abandoned -- a cold load on a slow line is genuinely this long -- but a
+ * viewer looking at a bar that has not moved deserves to know what it is
+ * waiting for, and whether it is something they can go and unblock. */
+const MODEL_GRACE_MS = 10000;
 
 /* A camera that is there and allowed but will not run.  Chrome says one of
  * these two for a device it opened and could not start, and they are the
@@ -48,10 +55,11 @@ export class GazeTracker {
    * metadata and the permutation.  `onStatus(text)` reports loading stages,
    * `onReading(reading)` gets every frame, tracked or not. */
   constructor({ models = "models", onStatus = () => {}, onReading = () => {},
-    permissionGrace = PERMISSION_GRACE_MS } = {}) {
+    permissionGrace = PERMISSION_GRACE_MS, modelGrace = MODEL_GRACE_MS } = {}) {
     this.models = models.replace(/\/$/, "");
     this.onStatus = onStatus;
     this.permissionGrace = permissionGrace;
+    this.modelGrace = modelGrace;
     // The pipeline's own last word, and whether it has said its last.  Both
     // are for open(): see the note there.
     this.loadStage = "";
@@ -120,6 +128,15 @@ export class GazeTracker {
   async loadOnce() {
     if (await this.loadWorker()) { this.loaded = true; return; }
     this.mode = "inline";
+    // Imported here rather than at the top of this file, and only once the
+    // worker has been ruled out.  gaze-core.js pulls MediaPipe and
+    // onnxruntime off a CDN in its own top-level imports, so a static import
+    // made evaluating *this* module wait on jsDelivr -- and with it every
+    // module that imports it, which is the whole page.  A CDN that is slow,
+    // filtered or blocked then stopped the site from booting at all, with no
+    // error and nothing on screen.  Now the wait belongs to load(), where the
+    // caller can report it and the viewer is told what it is waiting for.
+    const { GazeEngine } = await import("./gaze-core.js");
     this.engine = new GazeEngine({ models: this.models, onStatus: (text) => this.pipelineStatus(text) });
     this.engine.mirror = this._mirror;
     await this.engine.load();
@@ -194,8 +211,18 @@ export class GazeTracker {
   /* Prove the graph reproduces the exporter's reference frames, wherever it
    * ended up running.  Returns the worst |dgaze|. */
   selfTest() {
-    if (!this.worker) return this.engine.selfTest();
+    if (!this.worker) {
+      // load() failed or was never asked for: say so, rather than throwing a
+      // TypeError about null out of something the caller is awaiting.
+      if (!this.engine) return Promise.reject(new Error("The gaze pipeline is not loaded."));
+      return this.engine.selfTest();
+    }
     return new Promise((resolve, reject) => {
+      // There is one slot and the worker answers whichever ask is in it, so
+      // a second caller that simply overwrote it left the first promise
+      // pending for ever.  Retire it in words instead: an await with no way
+      // back is the failure this file has already been bitten by twice.
+      if (this.pendingTest) this.pendingTest.reject(new Error("A second self-test took this one's place."));
       this.pendingTest = { resolve, reject };
       this.worker.postMessage({ type: "selftest" });
     });
@@ -342,7 +369,17 @@ export class GazeTracker {
     // the models are slow, or a CDN has gone quiet, that stale line is the
     // whole of what the viewer ever sees.
     if (!this.loaded) this.onStatus(this.loadStage || "Loading the gaze pipeline…");
+    // And if the stage stops moving, name what is holding it.  A CDN import
+    // that never settles reports no stage at all, so without this the line
+    // above is the last thing the viewer ever sees, and it blames the models
+    // rather than the network they are coming over.
+    const slow = setTimeout(() => {
+      if (this.loaded) return;
+      this.onStatus("The gaze models are still coming down. They are fetched from a CDN "
+        + "(cdn.jsdelivr.net) — a network filter or a content blocker can hold them up.");
+    }, this.modelGrace);
     await this.load().catch(() => {});
+    clearTimeout(slow);
     // Seconds can pass in there, and the same abandonment applies.
     if (mine !== this.openId) {
       this.stop();
@@ -369,9 +406,30 @@ export class GazeTracker {
     this.video.playsInline = true;
     await this.video.play();
     await new Promise((resolve) => {
-      if (this.video.videoWidth) resolve();
-      else this.video.addEventListener("loadedmetadata", resolve, { once: true });
+      if (this.video.videoWidth) { resolve(); return; }
+      const settle = () => {
+        clearInterval(watch);
+        this.video.removeEventListener("loadedmetadata", settle);
+        resolve();
+      };
+      // The event on its own is not a way out.  A stop() landing in here has
+      // already stopped the track, and a stopped track never reaches
+      // loadedmetadata: the await then held open() -- and the caller behind
+      // it -- for the life of the page.  The poll is what notices that
+      // nobody is waiting on this camera any more.
+      const watch = setInterval(() => {
+        if (this.video.videoWidth || mine !== this.openId) settle();
+      }, 100);
+      this.video.addEventListener("loadedmetadata", settle, { once: true });
     });
+    // Which leaves the same abandonment one last time.  stop() has already
+    // stopped the track, so what would be left is an open() that reports
+    // "Camera running" for a session with no camera: the page believes it,
+    // marks the camera open, never asks again, and the view never moves.
+    if (mine !== this.openId) {
+      this.stop();
+      throw new Error("The camera was let go of before it finished opening.");
+    }
     this.onStatus("Camera running");
   }
 

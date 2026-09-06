@@ -48,6 +48,11 @@ const MIRROR_WIDTH = 640;
 /* If a frame takes longer than this on average the mirror pass is dropped:
  * a single pass at a usable rate beats two passes at a crawl. */
 export const MIRROR_BUDGET_MS = 45;
+/* A gap this long is not a slow device, it is no device: the camera was let
+ * go of and taken up again, or the tab went behind another and the frame
+ * callbacks were throttled to a crawl.  The rate window starts over rather
+ * than averaging across it -- see reading(). */
+export const IDLE_GAP_MS = 1000;
 
 /* Scratch for the flipped pass.  A worker has no document, and a main
  * thread that has OffscreenCanvas is better off with one anyway: it keeps
@@ -77,6 +82,12 @@ export class GazeEngine {
       fetch(`${this.models}/mirror_permutation.json`).then((r) => r.json()),
     ]);
     if (permutation.length !== NUM_LANDMARKS) throw new Error("mirror permutation must have 478 entries");
+    // Length alone is not enough: an entry outside the cloud makes
+    // mirrorCloud read undefined, which reaches the model as NaN and comes
+    // back as a gaze of NaN -- no error, no reading, nothing to look at.
+    if (!permutation.every((i) => Number.isInteger(i) && i >= 0 && i < NUM_LANDMARKS)) {
+      throw new Error("mirror permutation has an entry outside the cloud");
+    }
     this.permutation = Int32Array.from(permutation);
     const gate = meta.eye_gate || {};
     this.eyeGate = [Number(gate.low ?? 0), Number(gate.high ?? 0)];
@@ -179,10 +190,14 @@ export class GazeEngine {
       cloud = weak3dCloud(landmarks, width, height);
       context = cameraContext(landmarks, width, height, FOCAL_SCALE);
       validity = landmarkValidity(landmarks);
+      // Inside the guard with the rest: rowStatistics throws "degenerate eye
+      // width" on a hard profile turn, and outside it that throw escaped
+      // process() and set tracker.error -- the HUD said "tracker error" for
+      // what is only a face the extractor could not measure this frame.
+      context = context.concat(this.stats.push(cloud));
     } catch (error) {
       return lost();
     }
-    context = context.concat(this.stats.push(cloud));
 
     const gaze = await this.predict(cloud, context, validity);
     const [yaw, pitch] = gazeAngles(gaze);
@@ -237,6 +252,16 @@ export class GazeEngine {
   /* Wrap one frame's answer, and keep the running frame rate that decides
    * whether this device can still afford the second pass. */
   reading(sample, visibility, latencyMs, atMs) {
+    // The window measures how fast this device is going, so a stretch when
+    // it was not going at all must not count.  The engine outlives the
+    // camera: a session that ends and begins again -- the settings panel
+    // changing camera, a tab hidden and looked at again -- resumed with
+    // sixty timestamps from minutes ago still in here, and the first reading
+    // back averaged an idle minute over sixty frames.  Every period is then
+    // past the budget, so the mirror pass was dropped on the spot and stayed
+    // dropped for the rest of the run, on a machine that was keeping up fine.
+    const last = this.frameTimes[this.frameTimes.length - 1];
+    if (last !== undefined && atMs - last > IDLE_GAP_MS) this.frameTimes.length = 0;
     this.frameTimes.push(atMs);
     if (this.frameTimes.length > 60) this.frameTimes.shift();
     if (this.frameTimes.length > 1) {

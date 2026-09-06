@@ -23,11 +23,23 @@
   font: var(--t-body);
   /* One card width, shared by the shelves, their skeletons and the arrows. */
   --card-w: clamp(240px, 22vw, 320px);
+  visibility: visible;
   /* The room fades slower than a control does: 320ms, not a token. */
-  transition: opacity 320ms var(--ease-out);
+  transition: opacity 320ms var(--ease-out), visibility 0s;
 }
 
-body:not(.browsing) #library { opacity: 0; pointer-events: none; }
+/* Behind the picture: gone, not merely transparent.  A room at opacity 0 is
+   still in the tab order and still in the accessibility tree, so one Tab
+   during playback walks the keyboard into a hundred invisible cards, an
+   invisible search field and an invisible gear -- with the focus ring
+   invisible too, and no way to see where the keyboard has gone.  Visibility
+   takes them out of both, and waits for the fade the way the HUD's does. */
+body:not(.browsing) #library {
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition: opacity 320ms var(--ease-out), visibility 0s 320ms;
+}
 
 /* app.js hides sections by attribute; nothing below may set display over it. */
 #library [hidden] { display: none !important; }

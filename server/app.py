@@ -21,7 +21,6 @@ import argparse
 import asyncio
 import mimetypes
 import os
-import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -34,10 +33,9 @@ import source  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 SITE = ROOT / "site"
 
-HOME_LIMIT = 12
-SEARCH_LIMIT = 24
-CATEGORY_TTL = 6 * 3600
-SEARCH_TTL = 15 * 60
+# The limits, the TTLs and the cache headers live in source.py, shared with
+# api/index.py, so the Vercel deployment cannot quietly answer differently
+# from the one that gets developed against.
 
 # Windows can misreport these from the registry; the page depends on them.
 mimetypes.add_type("text/javascript", ".js")
@@ -60,14 +58,17 @@ async def cached(key: str, producer, ttl: float):
         value = CACHE.get(key)
         if value is None:
             value = await asyncio.to_thread(producer)
-            CACHE.put(key, value, ttl)
+            CACHE.put(key, value, source.cache_ttl(value, ttl))
     return value
 
 
-def clean_error(error: Exception) -> str:
-    """yt-dlp's messages, without its log prefixes."""
-    text = re.sub(r"^ERROR:\s*", "", str(error))
-    return re.sub(r"\[[\w:]+\]\s*[\w-]*:?\s*", "", text).strip() or "unavailable"
+def api_json(obj, status: int = 200) -> web.Response:
+    """Every API answer, shaped and headed the way Vercel's shapes it.
+
+    The error key matters: the page reads ``data.error`` and shows it, so
+    an endpoint that answers with aiohttp's own plain-text error page
+    instead of JSON leaves the viewer reading "the server said 400"."""
+    return web.json_response(obj, status=status, headers={"Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------- search
@@ -76,28 +77,28 @@ async def api_home(request: web.Request) -> web.Response:
     async def shelf(category: dict) -> dict:
         try:
             clips = await cached(f"cat:{category['id']}",
-                                 lambda q=category["query"]: source.search_360(q, HOME_LIMIT),
-                                 CATEGORY_TTL)
+                                 lambda q=category["query"]: source.search_360(q, source.HOME_LIMIT),
+                                 source.CATEGORY_TTL)
             return {"id": category["id"], "title": category["title"], "clips": clips}
         except Exception as error:  # one dead shelf must not empty the page
             return {"id": category["id"], "title": category["title"], "clips": [],
-                    "error": clean_error(error)}
+                    "error": source.clean_error(error)}
 
     shelves = await asyncio.gather(*(shelf(c) for c in source.CATEGORIES))
-    return web.json_response({"categories": list(shelves)})
+    return api_json({"categories": list(shelves)})
 
 
 async def api_search(request: web.Request) -> web.Response:
     query = " ".join((request.query.get("q") or "").split())[:100]
     if not query:
-        raise web.HTTPBadRequest(reason="q is required")
+        return api_json({"error": "q is required"}, status=400)
     try:
         clips = await cached(f"q:{query.lower()}",
-                             lambda: source.search_360(query, SEARCH_LIMIT),
-                             SEARCH_TTL)
+                             lambda: source.search_360(query, source.SEARCH_LIMIT),
+                             source.SEARCH_TTL)
     except Exception as error:
-        return web.json_response({"error": clean_error(error)}, status=502)
-    return web.json_response({"query": query, "clips": clips})
+        return api_json({"error": source.clean_error(error)}, status=502)
+    return api_json({"query": query, "clips": clips})
 
 
 # ---------------------------------------------------------------- wiring
@@ -122,16 +123,16 @@ def tailscale_ipv4() -> str:
 @web.middleware
 async def cache_headers(request: web.Request, handler):
     """aiohttp's static route sends ETag and Last-Modified but no Cache-Control,
-    so browsers guess.  Models and fonts change only with a deploy; the page's
-    own files revalidate after five minutes.  The API sets its own headers."""
+    so browsers guess.  The rule and the two header values are source.py's, so
+    that a file cached for a day here is cached for a day on Vercel too.  The
+    API sets its own (no-store) in api_json."""
     response = await handler(request)
     path = request.path
     if (request.method == "GET" and not path.startswith("/api/")
             and "Cache-Control" not in response.headers):
+        top = path.lstrip("/").split("/")[0]
         response.headers["Cache-Control"] = (
-            "public, max-age=86400, stale-while-revalidate=604800"
-            if path.startswith(("/models/", "/fonts/"))
-            else "public, max-age=300, must-revalidate")
+            source.ASSET_CACHE if top in source.LONG_CACHED else source.PAGE_CACHE)
     return response
 
 

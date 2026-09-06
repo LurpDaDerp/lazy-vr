@@ -1,4 +1,5 @@
-/* The embed fallback's pure parts: the view mapping and the send gate. */
+/* The embed engine's testable parts: the view mapping, the send gate, and
+ * the one player that carries every video the page ever plays. */
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
@@ -78,6 +79,16 @@ test("gate: movement on any axis opens it", () => {
   assert.ok(movedEnough(a, { ...a, roll: 1.5 }));
 });
 
+test("gate: a new field of view opens it with the view standing still", () => {
+  // Nothing nudges the field of view on its own, so judging it by the same
+  // tenth-of-a-degree threshold as the angles left a fresh one sitting
+  // unsent until the body happened to drift -- and a viewer working the
+  // slider is holding still to see what it does.
+  const a = { yaw: 120, pitch: 10, roll: 1, fov: 75 };
+  assert.ok(!movedEnough(a, { ...a }));
+  assert.ok(movedEnough(a, { ...a, fov: 90 }));
+});
+
 test("gate: the yaw seam at 0/360 is not movement", () => {
   assert.ok(!movedEnough({ yaw: 359.995, pitch: 0, roll: 0 }, { yaw: 0.005, pitch: 0, roll: 0 }));
   assert.ok(movedEnough({ yaw: 359, pitch: 0, roll: 0 }, { yaw: 1, pitch: 0, roll: 0 }));
@@ -138,4 +149,115 @@ test("a cue that is already settled cannot be settled twice", async () => {
   await opening;
   player.settleCue(new Error("too late"));  // must not throw or reject anything
   assert.equal(player.pendingCue, null);
+});
+
+test("a cue the player cannot take yet leaves no pending cue behind", async () => {
+  // A player built by an open that timed out is a YT.Player with none of its
+  // methods.  The throw used to escape the promise executor with pendingCue
+  // still standing -- and that stale record swallows the next onError and
+  // fires its own timer into somebody else's cue a quarter of a minute on.
+  const { player } = reused();
+  player.player.cueVideoById = () => { throw new TypeError("cueVideoById is not a function"); };
+  await assert.rejects(player.open("abc123"), /cueVideoById/);
+  assert.equal(player.pendingCue, null);
+});
+
+test("steer: a new field of view reaches the player without waiting for a turn", () => {
+  const sent = [];
+  const player = new EmbedPlayer({ clientWidth: 1280, clientHeight: 720, appendChild() {} });
+  player.player = { setSphericalProperties: (props) => sent.push(props), getIframe: () => null };
+  const view = { yaw: 0, pitch: 0, roll: 0 };
+  player.steer(view);
+  player.steer(view);
+  assert.equal(sent.length, 1, "a still view sends nothing");
+  player.fov = 100;
+  player.steer(view);
+  assert.equal(sent.length, 2, "the slider was left waiting on the body");
+  assert.equal(sent[1].fov, 100);
+});
+
+// -- the very first pick, which builds the player ---------------------------
+
+/* A stand-in for youtube's iframe API, so the build branch of open() can be
+ * driven from here.  A real YT.Player has none of its methods until it
+ * reports ready, which is exactly what the next two tests turn on. */
+const builds = [];
+
+globalThis.document = { createElement: () => ({}), head: { appendChild() {} } };
+globalThis.location = { origin: "https://lazyvr.test" };  // playerVars carries it
+window.YT = {
+  PlayerState: { ENDED: 0, PLAYING: 1, PAUSED: 2, BUFFERING: 3, CUED: 5 },
+  Player: function (mount, options) {
+    const build = { events: options.events, videoId: options.videoId, ready: false, stopped: 0, cued: [] };
+    this.getIframe = () => null;
+    this.stopVideo = () => {
+      if (!build.ready) throw new Error("the player has no methods until it is ready");
+      build.stopped += 1;
+    };
+    this.cueVideoById = (id) => {
+      if (!build.ready) throw new Error("the player has no methods until it is ready");
+      build.cued.push(id);
+    };
+    builds.push(build);
+  },
+};
+
+function firstPick() {
+  builds.length = 0;
+  return new EmbedPlayer({ clientWidth: 1280, clientHeight: 720, appendChild() {} });
+}
+
+test("a build let go of before it finishes is stopped, not left autoplaying", async () => {
+  // Escape while youtube's script and player were still coming up: close()
+  // ran when there was nothing yet to stop, and playerVars carries autoplay,
+  // so the player arrived talking -- in a library where the chrome is gone,
+  // the overlay is down and nothing was left to pause it.
+  const player = firstPick();
+  const opening = player.open("abc123");
+  await new Promise((r) => setTimeout(r, 0));
+  const build = builds[0];
+  assert.ok(build, "the player was never built");
+
+  player.close();
+  build.ready = true;
+  build.events.onReady();
+
+  await assert.rejects(opening, /let go of/);
+  assert.equal(build.stopped, 1);
+});
+
+test("a build nobody let go of is left to play", async () => {
+  const player = firstPick();
+  const opening = player.open("abc123");
+  await new Promise((r) => setTimeout(r, 0));
+  const build = builds[0];
+  build.ready = true;
+  build.events.onReady();
+  await opening;
+  assert.equal(build.stopped, 0);
+});
+
+test("two picks racing youtube's script build one player, not two", async () => {
+  // this.player is only assigned once the build finishes, so a second pick
+  // that started inside the iframe_api download used to sail past the reuse
+  // check and construct a second YT.Player -- a second mount in #embed, and
+  // the first player's iframe, message listeners and workers orphaned for
+  // the life of the page.
+  const player = firstPick();
+  const first = player.open("abc123");
+  const second = player.open("def456");
+  await new Promise((r) => setTimeout(r, 0));
+
+  assert.equal(builds.length, 1, `built ${builds.length} players`);
+  const build = builds[0];
+  build.ready = true;
+  build.events.onReady();
+  await first;
+
+  // The second pick joined the build and then cued into the one player.
+  await new Promise((r) => setTimeout(r, 0));
+  player.settleCue();
+  await second;
+  assert.equal(builds.length, 1);
+  assert.deepEqual(build.cued, ["def456"]);
 });

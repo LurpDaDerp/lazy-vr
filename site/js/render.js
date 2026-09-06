@@ -76,8 +76,34 @@ export class Renderer {
     if (!gl) throw new Error("This browser has no WebGL2, which the 360 renderer needs.");
     this.gl = gl;
     this.pendingFrame = false;
+    // Nothing may be drawn between losing the context and rebuilding on it.
+    this.lost = false;
+    this.watchContext();
     this.init();
     this.watchFrames();
+  }
+
+  /* A WebGL context is not forever.  A driver reset, a laptop waking on the
+   * other GPU, or the browser reclaiming memory from a background tab takes
+   * it away, and every object made on it -- program, buffer, texture, uniform
+   * location -- goes with it.  Left alone the loss is silent and permanent:
+   * gl calls afterwards quietly do nothing, so the video is simply black for
+   * the rest of the session with no error anywhere and nothing to click.
+   * preventDefault is what earns the restored event; init() rebuilds. */
+  watchContext() {
+    this.canvas.addEventListener("webglcontextlost", (event) => {
+      event.preventDefault();
+      this.lost = true;
+    });
+    this.canvas.addEventListener("webglcontextrestored", () => {
+      this.init();
+      this.lost = false;
+      // The new texture is a black pixel and the new context's viewport is
+      // unset; resize() would say nothing changed, since the canvas kept its
+      // size through the loss, so both have to be asked for here.
+      this.pendingFrame = true;
+      this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
+    });
   }
 
   compile(type, source) {
@@ -92,11 +118,15 @@ export class Renderer {
   init() {
     const gl = this.gl;
     const program = gl.createProgram();
-    gl.attachShader(program, this.compile(gl.VERTEX_SHADER, VS));
-    gl.attachShader(program, this.compile(gl.FRAGMENT_SHADER, FS));
+    const shaders = [this.compile(gl.VERTEX_SHADER, VS), this.compile(gl.FRAGMENT_SHADER, FS)];
+    for (const shader of shaders) gl.attachShader(program, shader);
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
     gl.useProgram(program);
+    // The linked program holds everything it needs; the shader objects are
+    // only kept alive by being attached.  One rebuild per context loss would
+    // otherwise leave the last pair behind each time.
+    for (const shader of shaders) { gl.detachShader(program, shader); gl.deleteShader(shader); }
 
     const buffer = gl.createBuffer();
     gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
@@ -153,6 +183,10 @@ export class Renderer {
   }
 
   draw(view) {
+    // Between the loss and the restore there is nothing to draw on and no
+    // program to draw with; every call would be a no-op that also reports a
+    // stream of INVALID_OPERATION into the console.
+    if (this.lost) return;
     const gl = this.gl;
     if (this.pendingFrame && this.video.readyState >= 2 && this.video.videoWidth) {
       gl.bindTexture(gl.TEXTURE_2D, this.texture);
