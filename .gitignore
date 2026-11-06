@@ -17,9 +17,27 @@ desktop.ini
 
 .vercel
 
+# Agent instruction files, settings and working folders stay local.
 CLAUDE.md
+CLAUDE.local.md
+.claude/
+AGENTS.md
+.agents/
+GEMINI.md
+.gemini/
+.codex/
+.cursor/
+.cursorrules
+.windsurf/
+.windsurfrules
+.clinerules
+.aider*
+.continue/
+.github/copilot-instructions.md
+.superpowers/
+.mcp.json
 
-# Agent-authored docs and instruction files stay local.
+# Agent-authored docs stay local.
 docs/superpowers/
 
 # Impeccable (design agent) artifacts stay local, like the other agent notes.
