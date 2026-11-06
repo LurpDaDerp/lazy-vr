@@ -89,12 +89,17 @@ export const EYE_DEFAULTS = Object.freeze({
   bPrior: -0.31,
   aSd: 0.03, bSd: 0.10,
   noiseSd: 0.015,
-  aProcessSd: 0.0015, bProcessSd: 0.0005,   // per frame
+  aProcessSd: 0.0005, bProcessSd: 0.0005,   // per frame
   bMin: -0.45, bMax: -0.15,
   robustRes: 0.03,       // robust weight min(1, robustRes/|res|)
   gate: 0.035,           // update only while |res| is below this (≈5°)...
   wideGate: 0.08,        // ...or this during the first wideGateSec of the fit
   wideGateSec: 3,
+  // A held look must not be learnt as the rest offset (it would then rebound the
+  // other way when the eyes come back). Once the median-smoothed residual leaves
+  // lockRes the axis stops fitting, and resumes only after unlockSec back inside.
+  lockRes: 0.02,         // eye widths (≈3°, steer's eyeExit)
+  unlockSec: 0.5,
   fitYawMax: 35, fitPitchMax: 25,
   // residual -> angle -> filters
   gain: 0.38,            // eye widths per unit sin(eye rotation)
@@ -142,6 +147,10 @@ export class EyeTracker {
     this.earMedian = new TimedMedian(o.earWindow);
     this.medX = new RollingMedian(o.medianFrames);
     this.medY = new RollingMedian(o.medianFrames);
+    this.resMedH = new RollingMedian(o.medianFrames);
+    this.resMedV = new RollingMedian(o.medianFrames);
+    this.lockH = { locked: false, calmSince: NaN };
+    this.lockV = { locked: false, calmSince: NaN };
     this.euroX = new OneEuro(o.oneEuro);
     this.euroY = new OneEuro(o.oneEuro);
     this.initH = new Float64Array(o.initFrames);
@@ -164,6 +173,21 @@ export class EyeTracker {
   resetFilters() {
     this.medX.reset(); this.medY.reset();
     this.euroX.reset(); this.euroY.reset();
+    this.resMedH.reset(); this.resMedV.reset();
+    // After a gap the residual history is gone: start unlocked, the gate still applies.
+    this.lockH.locked = false; this.lockH.calmSince = NaN;
+    this.lockV.locked = false; this.lockV.calmSince = NaN;
+  }
+
+  /* Fit lock for one axis from its smoothed residual; true while learning is allowed. */
+  fitOpen(lock, smoothed, tSec, wide) {
+    const o = this.opts;
+    if (wide) { lock.locked = false; lock.calmSince = NaN; return true; }
+    if (Math.abs(smoothed) > o.lockRes) { lock.locked = true; lock.calmSince = NaN; return false; }
+    if (!lock.locked) return true;
+    if (!Number.isFinite(lock.calmSince)) lock.calmSince = tSec;
+    if (tSec - lock.calmSince >= o.unlockSec) lock.locked = false;
+    return !lock.locked;
   }
 
   output(valid, blink) { return { x: this.x, y: this.y, valid, blink }; }
@@ -217,12 +241,15 @@ export class EyeTracker {
     const resH = this.fitH.residual(features.hx, sYaw);
     const resV = this.fitV.residual(features.vy, sPitch);
 
+    const wide = tSec - this.fitStart < o.wideGateSec;
+    const openH = this.fitOpen(this.lockH, this.resMedH.push(resH), tSec, wide);
+    const openV = this.fitOpen(this.lockV, this.resMedV.push(resV), tSec, wide);
     if (inFitRange) {
-      const gate = tSec - this.fitStart < o.wideGateSec ? o.wideGate : o.gate;
+      const gate = wide ? o.wideGate : o.gate;
       const r = o.noiseSd * o.noiseSd;
       const robust = (res) => Math.min(1, o.robustRes / Math.max(Math.abs(res), 1e-12));
-      if (Math.abs(resH) < gate) this.fitH.update(features.hx, sYaw, r / robust(resH), o.bMin, o.bMax);
-      if (Math.abs(resV) < gate) this.fitV.update(features.vy, sPitch, r / (robust(resV) * vWeight), o.bMin, o.bMax);
+      if (openH && Math.abs(resH) < gate) this.fitH.update(features.hx, sYaw, r / robust(resH), o.bMin, o.bMax);
+      if (openV && Math.abs(resV) < gate) this.fitV.update(features.vy, sPitch, r / (robust(resV) * vWeight), o.bMin, o.bMax);
     }
 
     const ex = Math.asin(clamp(resH / o.gain, -1, 1)) * DEG;

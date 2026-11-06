@@ -59,18 +59,32 @@ export class Latest {
 }
 
 /* Thumbnail candidates for a card.  The server hands out mqdefault
- * (320×180); hqdefault (480×360, letterboxed 4:3 that object-fit: cover
- * crops back to 16:9) always exists too, and hq720 (1280×720) exists for
- * most uploads and is tried only where the card is big enough to use it. */
+ * (320×180, the 1x picture), and hqdefault (480×360, letterboxed 4:3 that
+ * object-fit: cover crops back to 16:9) always exists too: those two are all
+ * a shelf card gets, hqdefault serving as its 2x source.  A shelf of cards at
+ * 2x would otherwise pull a 1280px JPEG per card (megabytes before anything
+ * plays).  Only the results grid's bigger cards (`large`) are offered hq720
+ * (1280×720), which some uploads lack: youtube then answers with a 120×90
+ * grey placeholder that fires load, not error, so makeCard checks what came
+ * back (isPlaceholder) and drops to the two safe sizes. */
 const YT_THUMB = /^https:\/\/i\.ytimg\.com\/vi\/([A-Za-z0-9_-]{11})\//;
 
-export function thumbSources(clip) {
+export function thumbSources(clip, { large = false } = {}) {
   const thumb = clip && typeof clip.thumb === "string" ? clip.thumb : "";
   const match = YT_THUMB.exec(thumb);
   if (!match) return { src: thumb, srcset: "", fallback: "" };
   const base = `https://i.ytimg.com/vi/${match[1]}`;
   const safe = `${base}/mqdefault.jpg 320w, ${base}/hqdefault.jpg 480w`;
-  return { src: `${base}/mqdefault.jpg`, srcset: `${safe}, ${base}/hq720.jpg 1280w`, fallback: safe };
+  return { src: `${base}/mqdefault.jpg`, srcset: large ? `${safe}, ${base}/hq720.jpg 1280w` : safe, fallback: safe };
+}
+
+/* Whether a loaded thumbnail is youtube's "no such size" placeholder: a
+ * 4:3 picture where a 16:9 hq720 was asked for.  (hqdefault is 4:3 by
+ * design, so only the optional size is judged.) */
+export function isPlaceholder(currentSrc, naturalWidth, naturalHeight) {
+  if (!/\/hq720\.jpg(?:$|\?)/.test(currentSrc || "")) return false;
+  if (!(naturalWidth > 0) || !(naturalHeight > 0)) return false;
+  return naturalWidth / naturalHeight < 1.5;
 }
 
 /* The card widths the CSS gives (library.css): shelves clamp(240px, 22vw,
@@ -122,7 +136,7 @@ const rowWatcher = typeof ResizeObserver === "function"
   ? new ResizeObserver((entries) => { for (const entry of entries) entry.target.__update?.(); })
   : null;
 
-export function makeCard(clip, onPick, sizes = SHELF_SIZES) {
+export function makeCard(clip, onPick, sizes = SHELF_SIZES, { large = false } = {}) {
   const root = document.createElement("button");
   root.className = "card";
   root.type = "button";
@@ -137,12 +151,22 @@ export function makeCard(clip, onPick, sizes = SHELF_SIZES) {
   image.decoding = "async";
   // The seat and its shimmer show until the picture is there; a picture
   // that never comes leaves a plain seat rather than a shimmer forever.
-  const sources = thumbSources(clip);
-  image.addEventListener("load", () => { strip.classList.remove("loading"); strip.classList.add("loaded"); }, { once: true });
+  const sources = thumbSources(clip, { large });
+  const safeOnly = () => sources.fallback && image.srcset !== sources.fallback;
+  // Not once: after a placeholder is swapped out, the safe picture's own
+  // load is the one that shows the card.
+  image.addEventListener("load", () => {
+    if (safeOnly() && isPlaceholder(image.currentSrc, image.naturalWidth, image.naturalHeight)) {
+      image.srcset = sources.fallback;
+      return;
+    }
+    strip.classList.remove("loading");
+    strip.classList.add("loaded");
+  });
   const failed = () => {
     // hq720 is missing for some uploads; fall back once to the sizes that
     // always exist before giving up on the picture.
-    if (sources.fallback && image.srcset !== sources.fallback) {
+    if (safeOnly()) {
       image.srcset = sources.fallback;
       return;
     }
@@ -159,7 +183,11 @@ export function makeCard(clip, onPick, sizes = SHELF_SIZES) {
     image.srcset = sources.srcset;
   }
   image.src = sources.src;
-  if (image.complete && image.naturalWidth) strip.classList.add("loaded");
+  // Already cached: loaded now, unless it is the placeholder (whose load
+  // event is still to come and swaps it out).
+  if (image.complete && image.naturalWidth && !isPlaceholder(image.currentSrc, image.naturalWidth, image.naturalHeight)) {
+    strip.classList.add("loaded");
+  }
   const badge = document.createElement("span");
   badge.className = "badge";
   const length = formatDuration(clip.duration);
@@ -255,6 +283,6 @@ export function renderShelves(container, categories, onPick) {
 export function renderResults(grid, clips, onPick) {
   releaseCards(grid);
   grid.textContent = "";
-  for (const clip of clips) grid.appendChild(makeCard(clip, onPick, GRID_SIZES));
+  for (const clip of clips) grid.appendChild(makeCard(clip, onPick, GRID_SIZES, { large: true }));
   return clips.length;
 }

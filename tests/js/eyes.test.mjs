@@ -238,6 +238,40 @@ test("EyeTracker: a voluntary look has the right sign and roughly the right size
   assert.ok(late.x > 0.8 * early.x, `held ${early.x} -> ${late.x}`);
 });
 
+test("EyeTracker: a held 6-10 deg look is not learnt as the rest offset, so returning never rebounds", () => {
+  // Synthetic features: rest offset 0.02 eye widths, 0.38 per unit sin(look), noise sd 0.008-0.014.
+  for (const sd of [0.008, 0.014]) {
+    for (const look of [6, 7, 8, 10]) {
+      for (const seed of [1, 2, 3]) {
+        const rand = rng(seed * 101 + look);
+        const eyes = new EyeTracker();
+        const f = (deg) => ({ ok: true, hx: 0.02 + 0.38 * Math.sin(deg * Math.PI / 180) + sd * gaussian(rand), vy: sd * gaussian(rand), ear: 0.3 });
+        let s = 0, x = 0;
+        for (let i = 0; i < 300; i++) eyes.update(f(0), 0, 0, (s += FRAME), true);   // 10 s at rest
+        for (let i = 0; i < 90; i++) x = eyes.update(f(look), 0, 0, (s += FRAME), true).x;   // 3 s look
+        const tag = `sd ${sd} look ${look} seed ${seed}`;
+        assert.ok(x > 0.6 * look, `${tag}: look faded to ${x}`);
+        let worst = 0;
+        for (let i = 0; i < 600; i++) worst = Math.min(worst, eyes.update(f(0), 0, 0, (s += FRAME), true).x);
+        assert.ok(worst > -5, `${tag}: rebounded to ${worst} after the eyes returned`);
+      }
+    }
+  }
+  // The same through the real pipeline (head still, a target 8 cm beside the screen centre).
+  for (const seed of [1, 2, 3]) {
+    const out = session((s) => {
+      if (s < 5) return {};
+      if (s < 8) return { target: [-8, 12, 0] };
+      if (s < 12) return {};
+      return null;
+    }, { noise: 0.3, seed });
+    const end = out.filter((r) => r.s < 8).at(-1);
+    assert.ok(end.x > 5, `seed ${seed}: look held ${end.x}`);
+    const worst = Math.min(...out.filter((r) => r.s >= 8).map((r) => r.x));
+    assert.ok(worst > -5, `seed ${seed}: rebounded to ${worst}`);
+  }
+});
+
 test("EyeTracker: blinks hold the last value, flag blink, and release 120 ms after reopening", () => {
   const plan = (s) => {
     if (s < 6) return { yaw: 10 * Math.sin(2 * Math.PI * s / 3) };

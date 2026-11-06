@@ -17,6 +17,22 @@
 <link rel="dns-prefetch" href="https://cdn.jsdelivr.net">
 <link rel="dns-prefetch" href="https://www.google.com">
 <link rel="preload" href="fonts/AtkinsonHyperlegibleNext-latin.woff2" as="font" type="font/woff2" crossorigin>
+<!-- The page's whole static module graph, so every module is fetched (and,
+     under max-age=0, revalidated) in parallel with app.js instead of one
+     import level per round trip.  Keep in step with the imports; a test
+     (tests/js/page.test.mjs) compares the two.  The tracker's worker-side
+     modules load on demand and are not listed. -->
+<link rel="modulepreload" href="js/app.js">
+<link rel="modulepreload" href="js/camera.js">
+<link rel="modulepreload" href="js/chrome.js">
+<link rel="modulepreload" href="js/embed.js">
+<link rel="modulepreload" href="js/library.js">
+<link rel="modulepreload" href="js/player.js">
+<link rel="modulepreload" href="js/quality.js">
+<link rel="modulepreload" href="js/render.js">
+<link rel="modulepreload" href="js/settings.js">
+<link rel="modulepreload" href="js/steer.js">
+<link rel="modulepreload" href="js/filters.js">
 <link rel="stylesheet" href="css/tokens.css">
 <link rel="stylesheet" href="css/base.css">
 <link rel="stylesheet" href="css/library.css">
@@ -70,7 +86,7 @@
 <!-- ==============================================================
      The player screen.
      ============================================================== -->
-<div id="player" aria-label="Player">
+<div id="player" aria-label="Player" tabindex="-1">
   <!-- Our one pointer layer over the picture: it wakes the chrome and
        handles click, double click and drag.  Over youtube's iframe it is
        also why youtube's own drag-to-look never fights the head steering;
@@ -121,10 +137,13 @@
           <span id="clock" class="clock">0:00 / –:––</span>
         </div>
         <div class="bar-group">
-          <button type="button" id="recenterbtn" class="pbtn labeled" data-tip="Recenter the view (C)">
+          <button type="button" id="recenterbtn" class="pbtn labeled" aria-label="Recenter" data-tip="Recenter the view (C)">
             <svg class="icon"><use href="#i-recenter"/></svg><span>Recenter</span>
           </button>
-          <button type="button" id="trackbtn" class="pbtn labeled" aria-pressed="true" data-tone="busy" data-tip="Head tracking (T)">
+          <!-- A toggle's name stays put while aria-pressed carries the state; the
+               changing word is its description. -->
+          <button type="button" id="trackbtn" class="pbtn labeled" aria-pressed="true" aria-label="Head tracking"
+                  aria-describedby="tracklabel" data-tone="busy" data-tip="Head tracking (T)">
             <svg class="icon"><use href="#i-tracking"/></svg><span id="tracklabel">Tracking</span>
           </button>
           <button type="button" id="setsbtn" class="pbtn" aria-label="Settings" data-tip="Settings (,)"

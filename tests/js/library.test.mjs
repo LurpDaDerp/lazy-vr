@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import { afterEach, test } from "node:test";
 
 import {
-  Latest, fetchHome, fetchSearch, formatDuration, formatViews, isAbort, thumbSources,
+  Latest, fetchHome, fetchSearch, formatDuration, formatViews, isAbort, isPlaceholder, thumbSources,
 } from "../../site/js/library.js";
 
 const realFetch = globalThis.fetch;
@@ -50,7 +50,7 @@ test("fetchHome: readable errors for a dead server, an error body and a non-JSON
 });
 
 test("thumbSources: srcset for youtube thumbs, with a fallback that drops hq720", () => {
-  const s = thumbSources({ thumb: "https://i.ytimg.com/vi/sPyAQQklc1s/mqdefault.jpg" });
+  const s = thumbSources({ thumb: "https://i.ytimg.com/vi/sPyAQQklc1s/mqdefault.jpg" }, { large: true });
   assert.equal(s.src, "https://i.ytimg.com/vi/sPyAQQklc1s/mqdefault.jpg");
   assert.match(s.srcset, /hqdefault\.jpg 480w/);
   assert.match(s.srcset, /hq720\.jpg 1280w/);
@@ -59,6 +59,28 @@ test("thumbSources: srcset for youtube thumbs, with a fallback that drops hq720"
   const other = thumbSources({ thumb: "https://example.com/x.jpg" });
   assert.deepEqual(other, { src: "https://example.com/x.jpg", srcset: "", fallback: "" });
   assert.deepEqual(thumbSources({}), { src: "", srcset: "", fallback: "" });
+});
+
+test("thumbSources: a shelf card gets only the two sizes that always exist (no 1280px pull at 2x)", () => {
+  const s = thumbSources({ thumb: "https://i.ytimg.com/vi/sPyAQQklc1s/mqdefault.jpg" });
+  assert.equal(s.srcset,
+    "https://i.ytimg.com/vi/sPyAQQklc1s/mqdefault.jpg 320w, https://i.ytimg.com/vi/sPyAQQklc1s/hqdefault.jpg 480w");
+  assert.equal(s.srcset, s.fallback);
+  assert.doesNotMatch(s.srcset, /hq720|sddefault|maxres/);
+});
+
+test("isPlaceholder: youtube's 4:3 grey stand-in for a missing hq720, and nothing else", () => {
+  const hq720 = "https://i.ytimg.com/vi/Fy6uxsLX-Xc/hq720.jpg";
+  assert.equal(isPlaceholder(hq720, 120, 90), true);
+  assert.equal(isPlaceholder(hq720, 30, 22.5), true);    // density-corrected, same shape
+  assert.equal(isPlaceholder(hq720, 1280, 720), false);
+  assert.equal(isPlaceholder(hq720, 316, 177.75), false);
+  // hqdefault is 4:3 by design; never judged.
+  assert.equal(isPlaceholder("https://i.ytimg.com/vi/Fy6uxsLX-Xc/hqdefault.jpg", 480, 360), false);
+  assert.equal(isPlaceholder("https://i.ytimg.com/vi/Fy6uxsLX-Xc/mqdefault.jpg", 120, 90), false);
+  assert.equal(isPlaceholder(hq720, 0, 0), false);
+  assert.equal(isPlaceholder("", 120, 90), false);
+  assert.equal(isPlaceholder(undefined, 120, 90), false);
 });
 
 test("formatDuration and formatViews", () => {

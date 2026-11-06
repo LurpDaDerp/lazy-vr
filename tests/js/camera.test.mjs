@@ -169,14 +169,27 @@ function harness({ worker = true, processor = true, camera = "open" } = {}) {
   });
 
   const fakeTrack = () => {
+    const listeners = new Set();
     const track = {
       kind: "video", stopped: false, ends: [],
+      // As in the browser, stop() ends the processor's stream but never fires "ended".
       stop() {
         if (track.stopped) return;
         track.stopped = true;
         for (const end of track.ends) end();
       },
       clone: () => fakeTrack(),
+      addEventListener(type, listener) { if (type === "ended") listeners.add(listener); },
+      removeEventListener(type, listener) { if (type === "ended") listeners.delete(listener); },
+      get listening() { return listeners.size; },
+      /* The source goes away (unplugged, permission revoked): the processor's
+       * stream closes and "ended" fires. The light is off, so it counts as stopped. */
+      unplug({ event = true } = {}) {
+        if (track.stopped) return;
+        track.stopped = true;
+        for (const end of track.ends) end();
+        if (event) for (const listener of [...listeners]) { listeners.delete(listener); listener({ type: "ended" }); }
+      },
     };
     env.tracks.push(track);
     return track;
@@ -305,9 +318,14 @@ async function running(options = {}, trackerOptions = {}) {
   const readings = [];
   const errors = [];
   const said = [];
+  // What onError's second argument said, and whether the camera was already let go.
+  const notes = [];
   const tracker = new HeadTracker({
     onReading: (r) => readings.push(r),
-    onError: (e) => errors.push(e),
+    onError: (e, info) => {
+      errors.push(e);
+      notes.push({ ...info, running: tracker.running, stream: tracker.stream });
+    },
     onStatus: (text) => said.push(text),
     ...trackerOptions,
   });
@@ -316,7 +334,7 @@ async function running(options = {}, trackerOptions = {}) {
   h.finishModels();
   await opening;
   await settle();
-  return { h, tracker, readings, errors, said };
+  return { h, tracker, readings, errors, said, notes };
 }
 
 const engineOf = (h, which = "worker") => globalThis.__trackerStub.engines
@@ -915,6 +933,144 @@ test("stop() in frames mode also lets go of the element and the frame loop", asy
   assert.equal(h.video.fire(), 0, "the retired chain rescheduled itself");
 });
 
+// -- a camera that goes away ---------------------------------------------------------------
+
+/* A fatal report: the tracker had already stopped and released the camera. */
+const assertFatal = (errors, notes, pattern) => {
+  assert.equal(errors.length, 1, `expected one report, got ${errors.map((e) => e.message).join(" | ")}`);
+  assert.match(errors[0].message, pattern);
+  assert.equal(errors[0].fatal, true);
+  assert.equal(notes[0].fatal, true);
+  assert.equal(notes[0].running, false, "the listener heard before the tracker stopped");
+  assert.equal(notes[0].stream, null, "the listener heard before the camera was let go");
+};
+
+test("a camera unplugged mid-session stops the tracker and says so, once, as fatal", async () => {
+  const { h, tracker, errors, notes } = await running();
+  const worker = h.worker;
+  h.stream.getVideoTracks()[0].unplug();
+  await settle();
+
+  assertFatal(errors, notes, /camera stopped/i);
+  assert.equal(tracker.running, false);
+  assert.equal(tracker.stream, null);
+  assert.ok(worker.posted.some((m) => m.type === "stop"));
+});
+
+test("a frame stream that closes under a live run is reported by the worker, as fatal", async () => {
+  const { h, tracker, errors, notes } = await running();
+  const run = tracker.runId;
+  h.stream.getVideoTracks()[0].unplug({ event: false });
+  await settle();
+
+  assert.ok(h.worker.sent.some((m) => m.type === "ended" && m.run === run), "the worker kept quiet");
+  assertFatal(errors, notes, /camera stopped/i);
+  assert.equal(tracker.running, false);
+});
+
+test("a camera unplugged in frames mode stops the tracker as well", async () => {
+  const { h, tracker, errors, notes } = await running({ processor: false });
+  assert.equal(tracker.mode, "frames");
+  h.stream.getVideoTracks()[0].unplug();
+  await settle();
+
+  assertFatal(errors, notes, /camera stopped/i);
+  assert.equal(tracker.running, false);
+  assert.equal(h.video.srcObject, null);
+});
+
+test("stop() is not a camera going away: nothing is reported", async () => {
+  const { h, tracker, errors } = await running();
+  const track = h.stream.getVideoTracks()[0];
+  tracker.stop();
+  await settle();
+  assert.equal(track.listening, 0, "the stopped session still listens to its track");
+  assert.ok(!h.worker.sent.some((m) => m.type === "ended" && m.run === tracker.runId));
+  assert.equal(errors.length, 0);
+});
+
+test("after a crash only the live clone is watched, and its end is fatal", async () => {
+  const { h, tracker, errors, notes } = await running();
+  const old = h.processor.track;
+  h.worker.crash();
+  await settle();
+  assert.equal(errors.length, 1);
+  assert.notEqual(tracker.error && tracker.error.fatal, true, "a recovered crash is not fatal");
+  assert.equal(notes[0].fatal, false);
+  assert.equal(old.listening, 0, "the cloned-away track is still watched");
+  assert.equal(tracker.running, true);
+
+  h.processor.track.unplug();
+  await settle();
+  assert.equal(errors.length, 2);
+  assert.match(errors[1].message, /camera stopped/i);
+  assert.equal(notes[1].fatal, true);
+  assert.equal(notes[1].running, false);
+});
+
+test("a stream-mode camera that never delivers a picture is given up on", async () => {
+  const { tracker, errors, notes } = await running({}, { pictureTimeout: 40 });
+  assert.equal(tracker.mode, "worker");
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assertFatal(errors, notes, /never delivered a picture/);
+  assert.equal(tracker.running, false);
+});
+
+test("a stream-mode camera that delivers is not given up on", async () => {
+  const { h, tracker, errors, readings } = await running({}, { pictureTimeout: 40 });
+  h.processor.frames.push(fakeFrame(1_000_000));
+  await settle();
+  assert.equal(readings.length, 1);
+  await new Promise((resolve) => setTimeout(resolve, 80));
+  assert.equal(errors.length, 0);
+  assert.equal(tracker.running, true);
+  tracker.stop();
+});
+
+// -- a retired ask asks nothing more ---------------------------------------------------------
+
+const notReadable = () => Object.assign(new Error("Could not start video source"), { name: "NotReadableError" });
+
+test("a stop while a busy camera is being asked for asks no other camera", async () => {
+  const h = harness();
+  const asks = [];
+  const first = held();
+  navigator.mediaDevices.getUserMedia = async ({ video }) => {
+    asks.push(video);
+    if (asks.length === 1) {
+      await first.promise;
+      throw notReadable();
+    }
+    return { getTracks: () => [], getVideoTracks: () => [] };
+  };
+  const tracker = new HeadTracker({ permissionGrace: 1e9 });
+  const opening = tracker.open(h.video, "busy");
+  await settle();
+  tracker.stop();
+  first.release();
+  await assert.rejects(opening, /let go/);
+  assert.equal(asks.length, 1, `a retired open went on to ask for ${JSON.stringify(asks.slice(1))}`);
+});
+
+test("a stop during the walk over every camera ends the walk", async () => {
+  const h = harness();
+  const asks = [];
+  const ghost = held();
+  navigator.mediaDevices.getUserMedia = async ({ video }) => {
+    asks.push(video);
+    if (video?.deviceId?.exact === "ghost") await ghost.promise;
+    throw notReadable();
+  };
+  const tracker = new HeadTracker({ permissionGrace: 1e9 });
+  const opening = tracker.open(h.video);
+  await settle();
+  assert.deepEqual(asks.at(-1).deviceId, { exact: "ghost" }, "the walk over named cameras never began");
+  tracker.stop();
+  ghost.release();
+  await assert.rejects(opening, /let go/);
+  assert.ok(!asks.some((ask) => ask?.deviceId?.exact === "real"), "a retired walk asked for the next camera");
+});
+
 // -- a worker that dies -----------------------------------------------------------------
 
 test("a worker that crashes mid-session is restarted once and the session carries on", async () => {
@@ -1001,6 +1157,47 @@ test("when nothing can be restarted the camera is let go and the listener told",
   assert.equal(tracker.running, false);
   assert.equal(h.lightOn(), false);
   assert.equal(tracker.error, errors[1]);
+});
+
+test("a recovery that gives up has let the camera go before the fatal report", async () => {
+  const { h, errors, notes } = await running();
+  globalThis.__trackerStub.engineLoad = () => Promise.reject(new Error("CDN gone"));
+  h.worker.crash();
+  await settle();
+
+  assert.equal(notes[0].fatal, false, "the crash itself is being recovered");
+  assert.match(errors[1].message, /could not be restarted/);
+  assert.equal(errors[1].fatal, true);
+  assert.deepEqual([notes[1].fatal, notes[1].running, notes[1].stream], [true, false, null]);
+});
+
+test("a recovery with no session open that fails is not fatal", async () => {
+  const h = harness();
+  const notes = [];
+  const tracker = new HeadTracker({ onError: (e, info) => notes.push(info) });
+  const loading = tracker.load();
+  h.finishModels();
+  await loading;
+  globalThis.__trackerStub.engineLoad = () => Promise.reject(new Error("CDN gone"));
+  h.worker.crash();
+  await settle();
+  assert.deepEqual(notes.map((n) => n.fatal), [false, false]);
+  assert.equal(tracker.running, false);
+});
+
+test("a rewire that fails after a crash stops the tracker and reports it as fatal", async () => {
+  const { h, tracker, errors, notes } = await running({ processor: false });
+  h.video.videoWidth = 0;
+  h.video.play = async () => { throw Object.assign(new Error("denied"), { name: "NotAllowedError" }); };
+  h.worker.crash();
+  // attachVideo polls every 100 ms for the failed play().
+  for (let i = 0; i < 40 && errors.length < 2; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+
+  assert.equal(errors.length, 2);
+  assert.match(errors[1].message, /would not play/);
+  assert.deepEqual([notes[1].fatal, notes[1].running, notes[1].stream], [true, false, null]);
+  assert.equal(tracker.running, false);
+  assert.equal(h.lightOn(), false);
 });
 
 test("a crash with no session open restarts quietly, and the next open uses it", async () => {

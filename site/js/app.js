@@ -15,8 +15,11 @@
  */
 
 import { HeadTracker } from "./camera.js";
-import { diagnosticsRows, isVideoId, qualityLabel, stepVolume, videoIdFrom } from "./chrome.js";
-import { EmbedPlayer } from "./embed.js";
+import {
+  PERMANENT_REFUSALS, diagnosticsRows, isVideoId, qualityLabel, retryableRefusal, trackerGaveUp, transportSnapshot,
+  videoIdFrom, volumeStep,
+} from "./chrome.js";
+import { EmbedPlayer, refusal } from "./embed.js";
 import { Latest, fetchHome, fetchSearch, isAbort, renderResults, renderShelves } from "./library.js";
 import { PlayerUI } from "./player.js";
 import { MISSING_API_CAP, StallMonitor, chooseTier, decodeCap, tierBelow } from "./quality.js";
@@ -34,6 +37,7 @@ const el = {
   searchForm: $("search"), query: $("query"), grid: $("grid"), notice: $("libnotice"),
   empty: $("libempty"), emptytech: $("libemptytech"), emptyretry: $("emptyretry"), emptyfile: $("emptyfile"),
   loading: $("libloading"), local: $("local"), localfile: $("localfile"), volumeWrap: document.querySelector(".volume"),
+  player: $("player"),
 };
 
 const absNowSec = () => (performance.timeOrigin + performance.now()) / 1000;
@@ -56,7 +60,7 @@ const tracker = new HeadTracker({
   models: "models",
   onStatus: (text) => { trackerStatus = text; },
   onReading,
-  onError: (error) => console.warn("LazyVR head tracking:", error && error.message ? error.message : error),
+  onError: onTrackerError,
 });
 const embed = new EmbedPlayer(el.embed);
 embed.fov = settings.fov;
@@ -215,7 +219,13 @@ function setVolume(volume) {
 
 let volumeShowTimer = null;
 function volumeBy(delta) {
-  setVolume(stepVolume(settings.muted ? 0 : settings.volume, delta));
+  // Muted, ↓ changes nothing (the remembered level survives); ↑ unmutes from it.
+  const next = volumeStep(settings, delta);
+  if (next) {
+    settings = { ...settings, ...next };
+    applySound();
+    saver.save(settings);
+  }
   // Show the slider for a moment so the key press has something to answer it.
   el.volumeWrap.classList.add("open");
   clearTimeout(volumeShowTimer);
@@ -373,13 +383,18 @@ function trackingUiState() {
 }
 
 function paintUi() {
+  // Ended with a known duration pins the clock to the end (transportSnapshot),
+  // so the live time and buffer are only read when they will be shown.
   const playable = phase === "playing" || phase === "loading" || phase === "ended";
-  ui.paintTransport({
-    currentTime: playable ? mediaTime() : 0,
-    duration: playable ? mediaDuration() : NaN,
-    buffered: !playable ? 0 : engine === "embed" ? embed.bufferedFraction() : localBuffered(),
+  const duration = playable ? mediaDuration() : NaN;
+  const live = playable && !(phase === "ended" && Number.isFinite(duration));
+  ui.paintTransport(transportSnapshot({
+    phase,
+    time: live ? mediaTime() : 0,
+    duration,
+    buffered: !live ? 0 : engine === "embed" ? embed.bufferedFraction() : localBuffered(),
     paused: mediaPaused(),
-  });
+  }));
   const buffering = phase === "playing" && (engine === "embed" ? embed.buffering : localBuffering && !el.video.paused);
   ui.setBuffering(buffering);
   ui.setTracking(trackingUiState());
@@ -440,10 +455,18 @@ document.addEventListener("fullscreenchange", () => {
 /* Three stalls in a minute: size the layout one tier down for the rest of
  * this video, never back up. */
 function stepQualityDown() {
-  const below = tierBelow(embed.tier);
-  if (!below || below.w < 1280) return;
-  tierCeiling = below;
-  applyTier();
+  // In a narrow window adjacent tiers can clamp to the same layout (K_MAX),
+  // so keep stepping until the iframe's layout actually shrinks.
+  const before = embed.layout().innerW;
+  let tier = embed.tier;
+  for (;;) {
+    const below = tierBelow(tier);
+    if (!below || below.w < 1280) return;
+    tierCeiling = below;
+    applyTier();
+    if (embed.layout().innerW < before) break;
+    tier = below;
+  }
   if (!stallToasted) {
     stallToasted = true;
     toast("Lowering quality to keep it smooth");
@@ -486,9 +509,9 @@ function embedHandlers(my) {
     onBuffering: () => onMediaBuffering(my),
     onPaused: () => { if (session === my) stalls.paused(absNowSec()); },
     onEnded: () => onMediaEnded(my),
-    onError: (message) => {
+    onError: (message, code) => {
       if (session !== my || !playerOpen) return;
-      showError(`youtube would not play this video: ${message}.`);
+      showError(`youtube would not play this video: ${message}.`, { retry: retryableRefusal(code) });
     },
     onAutoplayBlocked: () => {
       if (session === my && playerOpen && phase !== "ended") ui.showBigPlay("blocked");
@@ -585,7 +608,7 @@ function startMedia(my) {
     applyTier();
     embed.open(clip.id, embedHandlers(my)).catch((error) => {
       if (session !== my || !playerOpen) return;
-      showError(`youtube's player would not start: ${error.message}.`);
+      showError(`youtube's player would not start: ${error.message}.`, { retry: retryableRefusal(refusalCode(error)) });
     });
   } else {
     renderer.setFov(settings.fov);
@@ -594,6 +617,14 @@ function startMedia(my) {
     renderer.setSource();
     mediaPlay();
   }
+}
+
+/* A refusal before youtube's player was ready arrives as an Error; its code
+ * is on it when embed.js attaches one, else read back from the message. */
+function refusalCode(error) {
+  if (error && Number.isFinite(error.code)) return error.code;
+  const message = error && error.message;
+  return PERMANENT_REFUSALS.find((code) => refusal(code) === message) ?? null;
 }
 
 /* Pick from the library (a click: a user gesture). */
@@ -802,13 +833,27 @@ function setTrackingOff() {
   ui.setTracking(trackingUiState());
 }
 
-function cameraUnavailable(reason) {
+function cameraUnavailable(reason, message = NO_CAMERA, ms = 2800) {
   stopCamera();
   trackingWanted = false;
   cameraBlocked = reason || "unavailable";
   steering.setEnabled(false);
   ui.setTracking("unavailable");
-  toast(NO_CAMERA);
+  toast(message, ms);
+}
+
+/* The tracker reports its errors here.  Once it has given up (a fatal
+ * report: it has already stopped itself), the session falls back to tracking
+ * off: the button says so, the picture keeps playing and drag still looks
+ * around, and T or the button asks for the camera again. */
+function onTrackerError(error, info) {
+  const message = error && error.message ? error.message : String(error);
+  console.warn("LazyVR head tracking:", message);
+  if (!trackerGaveUp({
+    fatal: Boolean(info && info.fatal), running: tracker.running, playerOpen, trackingWanted, cameraState,
+  })) return;
+  const why = message.replace(/[.\s]+$/, "");
+  cameraUnavailable(message, `Head tracking stopped (${why}). Drag to look around, or press T to try again.`, 6000);
 }
 
 async function startCamera(my, { fullscreenAfter = false } = {}) {
@@ -887,11 +932,27 @@ document.addEventListener("visibilitychange", () => {
   }
 });
 
-/* A click in youtube's iframe (the skip-ad hole) carries the keyboard into
- * another document where nothing listens; take it back. */
+/* youtube's iframe is another document: a key pressed while it has focus
+ * never reaches the shortcuts, and nothing shows where focus went.  So it is
+ * kept out of the tab order (whenever youtube builds or rebuilds it), and a
+ * click that does carry focus in (the skip-ad hole) has it taken back on the
+ * next tick -- a synchronous blur() inside the window's blur event does not
+ * move focus out of a cross-origin frame.  #player (tabindex -1) takes it:
+ * focusing a chrome button instead would hold the chrome awake. */
+const untabIframes = () => {
+  for (const frame of el.embed.querySelectorAll("iframe")) {
+    if (frame.getAttribute("tabindex") !== "-1") frame.setAttribute("tabindex", "-1");
+  }
+};
+untabIframes();
+new MutationObserver(untabIframes).observe(el.embed, { childList: true, subtree: true });
+
 window.addEventListener("blur", () => {
   const active = document.activeElement;
-  if (active && active.tagName === "IFRAME" && el.embed.contains(active)) active.blur();
+  if (!(active && active.tagName === "IFRAME" && el.embed.contains(active))) return;
+  setTimeout(() => {
+    if (playerOpen && document.activeElement === active) el.player.focus({ preventScroll: true });
+  }, 0);
 });
 
 /* ---------- the library ---------- */

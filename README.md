@@ -1,124 +1,390 @@
-# LazyVR — steer YouTube's 360 videos with your eyes
+# LazyVR — steer YouTube's 360 videos with your head
 
-A web page. Open it, pick a 360 video — off YouTube's shelves, by search, or
-a file on your own disk — and look around: look left and the view turns left,
-look back to the middle and it stops where it is. No headset, no mouse, no
-install.
+A web page. Pick a 360 video off YouTube's shelves, by search, or from a
+file on your own disk, and turn your head to look around inside it. It runs
+in an ordinary browser tab with a webcam. There is no headset, no install
+and no calibration step. The camera picture is processed in your browser and
+never leaves the device.
 
-Two pieces. The **page** does everything perceptual in the browser: the
-webcam, the face landmarks, the gaze model, the control law, the rendering.
-The **server** is small and does only one thing a browser cannot: it asks
-YouTube's search, through `yt-dlp` and filtered to 360° uploads, because
-YouTube's results page carries no CORS headers for a page to read it with.
+There are two pieces:
 
-A YouTube clip then plays in **YouTube's own embedded player**, which the
-browser loads straight from YouTube; the gaze pipeline steers it through
-the player's spherical API. So playback is on YouTube's terms — its
-presentation, and ads on the clips that carry them (a viewer's own YouTube
-Premium applies) — and not one video byte passes through this server. An
-earlier version pulled the raw streams instead, which meant no ads and also
-meant breaking YouTube's terms of service; that path is gone.
+- **The page** (`site/`, plain ES modules, no build step) does everything
+  perceptual: the webcam, face landmarks, head pose, the steering law and
+  the player.
+- **The server** (`server/`, or `api/index.py` on Vercel) does the one thing
+  a browser cannot. It runs YouTube's search through `yt-dlp`, filtered to
+  360° uploads, because YouTube's results page has no CORS headers. It never
+  sees a camera frame or a video byte.
 
-Gaze comes from the `gaze-direct` model: 478 MediaPipe landmarks into one
-ONNX graph, out comes a camera-frame gaze vector. No head-pose solver and no
-personal calibration beyond one short centring pass per visit.
+A YouTube clip plays in **YouTube's own embedded player**, loaded by the
+browser straight from YouTube and steered through the player's spherical
+API. Playback is on YouTube's terms: its ads on the clips that carry them
+(your own YouTube Premium applies), its view counts, its sign-in.
 
-## Run it
+## Quick start
 
 ```
 pip install -r server/requirements.txt
 python server/app.py                    # http://127.0.0.1:8360/
 ```
 
-Or as a container:
+Open the page, pick a video and allow the camera. Sit facing the screen.
+After about a second of holding roughly still the view is centred on
+wherever you are facing, and from then on turning your head turns the view.
+`C` recentres.
+
+The camera needs a secure page: `localhost` works, and so does any
+`https://` host. A plain `http://` address on another machine shows the
+library but cannot use the camera.
+
+## How steering works
+
+### Head pose, relative to the screen
+
+The pipeline runs per camera frame, normally in a worker (see *Where the
+tracking runs*):
+
+1. **MediaPipe FaceLandmarker** (`@mediapipe/tasks-vision` 1.0.1, VIDEO
+   mode, one face, iris landmarks included) finds 478 face landmarks on the
+   raw, unmirrored frame. It tries the GPU delegate first and falls back to
+   the CPU.
+2. **solvePnP** (`pose.js`, hand-written) fits MediaPipe's canonical face
+   model to 29 rigid landmarks (nose, eye corners, nose base, forehead,
+   cheekbones; no lips, lids, brows or jaw). It uses Levenberg–Marquardt on
+   SO(3) with Huber-weighted residuals, warm-started from the previous
+   frame. The camera's focal length comes from an assumed 78° diagonal field
+   of view.
+3. **Screen-relative orientation.** The raw solve gives the head's rotation
+   relative to the camera. That is not what you want: lean to one side while
+   still looking at the middle of the screen and your head *is* rotated
+   relative to the camera. So `pose.js` places a pivot roughly where the
+   neck turns (8 cm below and 9 cm behind the eye midpoint), smooths it, and
+   measures the head's orientation relative to the ray from that pivot to
+   the screen centre. The screen centre is assumed to be 12 cm below the
+   camera, which is the **Camera position** setting (above: 12 cm, below:
+   −10 cm, beside/other: 0). The result: moving around in the frame, leaning
+   back, or sitting off to one side while facing the screen all read as
+   "looking at the centre", and only actually turning your head counts.
+4. **Gates.** A frame is not used for control when the fit is poor
+   (normalised reprojection error above 0.06, or above 3× its running 2 s
+   median), when the pose jumps more than 25° in one frame (held as a
+   suspected outlier unless the next frame lands within 8° of it), when the
+   eye corners or nose tip are within 2% of the frame edge, or when the head
+   is nearer than 20 cm or farther than 200 cm. Beyond 25° of yaw the
+   landmarks on the far side of the face are down-weighted.
+
+### The hybrid law
+
+`steer.js` turns the screen-relative pose into a view. Its numbers are
+`STEER_DEFAULTS`:
+
+| | Value | |
+|---|---|---|
+| Filter | One Euro, min cutoff 0.4 Hz, β 0.05, d-cutoff 1 Hz | on head yaw and pitch, with the frames' capture times |
+| Position zone | gain ×3 (× Sensitivity); yaw ±20°, pitch ±25° of head | the view follows your head, magnified, and springs back when you face the screen again |
+| Rate zone (yaw only) | past 20° of head yaw, ramping (smoothstep) to 90°/s (× Turn speed) at 35° | hold your head turned and the view keeps turning, all the way round and beyond |
+| Rate dwell | 0.15 s | the head must stay past 20° this long, roughly settled, before turning starts |
+| Look-away freeze | yaw beyond 45° (released below 40°), pitch beyond 35° (released below 30°) | you looked away from the screen, so the view holds |
+| Face lost | no tracked frame for 0.5 s | the view holds |
+| View pitch limit | ±85° | |
+| Follower | critically damped spring, ω = 22 rad/s; 9 rad/s for 0.5 s after a freeze, recentre or toggle | runs at display rate, so a 30 Hz tracker still gives smooth motion |
+
+In practice, with Sensitivity at 1:
+
+- Within ±20° of yaw the view sits at 3× your head angle, up to ±60°.
+  Facing the screen again brings it back. Pitch works the same way up to
+  25° of head pitch (±75° of view) and has no rate zone.
+- Between 20° and 35° the position term stays at the edge and a turning rate
+  is added on top, so the view is continuous across the boundary. The rate
+  only starts after the head has stayed past 20° for 0.15 s, moving at under
+  30°/s and not swinging back toward the centre. A head swinging out to look
+  at something else, or coming back from one, passes through without
+  starting a turn.
+- Turning accumulates. Bring your head back inside 20° and the view stays
+  turned by however far it went; the position zone then works around the
+  new heading. `C` or the Recenter button clears it.
+- Past 45° (yaw) or 35° (pitch) you are looking away from the screen. The
+  view holds where it was, the turning stops, and "Looking away — view held"
+  shows after 0.6 s. When you face the screen again the view glides back to
+  the live position.
+- If the face is lost (out of frame, covered, too dark) the view holds the
+  same way. A single dropped frame does not count; 0.5 s without a tracked
+  frame does, and "Face lost" shows after 1 s. A turn in progress stops after
+  two consecutive untracked frames, so the view never keeps spinning on a
+  stale angle.
+
+### Auto-zero, no calibration
+
+There is no calibration screen. "Straight ahead" (the neutral) is learnt
+from you:
+
+- At the start of a session, and after the tracking is switched back on,
+  the state is "acquiring" and the view holds still. The neutral becomes the
+  median of the first 20 consecutive frames in which the head is moving
+  under 15°/s and facing within ±15° of the screen. At 30 Hz that is about
+  0.7 s.
+- If you are steadily off-axis instead (a camera far to one side, a reclined
+  seat) and stay that way for 3 s, that pose is accepted as your rest pose.
+- Afterwards, whenever you are settled within ±4° of the neutral, the neutral
+  eases toward your current pose with a 30 s time constant, so slow drift in
+  posture is absorbed without your noticing.
+- A face found again after being lost keeps the existing neutral.
+
+**`C` (Recenter)** clears all accumulated turning and dragging and glides
+the view back to the video's front. If you are tracked, steady, inside the
+position zone and facing the screen, your current pose becomes the new
+neutral at once. Otherwise (for example you are looking down at the keyboard
+to find `C`) it re-acquires as above, so a glance at the keys never becomes
+"straight ahead".
+
+### The eye nudge
+
+On top of the head, where your eyes look adds a small offset: at most ±10°
+of yaw and ±6° of pitch. It only applies while the head is inside the
+position zone and tracking normally, and it can be switched off with
+**Eye assist**.
+
+It needs no calibration because it does not try to measure absolute gaze.
+`eyes.js` measures each iris in "eye widths" along the line between that
+eye's corners, which cancels head roll and distance. Turning your head while
+watching the screen also moves the iris in its socket (the vestibulo-ocular
+reflex, plus parallax). That coupling is fitted online per axis as
+`h = a + b·sin(head angle)` with a small Kalman filter, and only the residual
+counts. The residual is the part of the eye movement your head pose does not
+explain, which is close to zero whenever you look at your usual spot from
+any head angle. A held look is not learnt as the new rest position: the fit
+stops updating while the residual is large. Blinks are detected from the eye
+aspect ratio (below 0.65× its running 3 s median, or below 0.15) and held
+through, plus 120 ms.
+
+`steer.js` then applies a deadzone with hysteresis (on above 5° of eye
+angle, off below 3°) and maps 4°–20° of eye yaw to 0–10° of view (4°–14°
+of pitch to 0–6°). The result springs toward its target with a 0.15 s time
+constant, and back to zero when your eyes return to rest, blink for longer
+than 0.5 s, or the head leaves the zone.
+
+### Tracking off
+
+`T` or the Tracking button switches head tracking off. The camera is
+released and the light goes off. The head and eye contribution glides out,
+and dragging still works. Switching it back on opens the camera and
+auto-zeroes again.
+
+## The player
+
+Picking a card opens the player with the video already playing:
+
+- If the camera is already allowed, the page goes fullscreen and tracking
+  starts.
+- If the browser has not asked yet, a small sheet over the playing video
+  explains what the camera is for, with **Use camera** and **Watch without
+  camera**. The browser's prompt comes first and fullscreen after it,
+  because Chrome drops a page out of fullscreen to show a permission prompt.
+  If fullscreen is refused by then, the next click anywhere enters it.
+- If the camera is blocked or missing, the video plays with tracking off and
+  a toast says so.
+
+The first time per visit a hint appears: "Turn your head to look around · C
+recenters". While the neutral is being acquired a small "Tracking" pulse
+shows in the corner.
+
+The controls are a YouTube-style bar that hides 2.5 s after the pointer
+stops, cursor included. It stays up while paused, at the end of the video,
+while settings are open, while the pointer is over a control, while a panel
+is showing, and while a control has keyboard focus.
+
+- Top: back to library, title.
+- Seek bar: click or drag; buffered range and hover time. As a focused
+  slider, arrows move ±5 s, PageUp/PageDown ±10 s, and Home/End jump to the
+  ends.
+- Bottom: play/pause, mute with a volume slider, `elapsed / duration`,
+  **Recenter**, **Tracking** (Tracking, Finding you, Starting, Face lost,
+  Tracking off, No camera), **Settings**, **Fullscreen**.
+
+Only three things show over the video while the bar is hidden: "Face lost",
+"Looking away — view held", and a thin buffering line along the top edge.
+
+On the picture itself, a click plays or pauses (after a 220 ms wait to rule
+out a double click), a double click toggles fullscreen, and a press-and-drag
+looks around. Over YouTube's iframe these are handled by a transparent layer
+of the page's own, so YouTube's drag-to-look never fights the head steering.
+So that ads stay skippable, while the bar is showing that layer has a hole
+where YouTube draws "Skip ad": the right 24% of the width, between 9% and
+26% up from the bottom. Wake the bar (move the mouse), then click Skip.
+
+At the end of the video a panel offers **Replay** and **Back to library**.
+Errors show inline with **Retry** (when retrying could help) and **Back to
+library**.
+
+### Keyboard shortcuts
+
+| Key | |
+|---|---|
+| `Space` / `K` | Play or pause |
+| `←` / `→` | Back or forward 5 seconds |
+| `J` / `L` | Back or forward 10 seconds |
+| `↑` / `↓` | Volume (5% steps) |
+| `M` | Mute |
+| `F` | Fullscreen |
+| `C` | Recenter the view |
+| `T` | Head tracking on or off |
+| `,` | Settings |
+| `Esc` | Close settings, or back to the library |
+| `?` | These shortcuts |
+
+Shortcuts only act in the player. Keys with Ctrl, Cmd or Alt held are
+ignored, and so is auto-repeat (except the arrows). They are also ignored
+while typing in a field, inside the settings panel, and on a focused
+button's own Space/Enter. In fullscreen the first `Esc` only leaves
+fullscreen (the browser takes it); a second one goes back to the library.
+The browser's Back button also returns to the library. While the library is
+showing, only `Esc` (closing settings) does anything.
+
+`?v=<youtube-id>` (or the older `?video=`) opens the player directly with
+one Play button, since sound and fullscreen need a click.
+
+### Watching without a camera
+
+**Watch without camera**, a refused camera, or tracking switched off all
+leave the view under the pointer. Drag the picture to look around. It works
+like grabbing the world, as on YouTube: drag right and the picture moves
+right. One pixel of drag is `field of view / window width` degrees on both
+axes. Drag also works while tracking is on: it adds to the head's view, and
+`C` clears it.
+
+### Settings
+
+Settings are saved on the device (`localStorage`, key `lazyvr.settings`) and
+apply immediately, mid-video included.
+
+- **Steering**: Sensitivity (×0.5–×2, how far the view turns for a head
+  turn), Turn speed (×0.5–×2, the rate zone's speed), Eye assist, Invert
+  horizontal, Invert vertical.
+- **Picture**: Field of view (60–120°, horizontal, default 100°), Max
+  quality (Auto, 1080p, 1440p, 4K, 8K), and a read-only "Playing at …" line.
+- **Camera**: device, and Camera position (above, below or beside the
+  screen).
+- **Interface**: Diagnostics. A small readout appears bottom-left showing
+  state, filtered head pose, eye angle, view, tracker rate, latency and mode,
+  quality label and layout scale, and display fps.
+- **Reset steering & picture** puts those two groups back to defaults and
+  leaves volume, camera and diagnostics alone.
+
+### A video off your own disk
+
+**Play a file…**, or dropping a video anywhere on the page, plays it on a
+WebGL2 sphere with the same steering, keys and drag. The file is never
+uploaded: the page points a `<video>` element at an object URL. Anything the
+browser can decode works; H.264 or VP9 in MP4 or WebM is the safe choice.
+The footage should be equirectangular. A file has only the one encode it was
+made with, so none of the quality logic below applies.
+
+## Picture quality for 360
+
+**Why a viewport-sized stream looks soft.** A 360 frame spreads its width
+around the whole circle, but the window shows only the field of view. A
+1920-wide stream viewed at 100° puts about 533 source pixels across a
+1920-pixel window, a 3.6× upscale. To pixel-match the window, the stream
+needs to be
+
+```
+required width = 360 × window width (CSS px) × devicePixelRatio / horizontal FOV
+```
+
+which for a 1920 px window at 100° is about 6900 px. YouTube labels 360
+tiers by frame width (hd2160 is 3840 wide), and `quality.js` picks the
+smallest tier on the ladder (720p, 1080p, 1440p, 4K, 8K, plus the small
+ones) that covers the required width, limited by a cap.
+
+**Layout scaling.** The embedded player ignores every documented quality
+call (`setPlaybackQuality`, `vq`, `suggestedQuality` have done nothing since
+2019). It picks its tier from the iframe's *layout* size. So `embed.js`
+lays the iframe out at `k × window size`, with `k = tier width / window
+width` clamped to 1–3, and draws it back at window size with
+`transform: scale(1/k)` inside an overflow-hidden stage. With a capped tier
+narrower than the window, `k` can go down to 0.5 (laid out smaller, scaled
+up), which is the only way to honour a lower cap. The fit is redone,
+debounced, on resize and on entering or leaving fullscreen.
+
+**The cap.**
+
+- **Decode cap**: `MediaCapabilities.decodingInfo` is asked about VP9 and
+  AV1 at 3840×1920 and 7680×3840. A tier is allowed if at least one codec is
+  reported supported, smooth *and* power-efficient: 8K, else 4K, else 1440p.
+  If the API is missing or does not answer, the cap is 4K. Browsers answer
+  optimistically, so this is permission to try rather than a guarantee.
+- **Auto** (the default Max quality) is `min(decode cap, 4K)`. Auto never
+  asks for 8K.
+- **Max quality** 1080p, 1440p or 4K is honoured as chosen. 8K is still
+  bounded by the decode cap.
+- **Stall step-down**: three buffering stalls within 60 s (not counting the
+  first 3 s of playback, the 5 s after a seek, or the brief buffering
+  YouTube shows on every resume from pause) step the layout down one tier
+  for the rest of that video, never below 720p and never back up. A toast
+  says "Lowering quality to keep it smooth" once. Opening a video again
+  starts from the full target.
+
+What is actually playing is shown in Settings ("Playing at 2160p") and in
+the diagnostics readout. An upload that was never encoded at the target
+tier simply plays at its best.
+
+## Privacy
+
+- Camera frames are processed in the browser, normally in a worker. They are
+  never uploaded, recorded or sent to the server. There is no camera preview.
+- The server only answers search requests and serves static files.
+- The face model (`site/models/face_landmarker.task`) is served by the site.
+  MediaPipe's code and wasm come from jsDelivr.
+- The camera is released (light off) when you leave the player, switch
+  tracking off, or hide the tab. It reopens when the tab comes back if
+  tracking was on.
+- YouTube videos play in YouTube's own embed, which sees what any YouTube
+  embed sees. Local files are never uploaded.
+- Settings live in `localStorage` on the device. One `sessionStorage` flag
+  remembers that the hint was shown this visit.
+
+## Where the tracking runs
+
+`camera.js` (`HeadTracker`) opens the camera (ideal 1280×720 at 30 fps,
+user-facing) on the page, because `getUserMedia` only exists there. It hands
+frames to `tracker-worker.js`, which hosts `TrackerEngine`
+(`tracker-core.js`). It uses the best transport the browser offers:
+
+| Mode | How frames get there | Cost to the page |
+|---|---|---|
+| `worker` | a `MediaStreamTrackProcessor` stream (buffer of 1) is transferred to the worker | nothing per frame |
+| `frames` | no processor (Firefox, Safari): one 640-px-wide `ImageBitmap` at a time, each acknowledged, so one is ever in flight | the grab |
+| `inline` | no usable worker: the engine runs on the page | all of it |
+
+The worker is a classic worker that loads ES modules with dynamic `import()`,
+because MediaPipe's wasm loader uses `importScripts()`, which module
+workers do not allow. Every session has a run
+id, and readings from a previous session are dropped. If the worker crashes
+after loading it is restarted once, then the tracker falls back to inline
+mode. After five consecutive detector failures on the GPU it switches to the
+CPU once.
+
+## Running it
+
+### Locally
+
+```
+pip install -r server/requirements.txt
+python server/app.py                    # http://127.0.0.1:8360/
+python server/app.py --host 0.0.0.0     # serve beyond this machine
+python server/app.py --port 9000        # or set $PORT
+```
+
+### Docker
 
 ```
 docker build -t lazyvr .
 docker run -p 8360:8360 lazyvr
 ```
 
-## Host it
-
-The container is the whole product — page and search — and nothing in it
-refers back to any particular machine. Every visitor's webcam and gaze
-inference belong to *their* browser: the models load onto the visiting
-device and the server never sees a camera frame. It never sees a video
-frame either — it answers search and hands out static files, and that is
-the whole of it. The server listens on `$PORT` when a platform injects one
-(else 8360) and binds `0.0.0.0` inside the container.
-
-Pick a platform — each terminates HTTPS for you, which is exactly what the
-camera needs:
-
-- **Fly.io** — `fly launch --copy-config --name <yours>`, then `fly deploy`
-  (`fly.toml` is committed).
-- **Render** — *New → Blueprint* on the repo; `render.yaml` does the rest.
-  The free plan sleeps between visits.
-- **Railway** — *Deploy from repo*; the Dockerfile is detected.
-- **Any VPS / home server** — `docker run -d --restart unless-stopped -p
-  8360:8360 lazyvr` behind Caddy or nginx for TLS — or `tailscale serve
-  --bg 8360` for a tailnet-only `https://…ts.net` URL with no reverse proxy
-  at all.
-- **Vercel** — `vercel` deploys a preview, `vercel --prod` the real thing.
-  There is no long-lived server there, so `api/index.py` (wired by
-  `vercel.json`) re-implements the API as one serverless function: shelves
-  and search work the same, cached in module globals that a warm instance
-  keeps and a cold start refills. A function that cannot hold a socket open
-  is a fine place to answer search and was a terrible one to move video
-  through, which is part of why nothing moves video any more.
-
-Two hosting realities. Neither is bandwidth: no video passes through here,
-so the smallest free tier is genuinely enough.
-
-- `yt-dlp` rots as YouTube changes; redeploy with a fresh one when the
-  shelves come up empty. Install it with `curl-cffi` alongside (both
-  requirements files ask for it) — that is what keeps a cloud host off
-  youtube's bot challenge, and it matters far more there than at home.
-- YouTube sometimes challenges **datacenter IPs** ("confirm you're not a
-  bot"). If search dies on a cloud host but works from home, that is what
-  happened; a home or tailnet host is rarely challenged, and cookies are
-  the cure when it strikes (next section).
-
-### When youtube challenges the server ("confirm you're not a bot")
-
-All the server ever asks youtube for is a results page, so there is less to
-tune than there used to be — but `server/source.py` does what there is, and
-it is worth knowing before reaching for cookies.
-
-**What the request looks like.** youtube reads the TLS and HTTP/2 handshake
-before it reads a cookie, and python's own fingerprint on a datacenter IP is
-exactly the pair that gets challenged. `curl-cffi` is in both requirements
-files for that reason: with it installed, requests carry Chrome's
-fingerprint. It is optional at runtime — without it the server asks for no
-impersonation rather than failing — and `LAZYVR_IMPERSONATE=off` opts out.
-
-**A different IP.** `LAZYVR_PROXY=socks5://host:port` when an address is
-simply burnt.
-
-If all of that still gets challenged, give yt-dlp cookies. They must belong
-to the machine the **server** runs on — a site can never read a visitor's
-own youtube cookies, and must not try. Three ways in, by environment
-variable:
-
-| Variable | Meaning |
-|---|---|
-| `LAZYVR_COOKIES_FROM_BROWSER` | read a browser profile on the server's own machine: `chrome`, `edge`, `firefox`, or `chrome:Profile 1` |
-| `LAZYVR_COOKIES_FILE` | path to a Netscape-format `cookies.txt` |
-| `LAZYVR_COOKIES` | the file's *content*, passed by value — the shape a platform secret takes |
-
-For Vercel, export cookies on your own machine and hand them over as a
-secret. **Close the browser first** — a running Chrome locks its cookie
-database and the export fails — then:
-
-```
-yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download "https://www.youtube.com/watch?v=jNQXAC9IVRw"
-vercel env add LAZYVR_COOKIES        # paste the content of cookies.txt
-vercel deploy
-```
-
-Cookies make every request count against that google account, and accounts
-used this way can be rate-limited or flagged; the yt-dlp wiki recommends a
-throwaway account, and it is good advice.
+The container is the whole product, page and search. It listens on `$PORT`
+when a platform sets one (else 8360) and binds `0.0.0.0`. Put TLS in front of
+it, because the camera only works on a secure page.
 
 ### From another device on your tailnet
 
@@ -126,435 +392,228 @@ throwaway account, and it is good advice.
 python server/app.py --tailscale
 ```
 
-binds localhost plus this machine's Tailscale IP, so any device signed into
-your tailnet can open `http://<tailscale-ip>:8360/` — the exact URL is
-printed at startup. The LAN stays closed; only the tailnet is let in. If a
-remote device cannot connect, Windows' firewall is blocking inbound Python —
-accept the prompt it shows on first bind, or allow the port once.
+This binds localhost plus this machine's Tailscale IP, so any device on your
+tailnet can open `http://<tailscale-ip>:8360/`. The exact URL is printed at
+startup. The LAN stays closed. If a remote device cannot connect, Windows'
+firewall is blocking inbound Python; accept the prompt it shows on first
+bind, or allow the port once.
 
-One catch: browsers hand the camera only to a **secure** page, and
-`http://100.x…` is not one, so a remote device can browse the library but
-cannot start gaze steering. `tailscale serve --bg 8360` is the proper fix:
-it publishes the same server at `https://<machine>.<tailnet>.ts.net/` with a
-real certificate, camera included (`tailscale serve reset` undoes it).
+A plain `http://100.x…` address is not a secure page, so a remote device can
+browse but cannot start head tracking. `tailscale serve --bg 8360` publishes
+the same server at `https://<machine>.<tailnet>.ts.net/` with a real
+certificate, camera included (`tailscale serve reset` undoes it).
 
-Picking a video goes fullscreen for the session (`Esc` leaves the video,
-`F` toggles). Chrome will ask for the camera the first time, and because it
-shows that prompt by dropping the page *out* of fullscreen, the first ask
-is made before the fullscreen rather than inside it; the page goes
-fullscreen once the prompt is answered, and asks for one more click if the
-browser wants a fresh gesture by then. Then a lamp-lit dot appears in the
-middle of the screen inside a thin ring: the ring counts three seconds
-down, then fills while you hold still, so your eyes never have to leave
-the dot to know how it is going. That
-one hold teaches the player where your neutral gaze sits — look away and it
-starts over. It runs once a visit, `C` reruns it whenever you shift in your
-seat, a real change of screen size — fullscreen, a snapped window — pauses
-the video and reruns it by itself, and the camera is released — light off —
-whenever you are back in the library.
+### Hosting
 
-| Key | |
+No video passes through the server, so the smallest free tier is enough.
+Every platform below terminates HTTPS for you.
+
+- **Fly.io**: `fly launch --copy-config --name <yours>`, then `fly deploy`
+  (`fly.toml` is committed).
+- **Render**: *New → Blueprint* on the repo; `render.yaml` does the rest.
+  The free plan sleeps between visits.
+- **Railway**: *Deploy from repo*; the Dockerfile is detected.
+- **Any VPS or home server**: `docker run -d --restart unless-stopped -p
+  8360:8360 lazyvr` behind Caddy or nginx for TLS, or `tailscale serve --bg
+  8360` for a tailnet-only `https://…ts.net` URL.
+- **Vercel**: see below.
+
+### Vercel
+
+`vercel` deploys a preview, `vercel --prod` production. `vercel.json` sets
+it up as:
+
+- **The page from the CDN.** `outputDirectory` is `site/` with no build
+  step, so the HTML, modules, fonts and face model are static files on
+  Vercel's CDN. `index.html` is `no-cache`; `/js/*` and `/css/*` are
+  `max-age=0, must-revalidate` (ETag revalidation keeps the modules in step
+  after a deploy); `/models/*` and `/fonts/*` are cached for a week.
+- **`/api/*` to one Python function.** A rewrite sends `/api/home` and
+  `/api/search` to `api/index.py`, which imports `server/source.py` (the same
+  search code the aiohttp server uses). Root `requirements.txt` is the
+  function's dependencies. Answers are cached in module globals while an
+  instance stays warm and single-flighted per key. They also carry
+  `s-maxage` so the edge holds them: home for 6 hours when every shelf
+  succeeded (5 minutes when some failed), searches for 15 minutes.
+- **Headers.** `nosniff`, `strict-origin-when-cross-origin` (the embed
+  refuses to play without a referrer, error 153), and a `Permissions-Policy`
+  allowing the camera for the site and fullscreen/autoplay for YouTube. No
+  COOP/COEP, which would break the iframe.
+
+`.vercelignore` keeps tests, docs and other local files out of the upload.
+
+### Keeping search alive
+
+- `yt-dlp` breaks as YouTube changes. When the shelves come up empty,
+  redeploy with a fresh one. Install `curl-cffi` alongside it (both
+  requirements files include it): that keeps a cloud host off YouTube's bot
+  challenge, and it matters far more there than at home.
+- YouTube sometimes challenges **datacenter IPs** ("confirm you're not a
+  bot"). If search fails on a cloud host but works from home, that is what
+  happened. A home or tailnet host is rarely challenged, and cookies fix it
+  when it does happen.
+
+#### When YouTube challenges the server
+
+The server only ever asks YouTube for a results page, and
+`server/source.py` does what it can before cookies are needed.
+
+**What the request looks like.** YouTube reads the TLS and HTTP/2 handshake
+before it reads a cookie, and Python's own fingerprint on a datacenter IP is
+exactly the combination that gets challenged. With `curl-cffi` installed,
+requests carry Chrome's fingerprint. It is optional at runtime: without it
+the server asks for no impersonation rather than failing.
+`LAZYVR_IMPERSONATE=off` opts out.
+
+**A different IP.** `LAZYVR_PROXY=socks5://host:port` when an address is
+simply burnt.
+
+If that still gets challenged, give yt-dlp cookies. They must belong to the
+machine the **server** runs on; a site can never read a visitor's own
+YouTube cookies, and must not try.
+
+| Variable | Meaning |
 |---|---|
-| `R` | recentre — sweep back to the start; gaze is ignored until it arrives |
-| `C` | recalibrate — look at the dot |
-| `Space` | play / pause |
-| `M` | mute |
-| `↑` `↓` | volume |
-| `F` | fullscreen |
-| `←` `→` | seek five seconds |
-| `S` | settings |
-| `Esc` | back to the library |
+| `LAZYVR_COOKIES_FROM_BROWSER` | read a browser profile on the server's own machine: `chrome`, `edge`, `firefox`, or `chrome:Profile 1` |
+| `LAZYVR_COOKIES_FILE` | path to a Netscape-format `cookies.txt` |
+| `LAZYVR_COOKIES` | the file's *content*, passed by value (the form a platform secret takes) |
 
-The HUD — the clip's title, the horizon ring with the heading, the quality,
-engine and tracker marks, the transport line and the key hints — looks after
-itself the way a video player's controls do: three seconds into a playing
-video it fades out, cursor included, and the first movement of the pointer
-brings it back. Pausing, the settings panel and calibration all hold it
-open, and so does a window that has lost the focus to another application —
-it cannot see the pointer that would bring the chrome back. It fades over
-youtube's player exactly as it does over the sphere: the iframe is another
-document and keeps every pointer move to itself, so a transparent sheet
-lies over it while the chrome is down and hands the movement on. A few
-marks never fade, because they are needed while you are looking around and
-can be seen without being looked at: a lost face, the neck at its limit (a
-soft band on the edge you are pushing), a stalled picture (a line along the
-top edge), and pause. Looking at anything in a corner steers the view
-toward it — the deadzone is under two degrees — so
-nothing in the HUD is meant to be *read* during playback; the developer's
-readout and gaze stick are behind a Diagnostics switch in settings.
-
-On a phone there is no keyboard; the buttons that matter appear on screen.
-
-The **settings** button (or `S` while playing) opens a panel: sensitivity,
-deadzone, field of view, full-360 turning, motion blur, per-axis inversion,
-and a max-quality override for the display-matched cap. Everything applies
-live — mid-video included — and is saved on the device.
-
-**Full 360° turning** switches the neck off. By default the view has one —
-120° either way, tiring as it nears the end (see *The body*) — which reads
-like a person but does stop. Switch it on and yaw never ends: keep looking
-left and the view keeps coming round, as many times as you like. Pitch still
-stops at 100° either way, up or down, in both modes; there is no version of
-this where looking straight up and carrying on is anything but sickening.
-Switching the neck back *on* while the view is somewhere a neck could not
-reach sweeps home rather than snapping onto the limit.
-
-`?selftest` on the URL runs the gaze graph in *your* browser against the
-exporter's eight reference frames and reports the worst deviation, without
-opening a camera. `?video=<youtube-id>` jumps straight to one upload.
-
-## Where the videos come from
-
-The home page is shelves — Nature, Thrill, Ocean, Wildlife, Cities, Space,
-Flight, Music — and the top bar searches by keyword. Both go through
-`/api/…` on the server, which runs the query against YouTube's own search
-with the **360° feature filter** (the `sp` parameter YouTube's search UI
-sets when you tick that box). Only equirectangular uploads carry the flag,
-so the filter is also the projection check: everything that comes back
-renders correctly on the sphere. No API key is involved. Shelves are cached
-for six hours, searches for fifteen minutes.
-
-### A video off your own disk
-
-**Play a file…** in the top bar — or drop a video anywhere on the page —
-plays it through the same sphere, with the same gaze steering, the same
-calibration and the same keys. The file never leaves the device: the page
-points a `<video>` element at an object URL and nothing is uploaded, copied
-or sent to the server, which is not consulted at all. Anything the browser
-can decode works; H.264 or VP9 in MP4 or WebM is the safe pair, and the
-footage wants to be equirectangular like everything else here. The one
-thing that differs is quality — a file has the one encode it was made with,
-so the automatic downshift has nothing to offer and stands down.
-
-### A video off YouTube
-
-Picking one from the library hands its id to **youtube's own iframe
-player**, loaded by the browser straight from youtube and steered by the
-same gaze pipeline through the player's spherical API. Everything about
-the video is youtube's: the bytes, the ads, the view count, the sign-in —
-exactly as on youtube.com. The server is not in the path at all once the
-library card has been clicked.
-
-This is a trade, and it is worth naming both halves. It costs youtube's
-presentation, ads on the clips that carry them (a viewer's own premium
-applies), and no motion blur, because the iframe's pixels are not ours to
-smear. It buys playback that simply works — on a laptop, on a free cloud
-tier, from a datacenter IP — with nothing pulled that youtube has not
-offered the browser itself, and no bandwidth bill for whoever hosts this.
-
-The player is not left to its own adaptive guessing, though. It is pinned
-to what the **display deserves**: the screen's full physical pixels
-(fullscreen-sized, not window-sized) matched to the tier ladder, so a
-1440p monitor asks for 1440p rather than an 8K decode it cannot show, and
-it is re-pinned after every stall so a machine that cannot keep up settles
-one tier down instead of thrashing.
-
-There used to be a third engine here: the server resolved the signed
-googlevideo URLs with `yt-dlp` and proxied the bytes itself, with the
-iframe only as its fallback. It played without ads. It also broke
-youtube's terms of service, needed every video byte a viewer watched to
-flow through the host, and did not survive a serverless platform at all —
-so it is gone, and what used to be the fallback is now the whole story.
-
-## How it steers
-
-Rate control. Your eyes are a stick, not a pointer: how far off centre you
-look sets how fast the view *turns*, and it stays where you left it. Hold your
-eyes to the left and it keeps sweeping left; look back to the middle and it
-stops, exactly there. Nothing returns on its own; `R` turns you home.
+For Vercel, export cookies on your own machine and add them as a secret.
+**Close the browser first**, because a running Chrome locks its cookie
+database and the export fails. Then:
 
 ```
-e     = smoothed gaze angle − calibrated centre
-rate  = sign(e) · gain · (|e| − deadzone)      clamped to the axis limit
+yt-dlp --cookies-from-browser chrome --cookies cookies.txt --skip-download "https://www.youtube.com/watch?v=jNQXAC9IVRw"
+vercel env add LAZYVR_COOKIES        # paste the content of cookies.txt
+vercel deploy
 ```
 
-`control.js` decides only that much: the speed you are asking for, and
-whether you have actually committed to a turn rather than glanced. Where the
-view points is worked out by `body.js`, at display rate, because what carries
-the request out is meant to read as a head rather than a filter.
+Cookies make every request count against that Google account, and accounts
+used this way can be rate-limited or flagged. The yt-dlp wiki recommends a
+throwaway account.
 
-### Why pitch is geared harder than yaw
+### Where the videos come from
 
-A screen `a` times wider than it is tall gives your eyes `a` times as much
-room to travel sideways as up and down. For both axes to reach the same speed
-at the same *fraction* of the travel available to them, pitch takes the aspect
-as gain and gives it straight back on the deadzone:
-
-```
-(E − dz) · g   ≡   (E/a − dz/a) · g·a
-```
-
-`a` is measured, not assumed: the page reads the viewport it is filling and
-re-reads it on every resize and on fullscreen. An ultrawide, a 4:3 monitor and
-a phone held upright each get their own gearing, and on a screen taller than
-it is wide pitch gears *slower* than yaw, which is right.
-
-Size matters as much as shape. Calibration is only true for the viewport it
-happened in: go fullscreen afterwards and the same screen-edge glance is
-*more* degrees of eye travel than the map was tuned for. So a finished
-centring pass remembers its viewport, and every deadzone and gain rescales
-by how much each axis has grown since — deadzones multiplied by it, gains
-divided — keeping one thing invariant: the same **fraction** of the view
-always asks for the same turn. At the calibrated size the scales are 1 and
-nothing changes.
-
-A window *moved* across the monitor is a different problem: a side-snapped
-window taken fullscreen puts "straight ahead" somewhere physically else,
-and no ratio can see that. There used to be a second calibration dot for
-it, a known number of pixels from the first, measuring degrees-of-gaze per
-screen pixel so the centre could be shifted by what the movement was worth.
-It cost a second hold from every viewer on every pass, it could never run
-on the YouTube-player fallback (whose sphere is an iframe, so there is no
-canvas to offset the dot within), and calibration happens in fullscreen and
-stays there, where nothing moves. So the pass is one dot, and a window
-dragged somewhere new — or onto another monitor — is what `C` is for.
-
-| screen | pitch deadzone | pitch rate |
-|---|---|---|
-| 4:3 | 1.35° | 14.1 |
-| 16:9 | 1.01° | 18.8 |
-| 21:9 | 0.77° | 24.7 |
-| 9:16 (portrait) | 3.20° | 6.0 |
-
-| Setting (`control.js`) | Default | |
-|---|---|---|
-| `rateYaw` | 10.6 | deg/s of turn per degree of gaze, left/right |
-| `ratePitch` | from the screen | `rateYaw` × aspect |
-| `deadzoneYaw` | 1.8° | gaze eccentricity that commands no motion |
-| `deadzonePitch` | from the screen | `deadzoneYaw` ÷ aspect |
-| `maxRateYaw` | 128°/s | fastest the view may sweep |
-| `maxRatePitch` | from the screen | the same ceiling — see below |
-| `onset` | 0.03 s | off centre before the view commits to a turn |
-| `calibrationHold` | 1.4 s | continuous fixation that finishes a pass |
-| `calibrationTolerance` | 2.5° | wander that restarts one |
-| `tau` | 0.02 s | gaze smoothing, before the body |
-
-**The ceiling is part of the law, not an exception to it.** The gearing above
-already makes both axes ask for the same rate at the same *share* of the
-screen — so a lower vertical ceiling silently undoes that. It used to be 96,
-and the arithmetic is unkind: pitch reached its ceiling at 7.3° of eye travel
-where yaw ran to 16.3°, and then sat a quarter slower for the whole of the
-rest of the screen. Every glance past about two-thirds of the way up asked
-for less than the same glance sideways, which is exactly what "up and down
-feels sluggish" is. Both axes now saturate at the same share of the view and
-at the same speed; `maxRatePitch` may still be set explicitly by anyone who
-genuinely wants a gentler vertical.
-
-The deadzone is set in degrees of visual angle, not screen fraction. People do
-not recruit the head for gaze shifts below roughly 18°, so that is the
-physiological ceiling and 1.8° is walked a very long way down from it — a
-viewer at a screen cannot turn their real head to help, and the onset gate
-does the glance rejection the deadzone would otherwise have to. Below about
-1.5° the band is inside the gaze estimate's own noise, and anywhere near
-that floor every scrap of bias in the calibrated centre reads as a slow
-standing turn, so it sits a little clear of it rather than on it.
-
-Together with the gain, that puts the fastest sweep on offer within **13.9°**
-of eye travel, so full speed is still a glance rather than a stare:
-
-| glance | before | now |
-|---|---|---|
-| 3° | 19°/s | 13°/s |
-| 6° | 56°/s | 45°/s |
-| 12° | 128°/s | 108°/s |
-
-Near the centre the change is more than the 15% the gain alone would give:
-the wider band compounds with it, and the two together are what buy back the
-tolerance for drift that the previous pair spent — a small standing bias in
-the calibrated centre is swallowed again rather than showing up as a slow
-permanent turn.
-
-### The body
-
-The camera is not a filter on your gaze, it is a limb obeying it, and a few
-things do nearly all the work of selling that. None of them is something a
-viewer can name; they just stop it feeling like a tripod.
-
-**Acceleration is limited, not velocity.** A first-order smoother has its
-maximum acceleration the instant motion begins and a decaying tail after; a
-real head turn is the other way round, with a bell-shaped velocity profile.
-Clamping acceleration at 380°/s² gives a linear ramp while the clamp bites and
-an exponential settle once it does not. The stiffness is asymmetric (6 up, 10
-down) because heads stop faster than they start, which is also what stops the
-view feeling like it coasts past where you wanted it. Deliberately no
-overshoot: your own gaze is already a feedback element in this loop, and
-underdamped machine dynamics plus a human chasing them is how you get a view
-that hunts.
-
-**The turn starts ~33 ms late.** Respond the instant the gaze crosses the
-deadzone and the world feels welded to your eyeball; add a lag and it reads
-as a separate limb obeying you. In a natural gaze shift the eye saccades and
-the head follows 60–120 ms behind; this is deliberately under that, tuned for
-responsiveness. It is a commit gate rather than a delay line, so it costs
-nothing once moving. The delay moves in whole gaze samples, because the gate
-can only open when a reading arrives: at ~30 Hz that is one sample or two,
-with nothing in between.
-
-**The neck has an end, and it is not a box.** The head turns 120° either way
-and looks 90° up or down — but not both at once: turned right round to the
-side there is nothing left for looking up. The reachable set is an ellipse in
-(yaw, pitch), and where the head sits inside it is one number, its radius.
-Inside half that radius the neck is free. Beyond it, turning further costs
-effort that climbs steeply as the limit nears — a full-speed sweep is still at
-118°/s at 60% of the way out, 97°/s at 80%, 69°/s at 90%, and zero at the
-end, where the outward part of any request is simply gone. Only the outward
-part is taxed: coming back is free, as a real neck springs back, and sliding
-along the limit — trading yaw for pitch — crawls rather than sweeps. Held near
-the end the head is not quite steady, either.
-
-**It never sits perfectly still.** Two octaves of value noise, a third of a
-degree of yaw and a sixth of pitch, faded out the moment the view is
-genuinely turning. A perfectly static camera is the plainest tell that there
-is no body behind it.
-
-Two smaller ones: a roll of up to 2.5° driven by yaw *acceleration*, so the
-head leans into the two ends of a sweep rather than throughout it; and five
-taps of directional motion blur along the yaw axis, which besides being what
-a turning head sees also hides the judder a 30 Hz gaze pipeline puts into a
-fast rotation.
-
-### Losing your face asks for a stop
-
-A blink or a hand across the face must not keep you turning, so anything that
-is not a clear reading commands zero rate and the body coasts to a halt. A
-rate is not an angle: repeated forever while the tracker is quiet it would
-spin you round and round, so silence is read as "stop", never as "carry on",
-and a refound face has to wait out the commit delay before a turn resumes.
-
-## The gaze pipeline, in the browser — and off the main thread
-
-`gaze-core.js` is the pipeline. MediaPipe's FaceLandmarker
-(`@mediapipe/tasks-vision`) reads `face_landmarker.task`; onnxruntime-web
-runs `gaze_direct.onnx`; `geometry.js` builds the model's inputs. Both
-libraries load from jsDelivr with pinned versions; the model files load
-from the site.
-
-**It runs in a worker.** Two landmarker passes and an ONNX graph, thirty
-times a second, is twenty to forty milliseconds of work per frame — on the
-main thread that is most of the frame budget, sitting squarely between the
-render loop and the screen, and the view stutters not because the maths is
-wrong but because nothing got to draw. (This is why the same pipeline felt
-smooth when it ran on a Python server: the browser had nothing left to do
-but draw.) So `gaze.js` keeps only what must happen on the page —
-`getUserMedia`, which no worker can call — and hands the rest to
-`gaze-worker.js`, best way first:
-
-| | how frames get there | costs the page |
-|---|---|---|
-| worker | a `MediaStreamTrackProcessor`'s `ReadableStream` is *transferred*, and the worker reads frames from it | nothing per frame |
-| frames | no such processor (Firefox, Safari): one `ImageBitmap` at a time, each answered so exactly one is ever in flight | the grab |
-| inline | no worker, or the worker would not load: the pipeline runs on the page, as it always did | all of it |
-
-The track itself stays on the page even in the first case — transferring it
-would leave nothing on this side able to switch the camera light off.
-`gaze-worker.js` is a **classic** worker although everything it loads is a
-module: MediaPipe's fileset resolver loads its wasm with `importScripts()`,
-which a module worker is forbidden to have (in one, the face model dies with
-`ModuleFactory not set.`), and a classic worker can still pull in ES modules
-with dynamic `import()`.
-
-Per frame: detect landmarks on the raw camera frame, detect again on a
-horizontally flipped copy and un-mirror it through the 478-point left/right
-permutation, average the two clouds (this cancels the extractor's per-side
-noise and its side-dependent pitch offset), normalise into the eye-centred
-weak-3D cloud, build the camera context — the calibrated ray through the eye
-midpoint plus the running median of four eye statistics — mark out-of-frame
-landmarks invalid, and run the graph on a batch of two: the cloud and its
-mirror, whose gaze is un-mirrored and averaged with the direct one.
-
-The detector sees the **raw** frame, never a mirrored one, because the sign
-of "left" depends on it: the camera's +x is image right, which is where your
-own left lands. There is no camera preview — nobody came here to watch
-themself — so nothing on the page has to agree with a mirror.
-
-`geometry.js` is held to the numpy original by a fixture the numpy produced
-(`tests/fixtures/geometry_parity.json`, made by `tools/export_fixtures.py`):
-eight frames, every intermediate quantity, agreement to 1e-12. And
-`?selftest` runs the graph itself against the exporter's reference outputs;
-in Chrome it agrees to 2e-7, the same figure the Python parity check gave.
-
-### On a phone
-
-It runs, with caveats. The face landmarker and the gaze graph take real
-compute; a recent phone manages 15–25 gaze readings a second, and if it cannot
-keep up the second (mirrored) extraction pass is dropped automatically to
-protect the frame rate — the HUD then says `1-pass`. The axes re-gear
-themselves for a portrait screen (see above).
-
-## Tests
-
-```
-node --test "tests/js/*.test.mjs"          # geometry parity, control law, body, the HUD, gaze transport
-python -m unittest discover -s tests       # the youtube source: clips, search config
-```
-
-The control law's tests pin its defining properties — a held gaze keeps
-turning, a brief glance moves nothing, both axes reach the same speed at the
-same share of their travel on any screen shape. The body's pin the neck: exact
-limits on each axis, the ellipse never exceeded from any direction, the sweep
-slowing band by band, release free, sliding a crawl — and, with full-360
-turning on, yaw running past the limit and wrapping while pitch still stops
-dead at 100°. The source's pin what counts as a clip, how the search URL
-carries the 360° filter, and what the environment is allowed to say about
-cookies, a proxy and impersonation; they run without yt-dlp or the network.
+The home page has eight shelves (Nature, Thrill, Ocean, Wildlife, Cities,
+Space, Flight, Music), and the top bar searches by keyword. Both go through
+`/api/home` and `/api/search`, which run the query against YouTube's search
+with the **360° feature filter** (the `sp` parameter YouTube's own filter
+sets). Only equirectangular uploads carry that flag, so everything that comes
+back renders correctly on the sphere. No API key is involved. Clips under
+30 s are dropped. Shelves are cached for six hours, searches for fifteen
+minutes.
 
 ## Layout
 
 ```
-site/            the page: index.html, css/ (tokens, base, one file per
-                 screen), fonts/, js/, models/
-                 js/gaze.js is the camera and the choice of where the
-                 pipeline runs; js/gaze-core.js is the pipeline;
-                 js/gaze-worker.js is the worker that usually hosts it
-server/          app.py (aiohttp: static files + the search API), source.py
-                 (the youtube search itself), requirements.txt
-tools/           export_fixtures.py (regenerates the parity fixtures)
-tests/           JS tests (node --test) and Python tests (unittest), fixtures
-Dockerfile       page + server as one deployable container
+site/                 the page (served as-is; no build step)
+  index.html
+  css/                tokens, base, library, player, overlay, settings
+  fonts/              Atkinson Hyperlegible Next
+  models/             face_landmarker.task
+  js/app.js           orchestrator: library ⇄ player, sessions, wiring
+  js/player.js        player screen: control bar, auto-hide, keyboard, pointer, panels
+  js/chrome.js        pure player helpers: clocks, auto-hide rule, keymap, SHORTCUTS
+  js/settings.js      settings model (v4) and panel
+  js/library.js       shelves, search, cards
+  js/camera.js        HeadTracker: camera, worker transport
+  js/tracker-worker.js  classic worker hosting the engine
+  js/tracker-core.js  TrackerEngine: FaceLandmarker → pose → eyes, one frame → one reading
+  js/pose.js          canonical model, solvePnP, screen-relative pose, gates
+  js/eyes.js          iris features, blinks, head–eye coupling fit
+  js/filters.js       One Euro, rolling medians, helpers
+  js/steer.js         Steering: readings → view (the hybrid law)
+  js/embed.js         YouTube iframe player: layout scaling, steering, transport
+  js/quality.js       360 tier choice, decode cap, stall monitor
+  js/render.js        WebGL2 sphere for local files
+server/               app.py (aiohttp: static files + the API), source.py (search,
+                      caching, cookies/proxy/impersonation), requirements.txt
+api/index.py          the same API as one Vercel function
+tests/                JS tests (node --test) and Python tests (unittest)
+vercel.json           CDN for site/, rewrite /api/* to the function, headers
+Dockerfile, fly.toml, render.yaml
 ```
+
+## Tests
+
+```
+node --test "tests/js/*.test.mjs"          # pose, eyes, filters, steering, quality, embed,
+                                           # camera transport, player helpers, settings, page
+python -m unittest discover -s tests       # the search source and the API
+```
+
+The JS tests cover the pure modules directly: solvePnP recovering known
+poses, screen-relative compensation, and the gates; the eye coupling fit and
+blink handling; the steering law (auto-zero only when steady, the position
+zone and its spring-back, continuity at the zone edge, the rate dwell, full
+360 turning, freeze and resume, the eye bounds and hysteresis, inverts,
+recenter, tracking off/on, drag, NaN robustness and the sign conventions);
+tier choice, layout scale, decode cap and stall policy; the keymap. Camera
+transport runs in a stubbed worker harness with fake frames and a fake
+`getUserMedia`. The Python tests run without yt-dlp or the network.
 
 ## Troubleshooting
 
-**"Camera access was refused."** Allow the camera for the site in the
-browser's site settings and reload. On a page served over plain `http` that
-is not `localhost`, the browser will not even ask.
+**The Tracking button says "No camera".** The camera was refused, is
+missing, or is in use by another app. Allow it in the browser's site
+settings, then press `T`. On a plain `http` page that is not `localhost` the
+browser will not even ask.
 
-**A shelf or search says youtube gave nothing back.** Almost always a stale
+**It stays on "Finding you".** Auto-zero needs about 20 steady frames with
+your face in view. Hold still facing the screen. If the camera is far off to
+the side, holding still for 3 s is enough. Good light on your face helps
+more than anything.
+
+**"Face lost" keeps appearing.** Both eyes and the nose must stay inside the
+frame, and you must be 20–200 cm from the camera. Backlighting (a window
+behind you) and very low light are the usual causes. The diagnostics readout
+shows the tracker rate; under 15 Hz it is marked, and tracking will feel
+loose.
+
+**The view is off-centre when I face the screen, or slowly turns.** Press
+`C` while facing the middle of the screen. If it keeps happening, check
+**Camera position** in settings. If the view is turning on its own, your
+neutral pose is 20° or more from where you are now facing, which is the rate
+zone; `C` fixes that too.
+
+**The view stops following me.** You turned more than 45° sideways or 35°
+up or down ("Looking away — view held"). Face the screen again and it glides
+back.
+
+**Left/right or up/down feels backwards.** Use Invert horizontal or Invert
+vertical in settings.
+
+**The view moves too much, or too little.** Sensitivity scales the position
+zone; Turn speed scales the continuous turning. Switch off Eye assist if
+glancing around the picture moves it more than you want.
+
+**The picture is soft.** Check "Playing at …" in settings. A narrow window
+needs a smaller tier; fullscreen asks for more. Max quality may be capping
+it, or the device's decode cap (reported optimistically) may have limited it
+to 1440p. After repeated stalls the video steps down for the rest of that
+viewing; reopen it to start from the full target. Some uploads are simply
+not encoded at higher tiers.
+
+**A shelf or search says YouTube gave nothing back.** Almost always a stale
 `yt-dlp`: `pip install -U yt-dlp` (or rebuild the container) and restart.
 
 **Every shelf is empty and search returns nothing.** The server could not
-read youtube's results page. On a cloud host it is the bot challenge:
-check `curl-cffi` actually installed (it is what supplies the browser TLS
-fingerprint), then try cookies, then `LAZYVR_PROXY` — all three above.
-Anywhere else it is usually a stale `yt-dlp`: `pip install -U yt-dlp` and
-restart.
+read YouTube's results page. On a cloud host this is the bot challenge:
+check that `curl-cffi` actually installed, then try cookies, then
+`LAZYVR_PROXY` (all three above). Elsewhere it is usually a stale `yt-dlp`.
 
-**One video will not play, and the others do.** Nothing here can help: the
-clip is age-restricted, region-locked, or its uploader has disallowed
-embedding, and all three are youtube's answer to the browser rather than
-anything the server saw.
+**One video will not play, and the others do.** The clip is age-restricted,
+region-locked, or its uploader has disabled embedding. These are YouTube's
+answers to the browser, and nothing here can change them. Error 153 means
+the page sent no referrer; do not serve the page with
+`Referrer-Policy: no-referrer`.
 
-**A local file will not play.** The browser has to be able to decode it on
-its own — the page hands the file straight to a `<video>` element and does
-no transcoding. H.264 or VP9 in MP4 or WebM plays everywhere; HEVC, ProRes
-and most `.mkv` do not.
+**I cannot skip an ad.** Move the mouse so the control bar shows; the
+picture layer then lets clicks through to YouTube's "Skip ad" button.
 
-**The video stays black in a background tab.** Chrome does not load media in
-a tab that is not in front. Bring it forward. The camera goes with it — a
-backgrounded tab releases it, light and all, and it is reopened when the tab
-comes back.
+**A local file will not play.** The browser has to decode it on its own, and
+the sphere needs WebGL2. H.264 or VP9 in MP4 or WebM plays everywhere; HEVC,
+ProRes and most `.mkv` do not.
 
-**The view drifts when you hold still.** Press `C` and hold still while it
-recalibrates. A rate map cannot tolerate a biased centre the way a position
-map could — a small standing offset is a slow permanent turn.
-
-**Calibration never finishes.** It ends on stillness, so it waits forever if
-the reading is too noisy to sit inside `calibrationTolerance`. Better light
-on your face helps more than anything; raising the tolerance in `control.js`
-is the fallback.
-
-**It is slow on a phone.** The diagnostics readout (a switch in settings)
-shows the gaze rate on its `tracker` row, and the tracker mark in the HUD
-says `1-pass` once the second pass has gone. Under
-about 15 Hz the mirror pass has already been dropped (`1-pass`); below that
-the phone is simply too slow for the landmarker.
+**The camera light goes off when I switch tabs.** That is intended: a hidden
+tab releases the camera, and it reopens when you come back.

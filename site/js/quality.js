@@ -122,13 +122,31 @@ export function chooseTier({ cssWidth, dpr = 1, hFov = DEFAULT_FOV, setting = "a
 }
 
 /* Layout scale for the iframe: big enough that its CSS layout width is the
- * tier's frame width, never shrunk, never past kMax (YouTube's own UI --
- * ads, the skip button -- shrinks by 1/k). */
+ * tier's frame width, clamped to [kMin, kMax].  Past kMax YouTube's own UI
+ * (ads, the skip button) shrinks too far by 1/k; under kMin it grows too
+ * far.  kMin defaults to 1 (never shrink): see layoutFloor for when a
+ * smaller layout is allowed. */
 export const K_MAX = 3;
-export function layoutScale(cssWidth, tierWidth, kMax = K_MAX) {
+export const K_MIN = 0.5;
+export function layoutScale(cssWidth, tierWidth, kMax = K_MAX, kMin = 1) {
   if (!finite(cssWidth) || cssWidth <= 0 || !finite(tierWidth) || tierWidth <= 0) return 1;
   const max = finite(kMax) && kMax >= 1 ? kMax : 1;
-  return Math.min(max, Math.max(1, tierWidth / cssWidth));
+  const min = finite(kMin) && kMin > 0 && kMin <= 1 ? kMin : 1;
+  return Math.min(max, Math.max(min, tierWidth / cssWidth));
+}
+
+/* The kMin to hand layoutScale.  The embed picks its tier from layout size
+ * alone, and a viewport-sized layout already gets roughly the viewport's
+ * tier.  So a tier narrower than the viewport -- which chooseTier only
+ * returns when it was CAPPED (Max quality, the decode cap, the auto ceiling,
+ * a stall step-down) -- can only be honoured by laying the iframe out
+ * smaller than the viewport and scaling it UP (k < 1).  That is allowed
+ * down to K_MIN, and only for a capped tier; a tier that covers what the
+ * viewport needs keeps k >= 1.  Below K_MIN the cap is honoured as far as
+ * K_MIN·W allows (e.g. hd720 on a 3840 px window lays out at 1920). */
+export function layoutFloor(cssWidth, tierWidth, dpr = 1, hFovDeg = DEFAULT_FOV) {
+  if (!finite(tierWidth) || tierWidth <= 0) return 1;
+  return tierWidth < requiredWidth(cssWidth, dpr, hFovDeg) ? K_MIN : 1;
 }
 
 // ------------------------------------------------------------ decode cap
@@ -194,7 +212,7 @@ export function decodeCap(mc = globalThis.navigator && globalThis.navigator.medi
  * Fed the player's BUFFERING / PLAYING transitions and the app's own seeks;
  * times in seconds on any monotonic clock.  Counts stalls only after
  * playback has started, outside the start-up grace, and not the buffering a
- * seek causes.  `buffering()` returns true once per `threshold` stalls inside
+ * seek or a resume from pause causes.  `buffering()` returns true once per `threshold` stalls inside
  * `windowSec`; the caller steps the tier down (and never back up). */
 export class StallMonitor {
   constructor({ threshold = 3, windowSec = 60, graceSec = 3, stepGraceSec = 10, seekWindowSec = 5 } = {}) {
@@ -213,6 +231,7 @@ export class StallMonitor {
     this.stalls = [];
     this.inStall = false;
     this.seekAt = null;
+    this.resuming = false;
     this.lastT = -Infinity;
     this.steps = 0;
   }
@@ -232,6 +251,7 @@ export class StallMonitor {
     }
     this.inStall = false;
     this.seekAt = null;
+    this.resuming = false;
   }
 
   /* The app seeked: buffering within seekWindowSec of it is not a stall.
@@ -243,10 +263,14 @@ export class StallMonitor {
     this.inStall = false;
   }
 
-  /* Paused/ended: a later BUFFERING is a fresh transition. */
+  /* Paused/ended: a later BUFFERING is a fresh transition.  But YouTube
+   * emits a brief BUFFERING (~250 ms, measured live) on every resume from
+   * pause, so the first BUFFERING before the next PLAYING is the resume,
+   * not a stall. */
   paused(t) {
     if (!this.accept(t)) return;
     this.inStall = false;
+    this.resuming = true;
   }
 
   buffering(t) {
@@ -254,11 +278,11 @@ export class StallMonitor {
     if (this.inStall) return false;          // the same stall reported twice
     this.inStall = true;
     if (this.startedAt === null) return false; // initial load
-    if (this.seekAt !== null) {
-      const sinceSeek = t - this.seekAt;
-      this.seekAt = null;
-      if (sinceSeek <= this.seekWindowSec) return false;
-    }
+    const afterSeek = this.seekAt !== null && t - this.seekAt <= this.seekWindowSec;
+    const resumed = this.resuming;
+    this.seekAt = null;
+    this.resuming = false;
+    if (afterSeek || resumed) return false;
     if (t < this.quietUntil) return false;
     this.stalls.push(t);
     while (this.stalls.length && this.stalls[0] <= t - this.windowSec) this.stalls.shift();

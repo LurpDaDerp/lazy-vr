@@ -22,6 +22,8 @@ import { OneEuro } from "./filters.js";
 
 const DEG = Math.PI / 180;
 const RESUME_SECONDS = 0.5;   // follower runs at resumeOmega this long after a jump
+const RESUME_BLEND = 0.2;     // ...easing to followOmega over its last part (no re-acceleration)
+const RATE_PAUSE_RUN = 2;     // consecutive untracked readings that pause the rate
 const MAX_DT = 0.1;           // display steps longer than this are clamped
 const LIVE = new Set(["tracking", "turning"]);
 
@@ -33,6 +35,12 @@ export const STEER_DEFAULTS = Object.freeze({
   rateFull: 35,
   maxRate: 90,
   rateDwell: 0.15,
+  // Not in the spec table: the dwell only counts while the head is roughly
+  // settled in the zone -- slower than rateArmSpeed overall and not heading back
+  // toward the centre faster than rateArmInward -- so a turn away, or back from
+  // a look-away, passes through without arming it. Once armed, turning
+  // continues whatever the head does until it leaves the zone.
+  rateArmSpeed: 30, rateArmInward: 8,
   // freeze
   freezeYaw: 45, freezeYawExit: 40, freezePitch: 35, freezePitchExit: 30,
   staleAfter: 0.5,
@@ -40,6 +48,11 @@ export const STEER_DEFAULTS = Object.freeze({
   // filtering & neutral
   oneEuro: Object.freeze({ minCutoff: 0.4, beta: 0.05, dCutoff: 1.0 }),
   neutralFrames: 20, neutralMaxSpeed: 15,
+  // Not in the spec table: auto-zero only takes frames roughly facing the screen
+  // (head pose is screen-relative, so that reads ~0), so a glance at the keyboard
+  // never becomes the neutral. A head held steady off-axis this long is taken as
+  // the user's real rest pose (off-axis camera, reclined user) and accepted.
+  neutralAcquireYaw: 15, neutralAcquirePitch: 15, neutralAcquireWait: 3,
   neutralAdaptTau: 30, neutralAdaptBand: 4,   // tau <= 0 pins the neutral
   // eye offset
   eyeYawMax: 10, eyePitchMax: 6,
@@ -185,6 +198,8 @@ export class Steering {
     this._lastReadingT = -Infinity;           // seconds; ordering guard
     this._lastTrackedT = null;                // seconds
     this._lastReadingTracked = false;
+    this._untrackedRun = 0;                   // consecutive untracked readings
+    this._offAxisSince = null;                // acquiring: steady-off-axis since (seconds)
     this._eyeInX = 0; this._eyeInY = 0;
     this._eyeOnX = false; this._eyeOnY = false;
     this._eyeTargetYaw = 0; this._eyeTargetPitch = 0;
@@ -212,6 +227,7 @@ export class Steering {
     const head = reading.head;
     const tracked = reading.tracked === true && head && finite(head.yaw) && finite(head.pitch);
     this._lastReadingTracked = !!tracked;
+    this._untrackedRun = tracked ? 0 : this._untrackedRun + 1;
     if (!tracked) return;                   // never moves anything; staleness is judged in tick
     const o = this.options;
 
@@ -223,23 +239,42 @@ export class Steering {
       this._runYaw.length = 0;
       this._runPitch.length = 0;
       this._overSince = null;
+      this._offAxisSince = null;
     }
     const fy = this._euroYaw.filter(head.yaw, t);
     const fp = this._euroPitch.filter(head.pitch, t);
-    this._speed = gap > o.staleAfter ? 0 : Math.hypot(fy - this._fYaw, fp - this._fPitch) / gap;
+    const fresh = gap > o.staleAfter;
+    this._speed = fresh ? 0 : Math.hypot(fy - this._fYaw, fp - this._fPitch) / gap;
+    // d|yaw|/dt about the neutral (< 0 = heading back toward the centre).
+    const outward = fresh || !this._hasNeutral ? 0
+      : (Math.abs(fy - this._nYaw) - Math.abs(this._fYaw - this._nYaw)) / gap;
     this._fYaw = fy; this._fPitch = fp;
     this._lastTrackedT = t;
     const steady = this._speed < o.neutralMaxSpeed;
 
     if (!this._hasNeutral) {
-      // Auto-zero: the median of a run of consecutive steady frames.
-      if (!steady) { this._runYaw.length = 0; this._runPitch.length = 0; return; }
+      // Auto-zero: the median of a run of consecutive steady frames facing the
+      // screen; off-axis frames count only once the head has stayed off-axis
+      // for neutralAcquireWait (a run never mixes the two).
+      const facing = Math.abs(fy) <= o.neutralAcquireYaw && Math.abs(fp) <= o.neutralAcquirePitch;
+      if (facing) {
+        if (this._offAxisSince !== null) {
+          this._offAxisSince = null;
+          this._runYaw.length = 0; this._runPitch.length = 0;
+        }
+      } else if (this._offAxisSince === null) {
+        this._offAxisSince = t;
+        this._runYaw.length = 0; this._runPitch.length = 0;
+      }
+      const waiting = !facing && t - this._offAxisSince < o.neutralAcquireWait;
+      if (!steady || waiting) { this._runYaw.length = 0; this._runPitch.length = 0; return; }
       this._runYaw.push(fy);
       this._runPitch.push(fp);
       if (this._runYaw.length < o.neutralFrames) return;
       this._nYaw = median(this._runYaw);
       this._nPitch = median(this._runPitch);
       this._hasNeutral = true;
+      this._offAxisSince = null;
       this._runYaw.length = 0; this._runPitch.length = 0;
     }
 
@@ -271,7 +306,10 @@ export class Steering {
     this._holdYaw = hy; this._holdPitch = hp;
 
     if (Math.abs(hy) > o.yawZone) {
-      if (this._overSince === null) this._overSince = t;
+      const armed = this._overSince !== null && t - this._overSince >= o.rateDwell;
+      const settled = this._speed < o.rateArmSpeed && outward > -o.rateArmInward;
+      if (!armed && !settled) this._overSince = null;   // passing through: the dwell restarts
+      else if (this._overSince === null) this._overSince = t;
     } else {
       this._overSince = null;
     }
@@ -346,10 +384,11 @@ export class Steering {
     const sYaw = o.invertYaw ? -1 : 1, sPitch = o.invertPitch ? -1 : 1;
 
     // Rate zone: integrate into the offset (the target), not the spring. Paused
-    // while the newest reading is untracked so a face lost mid-turn cannot keep
-    // spinning on a stale angle until the stale timeout.
+    // after RATE_PAUSE_RUN consecutive untracked readings so a face lost mid-turn
+    // cannot keep spinning on a stale angle until the stale timeout, while one
+    // rejected frame (bad fit, jump) does not hitch a continuous turn.
     let rate = 0;
-    if (state === "turning" && this._lastReadingTracked) {
+    if (state === "turning" && this._untrackedRun < RATE_PAUSE_RUN) {
       const span = o.rateFull - o.yawZone;
       const u = span > 0 ? (Math.abs(this._hYaw) - o.yawZone) / span : 1;
       rate = -sYaw * Math.sign(this._hYaw) * o.maxRate * o.turnSpeed * smoothstep(u);
@@ -372,7 +411,10 @@ export class Steering {
 
     // Follower. Yaw goes the short way round (same bearing, nearest turn), so the
     // output stays continuous and a recenter after laps never unwinds them.
-    const omega = nowSec < this._resumeUntil ? o.resumeOmega : o.followOmega;
+    // After a jump the follower glides at resumeOmega, easing up to followOmega
+    // over the last RESUME_BLEND s: a hard switch re-accelerates the glide's tail.
+    const ease = Math.min(1, Math.max(0, (this._resumeUntil - nowSec) / RESUME_BLEND));
+    const omega = o.followOmega + (o.resumeOmega - o.followOmega) * ease;
     const goalYaw = targetYaw + 360 * Math.round((this._yaw - targetYaw) / 360);
     [this._yaw, this._vYaw] = follow(this._yaw, this._vYaw, goalYaw, omega, dt);
     [this._pitch, this._vPitch] = follow(this._pitch, this._vPitch, targetPitch, omega, dt);
@@ -397,15 +439,23 @@ export class Steering {
     if (this.enabled) {
       // Beyond that zone the user is more likely glancing at the keyboard for
       // the C key than facing the screen; zeroing there would skew every look after.
+      // Within the zone of the old neutral is not enough on its own: a keyboard
+      // 20 deg below a good neutral would pass. The pose must also face the
+      // screen in absolute terms, or sit right at the current neutral (which may
+      // itself be an accepted off-axis rest pose).
+      const facing = Math.abs(this._fYaw) <= o.neutralAcquireYaw && Math.abs(this._fPitch) <= o.neutralAcquirePitch;
+      const atNeutral = Math.abs(this._hYaw) <= o.neutralAdaptBand && Math.abs(this._hPitch) <= o.neutralAdaptBand;
       const trusted = this._hasNeutral && LIVE.has(this.state) && this._lastReadingTracked
         && this._speed < o.neutralMaxSpeed
-        && Math.abs(this._hYaw) <= o.yawZone && Math.abs(this._hPitch) <= o.pitchZone;
+        && Math.abs(this._hYaw) <= o.yawZone && Math.abs(this._hPitch) <= o.pitchZone
+        && (facing || atNeutral);
       if (trusted) {
         this._nYaw = this._fYaw; this._nPitch = this._fPitch;
       } else {
         this._hasNeutral = false;
       }
       this._runYaw.length = 0; this._runPitch.length = 0;
+      this._offAxisSince = null;
     }
     this._hYaw = 0; this._hPitch = 0;
     this._holdYaw = 0; this._holdPitch = 0;
@@ -436,6 +486,8 @@ export class Steering {
       this._euroYaw.reset(); this._euroPitch.reset();
       this._lastTrackedT = null;
       this._lastReadingTracked = false;
+      this._untrackedRun = 0;
+      this._offAxisSince = null;
       this._speed = Infinity;
     } else {
       this._resumePending = true;

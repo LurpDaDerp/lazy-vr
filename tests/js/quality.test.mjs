@@ -4,8 +4,8 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import {
-  AUTO_CEILING, K_MAX, LEVEL_HEIGHTS, MISSING_API_CAP, StallMonitor, TIERS,
-  chooseTier, decodeCap, layoutScale, qualityCap, requiredWidth, targetTier, tierAtMost,
+  AUTO_CEILING, K_MAX, K_MIN, LEVEL_HEIGHTS, MISSING_API_CAP, StallMonitor, TIERS,
+  chooseTier, decodeCap, layoutFloor, layoutScale, qualityCap, requiredWidth, targetTier, tierAtMost,
   tierBelow, tierOf,
 } from "../../site/js/quality.js";
 
@@ -118,6 +118,38 @@ test("layoutScale: tier width over CSS width, clamped to [1, K_MAX]", () => {
   assert.equal(layoutScale(NaN, 3840), 1);
   assert.equal(layoutScale(1920, NaN), 1);
   assert.equal(layoutScale(1000, 3000, 0.5), 1);
+});
+
+test("layoutScale: kMin lets a capped tier lay out smaller than the window, floored at K_MIN", () => {
+  // Max quality 1080 on a 2560 px window: only a 1920 layout honours it.
+  assert.equal(layoutScale(2560, 1920, K_MAX, K_MIN), 0.75);
+  // Step-down at 1920: hd720 must shrink the layout (it did not at k >= 1).
+  assert.equal(layoutScale(1920, 1280, K_MAX, K_MIN), 1280 / 1920);
+  assert.equal(layoutScale(3840, 1280, K_MAX, K_MIN), K_MIN);
+  // Junk kMin falls back to never-shrink.
+  for (const junk of [0, -1, 2, NaN, Infinity]) assert.equal(layoutScale(2560, 1920, K_MAX, junk), 1);
+  // Under 854 px both 4K and 1440 clamp to K_MAX: stepping between them
+  // cannot change the layout (the caller must check the layout shrank).
+  assert.equal(layoutScale(800, 3840, K_MAX, K_MIN), K_MAX);
+  assert.equal(layoutScale(800, 2560, K_MAX, K_MIN), K_MAX);
+});
+
+test("layoutFloor: K_MIN only for a tier capped below what the window needs, else 1", () => {
+  // 2560 px window needs 9216 at 100°: hd1080 is a cap -> may shrink.
+  assert.equal(layoutFloor(2560, 1920, 1, 100), K_MIN);
+  // A tier covering the need is not a cap: never shrink.
+  assert.equal(layoutFloor(1000, 3840, 1, 100), 1);   // needs 3600
+  assert.equal(layoutFloor(3000, 1280, 0.25, 360), 1); // needs 750
+  // Junk tier: never shrink.
+  assert.equal(layoutFloor(1920, NaN), 1);
+  assert.equal(layoutFloor(1920, 0), 1);
+  // End to end: chooseTier with Max quality 1080 on a 2560 window.
+  const tier = chooseTier({ cssWidth: 2560, dpr: 1, hFov: 100, setting: 1080, decodeCap: 4320 });
+  assert.equal(tier.label, "hd1080");
+  assert.equal(layoutScale(2560, tier.w, K_MAX, layoutFloor(2560, tier.w, 1, 100)) * 2560, 1920);
+  // Auto on a 1920 window is never capped below the window: k stays >= 1.
+  const auto = chooseTier({ cssWidth: 1920, dpr: 1, hFov: 100, decodeCap: 4320 });
+  assert.ok(layoutScale(1920, auto.w, K_MAX, layoutFloor(1920, auto.w, 1, 100)) >= 1);
 });
 
 // ---- decodeCap -------------------------------------------------------------
@@ -235,8 +267,35 @@ test("stall: a repeated BUFFERING without PLAYING between counts once", () => {
   assert.equal(m.buffering(12), false);
   assert.equal(m.stalls.length, 1);
   m.paused(13);
-  assert.equal(m.buffering(14), false);
+  assert.equal(m.buffering(14), false);     // the resume blip (see below)
+  assert.equal(m.stalls.length, 1);
+  m.playing(14.3);
+  assert.equal(m.buffering(20), false);     // a fresh transition, counted
   assert.equal(m.stalls.length, 2);
+});
+
+test("stall: the BUFFERING blip YouTube emits on every resume from pause is not a stall", () => {
+  // Timings measured on a live embed: ~260 ms of BUFFERING after playVideo().
+  const m = new StallMonitor();
+  m.playing(1);
+  for (const x of [14, 18, 22, 26, 30]) {
+    m.paused(x);
+    assert.equal(m.buffering(x + 1.5), false);
+    m.playing(x + 1.77);
+  }
+  assert.equal(m.stalls.length, 0);
+  assert.equal(m.steps, 0);
+  // A real stall after the resume still counts.
+  assert.deepEqual(stallsAt(m, [40, 41, 42]), [false, false, true]);
+  assert.equal(m.steps, 1);
+});
+
+test("stall: a resume that goes straight to PLAYING leaves no excuse behind", () => {
+  const m = new StallMonitor();
+  m.playing(0);
+  m.paused(10);
+  m.playing(11);              // no BUFFERING on this resume
+  assert.deepEqual(stallsAt(m, [20, 21, 22]), [false, false, true]);
 });
 
 test("stall: after a step, the tier switch's own rebuffer is forgiven, then counting restarts", () => {

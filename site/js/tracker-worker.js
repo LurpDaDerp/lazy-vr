@@ -14,7 +14,8 @@
  *   { type: "frame", image, atMs, run } one ImageBitmap; always answered with "ready"
  *   { type: "stop" }                    end the session
  * Worker -> page: status, loaded, loadfailed, reading {run, reading},
- *   ready {run}, error {run, message}.
+ *   ready {run}, error {run, message}, ended {run} (the frame stream closed
+ *   while its run was still live).
  *
  * Run ids are assigned by the page. Every reading is checked against the live
  * run AFTER the engine's await, so a session stopped mid-frame never posts.
@@ -91,13 +92,19 @@ async function pump(stream, run) {
   reader = own;
   while (runId === run) {
     let frame;
+    let next;
     try {
-      const next = await own.read();
-      if (next.done) break;
-      frame = next.value;
+      next = await own.read();
     } catch {
-      break;  // the page stopped the track: a stop, not a fault
+      next = { done: true };
     }
+    if (next.done) {
+      // Still the live run: the camera ended under it (unplugged, revoked), not
+      // a page stop. The page drops this if its own stop retired the run first.
+      if (runId === run) say({ type: "ended", run });
+      break;
+    }
+    frame = next.value;
     try {
       if (runId === run) {
         await handle(frame, frame.displayWidth || frame.codedWidth,

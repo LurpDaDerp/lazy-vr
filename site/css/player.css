@@ -24,6 +24,9 @@
 body.browsing #player { display: none; }
 
 #player [hidden] { display: none !important; }
+/* Focus parks on the player itself when it is taken back from youtube's
+   iframe (app.js); a container holding focus draws no ring. */
+#player:focus { outline: none; }
 
 /* -- the surface ---------------------------------------------------- */
 
@@ -158,7 +161,7 @@ body.chrome-asleep #chrome {
 }
 #chrome::after {
   bottom: 0;
-  height: 200px;
+  height: 260px;
   background: linear-gradient(0deg, rgba(6, 8, 20, 0.74), rgba(6, 8, 20, 0.62) 38%, rgba(6, 8, 20, 0.26) 68%, transparent);
 }
 
@@ -226,11 +229,12 @@ body.chrome-asleep #chrome {
 .pbtn:active { transform: translateY(1px); }
 .pbtn.labeled { padding: 0 var(--s-3) 0 var(--s-2); }
 
-/* The tracking button speaks in tone: Star when on, Star Dim when off or
-   busy, Ember when the face is lost. */
-#trackbtn[data-tone="busy"], #trackbtn[data-tone="off"] { color: var(--star-dim); }
+/* The tracking button speaks in tone: a Star Dim glyph when off or busy
+   (the word stays Star, so it reads over a bright picture), the whole
+   button Ember when the face is lost. */
+#trackbtn[data-tone="busy"] .icon, #trackbtn[data-tone="off"] .icon { color: var(--star-dim); }
 #trackbtn[data-tone="warn"] { color: var(--ember); }
-#trackbtn:hover { color: var(--lamp); }
+#trackbtn:hover, #trackbtn:hover .icon { color: var(--lamp); }
 
 .clock {
   margin-left: var(--s-2);
@@ -246,6 +250,7 @@ body.chrome-asleep #chrome {
   pointer-events: auto;
 }
 .volume input[type="range"] {
+  height: var(--control);   /* the 40px hit band; the track stays 2px, centred */
   width: 0;
   opacity: 0;
   margin: 0;
@@ -288,6 +293,13 @@ body.chrome-asleep #chrome {
   visibility: visible;
   transition: opacity var(--t-fast) var(--ease-out) 350ms, visibility 0s 350ms;
 }
+/* One tip at a time: the pointer's wins over the keyboard's, which comes
+   back when the pointer leaves. */
+#chrome:has([data-tip]:hover) [data-tip]:focus-visible:not(:hover)::after {
+  opacity: 0;
+  visibility: hidden;
+  transition: none;
+}
 .topbar [data-tip]::after { bottom: auto; top: calc(100% + var(--s-2)); left: 0; transform: none; }
 [data-tip-end]::after { left: auto; right: 0; transform: none; }
 body.chrome-asleep [data-tip]::after { display: none; }
@@ -306,6 +318,17 @@ body.chrome-asleep [data-tip]::after { display: none; }
   --hover: 0%;
 }
 .seek:focus-visible { outline-offset: 4px; }
+/* The hit band: 40px tall around the 20px bar, without moving the layout,
+   the tip or the focus ring.  The bar's buttons come later and keep the
+   clicks where the band reaches over them. */
+.seek::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: -10px;
+  bottom: -10px;
+}
 .seek-rail {
   position: absolute;
   left: 0;
@@ -394,7 +417,19 @@ body.chrome-asleep [data-tip]::after { display: none; }
 /* -- narrow windows: labels go, icons stay ---------------------------- */
 
 @media (max-width: 640px) {
-  .pbtn.labeled span { display: none; }
+  /* Hidden from sight, not from the accessibility tree: the words still
+     name (or, for tracking, describe) the buttons. */
+  .pbtn.labeled span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+    border: 0;
+  }
   .pbtn.labeled { padding: 0; }
   .clock { margin-left: 0; font-size: 0.75rem; }
 }

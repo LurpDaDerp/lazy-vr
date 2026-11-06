@@ -132,6 +132,32 @@ test("auto-zero does not happen while the head is moving", () => {
   near(m.s.diagnostics().neutral.yaw, 12, 0.3);
 });
 
+test("auto-zero ignores a steady glance off the screen (keyboard) and zeroes on the screen", () => {
+  const m = sim();
+  m.run(1.2, still(0, -30));                 // looking down at the keyboard, steady
+  assert.equal(m.s.state, "acquiring");
+  assert.equal(m.s.diagnostics().neutral, null);
+  m.run(1.5, still(2, -1));
+  assert.equal(m.s.state, "tracking");
+  near(m.s.diagnostics().neutral.pitch, -1, 0.3, "neutral pitch on the screen");
+  m.run(1, still(2, -1));
+  near(m.pitch, 0, 0.5, "view level, not pinned at the sky");
+});
+
+test("auto-zero falls back to a steady off-axis rest pose after neutralAcquireWait", () => {
+  const m = sim();
+  m.run(2.5, still(25, -24));                // e.g. a camera well off to the side
+  assert.equal(m.s.state, "acquiring", "waits first");
+  m.run(2, still(25, -24));
+  assert.equal(m.s.state, "tracking");
+  near(m.s.diagnostics().neutral.yaw, 25, 0.3);
+  near(m.s.diagnostics().neutral.pitch, -24, 0.3);
+  // C pressed right at that rest pose keeps it (no second wait).
+  m.s.recenter();
+  assert.equal(m.s.state, "tracking");
+  near(m.s.diagnostics().neutral.pitch, -24, 0.3);
+});
+
 test("neutral eases toward a small standing offset, but not a deliberate look", () => {
   const m = acquired();
   m.run(60, still(2, 0));
@@ -231,6 +257,47 @@ test("looking away fast (to 60 deg) passes the rate zone without turning more th
   g.run(1.5, (t) => ({ yaw: Math.max(0, 60 - Math.max(0, t) * 150), pitch: 0 }));
   assert.ok(Math.abs(g.s.offset.yaw) < 1, `glance offset ${g.s.offset.yaw}`);
   near(g.yaw, 0, 0.5);
+});
+
+test("turning away at ordinary speeds (40-100 deg/s) leaves no lasting spin", () => {
+  for (const v of [40, 60, 100]) {
+    const j = jitter(v);
+    const m = acquired();
+    // 0 -> 70 deg; the face is no longer tracked past 55.
+    m.run(2.5, (t) => {
+      const y = Math.min(70, Math.max(0, t) * v);
+      return y > 55 ? { yaw: y, pitch: 0, tracked: false } : { yaw: y + j(0.5), pitch: j(0.5) };
+    });
+    assert.ok(Math.abs(m.s.offset.yaw) < 3, `${v} deg/s: offset ${m.s.offset.yaw}`);
+  }
+});
+
+test("coming back from a look-away at 15-50 deg/s leaves no lasting spin", () => {
+  for (const v of [15, 20, 30, 50]) {
+    const j = jitter(v + 1);
+    const m = acquired();
+    m.run(1.5, (t) => ({ yaw: Math.min(50, Math.max(0, t) * 200) + j(0.5), pitch: j(0.5) }));
+    assert.equal(m.s.state, "away");
+    m.run(50 / v + 1.5, (t) => ({ yaw: Math.max(0, 50 - Math.max(0, t) * v) + j(0.5), pitch: j(0.5) }));
+    assert.equal(m.s.state, "tracking");
+    assert.ok(Math.abs(m.s.offset.yaw) < 3, `${v} deg/s: offset ${m.s.offset.yaw}`);
+  }
+});
+
+test("a deliberate hold past the zone still arms the rate soon after the head settles", () => {
+  for (const [amp, secs] of [[30, 0.25], [27, 0.5], [40, 1]]) {
+    const j = jitter(amp);
+    const m = acquired();
+    let onset = null;
+    m.run(3, (t) => {
+      const u = Math.min(1, Math.max(0, t) / secs);
+      return { yaw: amp * u * u * (3 - 2 * u) + j(0.5), pitch: j(0.5) };
+    }, (mm) => { if (onset === null && mm.s.state === "turning") onset = mm.now; });
+    assert.ok(onset !== null, `${amp}: never turned`);
+    const settle = onset - (m.now - 3) - secs;
+    assert.ok(settle < 0.7, `${amp}: rate armed ${settle.toFixed(2)} s after the head arrived`);
+    assert.ok(m.s.offset.yaw < -60, `${amp}: turned ${m.s.offset.yaw}`);
+  }
 });
 
 test("held past the zone the view keeps turning: full 360 and beyond, smoothly", () => {
@@ -365,6 +432,23 @@ test("a face lost mid-turn stops the rate at once and holds the offset", () => {
   assert.equal(m.s.state, "lost");
 });
 
+test("one untracked reading mid-turn does not hitch the rate; two in a row pause it", () => {
+  const m = acquired();
+  m.run(1.5, still(40, 0));
+  assert.equal(m.s.state, "turning");
+  let k = 0, slowest = -Infinity;
+  // Every 10th reading rejected (bad fit / jump): the pan keeps its full speed.
+  m.run(2, () => (k++ % 10 === 5 ? { yaw: 0, pitch: 0, tracked: false } : { yaw: 40, pitch: 0 }), (mm) => {
+    slowest = Math.max(slowest, mm.s.diagnostics().rate);   // rates are negative here
+  });
+  near(slowest, -90, 1e-9, "never paused");
+  // A real loss: at most about one more frame of rate before it stops.
+  const before = m.s.offset.yaw;
+  m.run(0.5, lost);
+  assert.ok(Math.abs(m.s.offset.yaw - before) < 90 / 30 + 0.5, `spun ${m.s.offset.yaw - before} after the loss`);
+  assert.equal(m.s.diagnostics().rate, 0);
+});
+
 test("resume after loss glides (resumeOmega) instead of snapping", () => {
   const m = acquired();
   m.run(3, still(10, 0));
@@ -378,6 +462,28 @@ test("resume after loss glides (resumeOmega) instead of snapping", () => {
   assert.ok(covered > 0.05 && covered < 0.4, `covered ${covered} in 0.1 s`);
   m.run(1.5, still(0, 0));
   near(m.yaw, 0, 0.5);
+});
+
+test("the resume glide eases into followOmega without re-accelerating", () => {
+  for (const big of [120, 30]) {
+    const m = acquired();
+    m.s.drag(big, 0);
+    m.run(2);
+    near(m.yaw, big, 0.1);
+    m.s.recenter();
+    // Speed rises to one peak, then only falls (a hard omega switch at 0.5 s
+    // made it speed up again ~20% near the end of the glide).
+    let prev = m.yaw, prevSpeed = 0, falling = false, bumps = 0;
+    m.run(1.5, still(0, 0), (mm) => {
+      const speed = Math.abs(mm.yaw - prev);
+      prev = mm.yaw;
+      if (falling && speed > prevSpeed + 1e-6) bumps++;
+      if (speed < prevSpeed) falling = true;
+      prevSpeed = speed;
+    });
+    assert.equal(bumps, 0, `${big} deg glide re-accelerated`);
+    near(m.yaw, 0, 0.5);
+  }
 });
 
 test("stale detection compares reading capture time with tick time on one clock", () => {
@@ -547,6 +653,21 @@ test("recenter while moving, untracked, or looking far off re-acquires", () => {
     m.run(2, still(3, 2));
     assert.equal(m.s.state, "tracking", `${name}: re-acquired`);
     near(m.yaw, 0, 0.5, name);
+  }
+});
+
+test("recenter pressed while looking at the keyboard never makes the keyboard the neutral", () => {
+  // -30 is outside the old neutral's pitch zone; -20 is inside it but off the screen.
+  for (const kb of [-30, -20]) {
+    const m = acquired();
+    m.run(1, still(0, kb));
+    m.s.recenter();
+    m.run(0.9, still(0, kb));                // still looking down after the key press
+    m.run(1.5, still(0, 0));
+    assert.equal(m.s.state, "tracking", `${kb}`);
+    near(m.s.diagnostics().neutral.pitch, 0, 0.5, `${kb}: neutral pitch`);
+    m.run(1, still(0, 0));
+    near(m.pitch, 0, 0.5, `${kb}: view pitch facing the screen`);
   }
 });
 

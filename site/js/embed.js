@@ -3,7 +3,14 @@
  * Quality: the embed ignores every quality call; it picks its tier from the
  * iframe's layout size.  So the iframe is laid out at k·W × k·H (k from the
  * tier quality.js chose) and drawn back at W × H with transform: scale(1/k)
- * inside an overflow-hidden stage.  See quality.js for the tier math.
+ * inside an overflow-hidden stage.  k >= 1 normally; k < 1 (laid out small,
+ * scaled up) only for a capped tier narrower than the window, the one way
+ * to honour Max quality, the decode cap or a stall step-down there.  See
+ * quality.js (layoutScale, layoutFloor) for the tier math.
+ *
+ * The iframe is out of the tab order (tabindex -1): focus inside youtube's
+ * document takes every page shortcut with it.  Not `inert`: the skip-ad
+ * hole still needs clicks to reach it.
  *
  * Lifecycle: ONE YT.Player for the life of the page (creating one per video
  * leaks listeners and workers).  The first open() builds it with the video;
@@ -14,14 +21,14 @@
  * Ads are drawn by YouTube regardless and must stay clickable.
  */
 
-import { LEVEL_HEIGHTS, layoutScale, K_MAX } from "./quality.js";
+import { LEVEL_HEIGHTS, layoutFloor, layoutScale, K_MAX, K_MIN } from "./quality.js";
 
 const DEG = Math.PI / 180;
 const API_TIMEOUT_MS = 15000;
 const READY_TIMEOUT_MS = 15000;
 const FIT_DEBOUNCE_MS = 150;
 
-export { K_MAX };
+export { K_MAX, K_MIN };
 
 /* Named for the viewer, not the API. */
 export const REFUSALS = Object.freeze({
@@ -128,6 +135,17 @@ export function resetIframeApiForTests() {
 
 const raf = (fn) => (typeof requestAnimationFrame === "function" ? requestAnimationFrame(fn) : null);
 
+/* Out of the tab order, pinned to the stage corner and scaled by 1/k. */
+function dressIframe(iframe, k) {
+  iframe.tabIndex = -1;
+  const style = iframe.style;
+  style.position = "absolute";
+  style.left = "0";
+  style.top = "0";
+  style.transformOrigin = "0 0";
+  style.transform = k === 1 ? "none" : `scale(${1 / k})`;
+}
+
 export class EmbedPlayer {
   /* options.readyTimeoutMs / apiTimeoutMs exist for tests. */
   constructor(container, { readyTimeoutMs = READY_TIMEOUT_MS, apiTimeoutMs = API_TIMEOUT_MS } = {}) {
@@ -213,7 +231,9 @@ export class EmbedPlayer {
 
   layout() {
     const { width, height } = this.measure();
-    const k = layoutScale(width, this.tier ? this.tier.w : width, K_MAX);
+    const tierW = this.tier ? this.tier.w : width;
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    const k = layoutScale(width, tierW, K_MAX, layoutFloor(width, tierW, dpr, this.fov));
     return { width, height, k, innerW: Math.round(width * k), innerH: Math.round(height * k) };
   }
 
@@ -226,7 +246,7 @@ export class EmbedPlayer {
     const mount = document.createElement("div");
     stage.appendChild(mount);
     this.container.appendChild(stage);
-    const { innerW, innerH } = this.layout();
+    const { innerW, innerH, k } = this.layout();
 
     let built = null;
     const teardown = () => {
@@ -259,7 +279,7 @@ export class EmbedPlayer {
             onReady: () => settle(),
             onError: (event) => {
               const code = event && event.data;
-              if (!settled) settle(new Error(refusal(code)));
+              if (!settled) settle(Object.assign(new Error(refusal(code)), { code }));
               else this.emit("onError", refusal(code), code);
             },
             onStateChange: (event) => this.onState(event && event.data),
@@ -268,13 +288,30 @@ export class EmbedPlayer {
               this.emit("onQuality", this.playbackQuality);
             },
             onAutoplayBlocked: () => this.emit("onAutoplayBlocked"),
+            // YouTube loads its captions module on its own after playback
+            // starts (ASR captions, a language mismatch); unload it again.
+            onApiChange: () => {
+              if (this.player !== built) return;
+              const modules = this.call("getOptions");
+              if (!Array.isArray(modules) || modules.includes("captions") || modules.includes("cc")) {
+                this.muteCaptions();
+              }
+            },
           },
         };
         try {
           built = new YT.Player(mount, options);
         } catch (error) {
           settle(error instanceof Error ? error : new Error(String(error)));
+          return;
         }
+        // YT.Player swaps the mount for its iframe synchronously, laid out
+        // at k·W × k·H; scale it now, not at onReady, or the stage shows a
+        // k-times zoomed corner of the loading view meanwhile.  If no
+        // iframe is there yet, keep the stage hidden until ready instead.
+        const early = typeof stage.querySelector === "function" ? stage.querySelector("iframe") : null;
+        if (early) dressIframe(early, k);
+        else stage.style.visibility = "hidden";
       });
     } catch (error) {
       // Timed out or refused before ready: nothing about this player can be
@@ -288,6 +325,9 @@ export class EmbedPlayer {
       // (it is ready and reusable) but silence it.
       this.player = built;
       this.stage = stage;
+      this.applied = null;
+      this.fit();
+      stage.style.visibility = "";
       try { built.stopVideo(); } catch { /* never played */ }
       throw new Error("the video was let go of before it loaded");
     }
@@ -295,6 +335,7 @@ export class EmbedPlayer {
     this.stage = stage;
     this.applied = null;
     this.fit();
+    stage.style.visibility = "";
   }
 
   emit(name, ...args) {
@@ -315,13 +356,14 @@ export class EmbedPlayer {
     if (state === PS.PLAYING) {
       if (this.assertOnPlay) {
         // First PLAYING of this video: the 360 renderer has just come up
-        // with its own default view, so re-send ours; re-assert sound and
-        // captions, which reload per video.
+        // with its own default view, so re-send ours; re-assert sound,
+        // which reloads per video.
         this.assertOnPlay = false;
         this.sent = null;
-        this.muteCaptions();
         this.setSound(this.volume, this.muted);
       }
+      // Captions on every PLAYING: the module can load after the first one.
+      this.muteCaptions();
       this.emit("onPlaying");
     } else if (state === PS.BUFFERING) {
       this.emit("onBuffering");
@@ -341,16 +383,13 @@ export class EmbedPlayer {
     const iframe = player && typeof player.getIframe === "function" ? player.getIframe() : null;
     const { width, height, k, innerW, innerH } = this.layout();
     this.k = k;
-    if (!iframe || !width || !height) return;
+    if (!iframe) return;
+    iframe.tabIndex = -1;
+    if (!width || !height) return;
     const a = this.applied;
     if (a && a.innerW === innerW && a.innerH === innerH && a.k === k) return;
     if (typeof player.setSize === "function") player.setSize(innerW, innerH);
-    const style = iframe.style;
-    style.position = "absolute";
-    style.left = "0";
-    style.top = "0";
-    style.transformOrigin = "0 0";
-    style.transform = k === 1 ? "none" : `scale(${1 / k})`;
+    dressIframe(iframe, k);
     this.applied = { innerW, innerH, k };
   }
 
@@ -375,11 +414,21 @@ export class EmbedPlayer {
     return { label, height: LEVEL_HEIGHTS[label] };
   }
 
-  /* Captions off, and kept off: the captions module reloads per video. */
+  /* Captions off, and kept off: nothing may float over the video and the
+   * chrome has no CC control.  cc_load_policy 0 does not force them off,
+   * and the module reloads per video (and can load late), so this runs on
+   * every PLAYING and on onApiChange.  Clearing the track first stops a
+   * reloaded module from bringing the same track back. */
   muteCaptions() {
-    if (!this.player || typeof this.player.unloadModule !== "function") return;
+    const player = this.player;
+    if (!player) return;
     for (const module of ["captions", "cc"]) {
-      try { this.player.unloadModule(module); } catch { /* not loaded */ }
+      if (typeof player.setOption === "function") {
+        try { player.setOption(module, "track", {}); } catch { /* not loaded */ }
+      }
+      if (typeof player.unloadModule === "function") {
+        try { player.unloadModule(module); } catch { /* not loaded */ }
+      }
     }
   }
 

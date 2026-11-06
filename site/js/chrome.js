@@ -126,6 +126,45 @@ export function stepVolume(volume, delta) {
   return Math.min(1, Math.max(0, next));
 }
 
+/* ↑/↓ on { volume, muted } → the new pair, or null for "change nothing".
+ * Muted, ↓ leaves the remembered level alone (stepping from a silent 0 would
+ * overwrite it with 0, and the next unmute would come back at a default);
+ * ↑ unmutes and steps from the remembered level. */
+export function volumeStep({ volume, muted } = {}, delta) {
+  if (muted && delta < 0) return null;
+  const next = stepVolume(volume, delta);
+  return { volume: next, muted: next > 0 ? false : Boolean(muted) };
+}
+
+/* What the transport shows, from the phase and the engine's live reads.
+ * Ended pins the clock to the end: youtube's getCurrentTime can stay where a
+ * paused seek left it after ENDED, which put a half-watched bar under the
+ * end panel. */
+export function transportSnapshot({ phase, time, duration, buffered, paused } = {}) {
+  const playable = phase === "playing" || phase === "loading" || phase === "ended";
+  if (!playable) return { currentTime: 0, duration: NaN, buffered: 0, paused: Boolean(paused) };
+  const known = Number.isFinite(duration) && duration > 0;
+  if (phase === "ended" && known) return { currentTime: duration, duration, buffered: 1, paused: true };
+  return { currentTime: time, duration, buffered, paused: Boolean(paused) };
+}
+
+/* youtube's refusals that no retry can change: a malformed id, a removed or
+ * private video, an uploader who blocks embedding.  Offering Retry for these
+ * only replays the same refusal. */
+export const PERMANENT_REFUSALS = Object.freeze([2, 100, 101, 150]);
+
+export const retryableRefusal = (code) => !PERMANENT_REFUSALS.includes(Number(code));
+
+/* The head tracker reported an error: has it given up?  A fatal report (the
+ * tracker has already stopped itself), or any report that finds an open
+ * camera no longer running, means the session must fall back to tracking
+ * off.  Errors while the camera is still opening belong to open()'s own
+ * rejection, and per-frame or recovered errors leave the tracker running. */
+export function trackerGaveUp({ fatal = false, running = true, playerOpen = false, trackingWanted = false, cameraState = "off" } = {}) {
+  if (!playerOpen || !trackingWanted || cameraState !== "open") return false;
+  return Boolean(fatal) || !running;
+}
+
 /* A pointer drag → view-space degrees.  Grab-the-world, as youtube does it:
  * dragging right pulls the picture right, which turns the view left
  * (view.yaw > 0 is left); dragging down turns it up.  One horizontal pixel

@@ -282,7 +282,10 @@ body:not(.browsing) #library {
 }
 /* Behind the picture the library is invisible, and an animation that keeps
    painting there is main-thread time taken from the video. */
-body:not(.browsing) #library .strip { animation: none; }
+body:not(.browsing) #library .strip,
+body:not(.browsing) #library .skeleton h2,
+body:not(.browsing) #library .skeleton .shelfrow i::before,
+body:not(.browsing) #library .skeleton .shelfrow i::after { animation: none; }
 
 @keyframes shimmer {
   from { background-position: 100% 0; }

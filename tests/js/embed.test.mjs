@@ -19,6 +19,14 @@ function el(tag) {
     tag, children: [], style: {}, parentNode: null,
     appendChild(child) { child.parentNode = this; this.children.push(child); return child; },
     removeChild(child) { this.children = this.children.filter((c) => c !== child); child.parentNode = null; },
+    querySelector(tagName) {
+      for (const child of this.children) {
+        if (child.tag === tagName) return child;
+        const deeper = child.querySelector && child.querySelector(tagName);
+        if (deeper) return deeper;
+      }
+      return null;
+    },
   };
 }
 globalThis.document = {
@@ -29,7 +37,7 @@ globalThis.document = {
 globalThis.location = { origin: "https://lazyvr.test" };
 
 const {
-  EmbedPlayer, K_MAX, REFUSALS, iframeApi, movedEnough, refusal, resetIframeApiForTests,
+  EmbedPlayer, K_MAX, K_MIN, REFUSALS, iframeApi, movedEnough, refusal, resetIframeApiForTests,
   sphericalFromView, youtubeFov,
 } = await import("../../site/js/embed.js");
 const { TIERS, tierOf } = await import("../../site/js/quality.js");
@@ -42,15 +50,21 @@ const tick = () => new Promise((r) => setTimeout(r, 0));
 
 const PS = { UNSTARTED: -1, ENDED: 0, PLAYING: 1, PAUSED: 2, BUFFERING: 3, CUED: 5 };
 const builds = [];
+let swapMount = false;   // mimic the real API: the mount is replaced by the iframe at once
 
 /* A YT.Player whose methods throw until ready (as a real one has none). */
 function FakePlayer(mount, options) {
   const b = {
     mount, options, events: options.events, ready: false, destroyed: false,
-    calls: [], iframe: { style: {}, attrs: {} }, state: PS.UNSTARTED,
-    time: 0, dur: 0, loaded: 0, quality: "unknown", data: { title: "" },
+    calls: [], iframe: { tag: "iframe", style: {}, attrs: {}, parentNode: null }, state: PS.UNSTARTED,
+    time: 0, dur: 0, loaded: 0, quality: "unknown", data: { title: "" }, modules: [],
   };
   builds.push(b);
+  if (swapMount && mount.parentNode) {
+    const parent = mount.parentNode;
+    parent.removeChild(mount);
+    parent.appendChild(b.iframe);
+  }
   const method = (name, fn = () => {}) => {
     this[name] = (...args) => {
       if (!b.ready) throw new TypeError(`${name} is not a function`);
@@ -69,6 +83,8 @@ function FakePlayer(mount, options) {
   method("mute");
   method("unMute");
   method("unloadModule");
+  method("setOption");
+  method("getOptions", () => b.modules);
   method("getIframe", () => b.iframe);
   method("getPlayerState", () => b.state);
   method("getCurrentTime", () => b.time);
@@ -95,6 +111,8 @@ function container(w = 1280, h = 720) {
 
 beforeEach(() => {
   builds.length = 0;
+  swapMount = false;
+  delete window.devicePixelRatio;
   installYT();
   resetIframeApiForTests();
   delete globalThis.requestAnimationFrame;
@@ -378,7 +396,8 @@ test("first PLAYING after a load re-sends the view, sound and captions; later on
   b.state$(PS.BUFFERING);
   b.state$(PS.PLAYING);
   player.steer(view);
-  assert.equal(b.calls.length, 0, "a rebuffer re-sends nothing");
+  const captions = (c) => c[0] === "unloadModule" || c[0] === "setOption";
+  assert.deepEqual(b.calls.filter((c) => !captions(c)), [], "a rebuffer re-sends no view or sound");
 
   // A new video re-arms the assertion.
   await player.open("next", {});
@@ -454,12 +473,38 @@ test("layout: the iframe is laid out at k·W×k·H and scaled by 1/k from the co
   assert.equal(b.iframe.style.position, "absolute");
 });
 
-test("layout: k is clamped to [1, K_MAX]", async () => {
+test("layout: k is clamped to K_MAX above; an uncapped tier never shrinks the layout", async () => {
   const small = await readyPlayer({ w: 800, h: 450, tier: tierOf("highres") });
   assert.equal(small.player.k, K_MAX);
   assert.deepEqual(small.b.iframe.attrs, { width: 2400, height: 1350 });
-  const big = await readyPlayer({ w: 3000, h: 1500, tier: tierOf("hd1080") });
-  assert.equal(big.player.k, 1);
+  // hd720 covers what a 3000 px window needs at DPR 0.25, 360° (750 px):
+  // not a cap, so the layout stays window-sized.
+  window.devicePixelRatio = 0.25;
+  const uncapped = await readyPlayer({ w: 3000, h: 1500, tier: tierOf("hd720"), player: {} });
+  uncapped.player.fov = 360;
+  uncapped.player.fit();
+  assert.equal(uncapped.player.k, 1);
+  assert.deepEqual(uncapped.b.iframe.attrs, { width: 3000, height: 1500 });
+});
+
+test("layout: a capped tier narrower than the window lays out smaller and scales up (k < 1)", async () => {
+  // Max quality 1080 on a 3000 px window: a window-sized layout would get
+  // ~hd1440, so the cap is only honoured by a 1920 px layout.
+  const { player, b } = await readyPlayer({ w: 3000, h: 1500, tier: tierOf("hd1080") });
+  assert.equal(player.k, 0.64);
+  assert.deepEqual(b.iframe.attrs, { width: 1920, height: 960 });
+  assert.equal(b.iframe.style.transform, `scale(${1 / 0.64})`);
+  // Stall step-down at 1920: hd1080 -> hd720 now shrinks the layout (it was
+  // a no-op when k was floored at 1).
+  const step = await readyPlayer({ w: 1920, h: 1080, tier: tierOf("hd1080") });
+  assert.equal(step.player.layout().innerW, 1920);
+  step.player.setTier(tierOf("hd720"));
+  assert.equal(step.player.layout().innerW, 1280);
+  assert.deepEqual(step.b.iframe.attrs, { width: 1280, height: 720 });
+  // Floored at K_MIN: hd720 on a 3840 px window lays out at 1920, not 1280.
+  const wide = await readyPlayer({ w: 3840, h: 2160, tier: tierOf("hd720") });
+  assert.equal(wide.player.k, K_MIN);
+  assert.deepEqual(wide.b.iframe.attrs, { width: 1920, height: 1080 });
 });
 
 test("layout: the build itself is sized for the tier", async () => {
@@ -580,4 +625,117 @@ test("build: a YT.Player constructor that throws rejects open and leaves no moun
   assert.equal(host.children.length, 0);
   assert.equal(player.player, null);
   assert.equal(player.building, null);
+});
+
+// ---- review fixes ----------------------------------------------------------
+
+test("a11y: the iframe is out of the tab order once built (no keyboard trap)", async () => {
+  const { b, player } = await readyPlayer({ w: 1920, h: 1080 });
+  assert.equal(b.iframe.tabIndex, -1);
+  // Kept out across refits and later videos.
+  b.iframe.tabIndex = 0;
+  player.setTier(tierOf("hd2160"));
+  assert.equal(b.iframe.tabIndex, -1);
+  b.iframe.tabIndex = 0;
+  await player.open("next", {});
+  assert.equal(b.iframe.tabIndex, -1);
+});
+
+test("a11y: the iframe leaves the tab order even while still loading", async () => {
+  swapMount = true;
+  const host = container(1920, 1080);
+  const player = new EmbedPlayer(host);
+  const opening = player.open("first", {});
+  await tick();
+  const b = builds.at(-1);
+  assert.equal(b.iframe.tabIndex, -1, "tabbable before onReady");
+  b.becomeReady();
+  await opening;
+});
+
+test("build: the iframe is scaled by 1/k before onReady, not k-times zoomed", async () => {
+  swapMount = true;
+  const host = container(1920, 1080);
+  const player = new EmbedPlayer(host);
+  player.tier = tierOf("hd2160");
+  const opening = player.open("first", {});
+  await tick();
+  const b = builds.at(-1);
+  assert.equal(b.ready, false);
+  assert.equal(b.options.width, 3840);
+  assert.equal(b.iframe.style.transform, "scale(0.5)");
+  assert.equal(b.iframe.style.transformOrigin, "0 0");
+  assert.equal(b.iframe.style.position, "absolute");
+  assert.notEqual(host.children[0].style.visibility, "hidden");
+  b.becomeReady();
+  await opening;
+  assert.equal(b.iframe.style.transform, "scale(0.5)");
+});
+
+test("build: with no iframe to scale yet, the stage stays hidden until ready", async () => {
+  const host = container(1920, 1080);
+  const player = new EmbedPlayer(host);
+  player.tier = tierOf("hd2160");
+  const opening = player.open("first", {});
+  await tick();
+  const stage = host.children[0];
+  assert.equal(stage.style.visibility, "hidden");
+  builds.at(-1).becomeReady();
+  await opening;
+  assert.equal(stage.style.visibility, "");
+  assert.equal(builds.at(-1).iframe.style.transform, "scale(0.5)");
+});
+
+test("build: a session let go of before ready still leaves the stage visible and scaled for reuse", async () => {
+  const host = container(1920, 1080);
+  const player = new EmbedPlayer(host);
+  player.tier = tierOf("hd2160");
+  const opening = player.open("abc");
+  await tick();
+  player.close();
+  builds[0].becomeReady();
+  await assert.rejects(opening, /let go of/);
+  assert.equal(host.children[0].style.visibility, "");
+  assert.equal(builds[0].iframe.style.transform, "scale(0.5)");
+  assert.equal(builds[0].iframe.tabIndex, -1);
+});
+
+test("captions: cleared and unloaded on every PLAYING, not only the first", async () => {
+  const { b } = await readyPlayer();
+  const captionCalls = () => b.calls.filter((c) => c[0] === "unloadModule" || c[0] === "setOption");
+  b.calls.length = 0;
+  b.state$(PS.PLAYING);
+  assert.deepEqual(captionCalls(), [
+    ["setOption", "captions", "track", {}], ["unloadModule", "captions"],
+    ["setOption", "cc", "track", {}], ["unloadModule", "cc"],
+  ]);
+  b.calls.length = 0;
+  b.state$(PS.BUFFERING);
+  b.state$(PS.PLAYING);
+  assert.equal(captionCalls().length, 4, "a later PLAYING re-mutes captions");
+});
+
+test("captions: a captions module loaded late (onApiChange) is unloaded again", async () => {
+  const { b } = await readyPlayer();
+  b.state$(PS.PLAYING);
+  b.calls.length = 0;
+  b.modules = ["spherical"];
+  b.events.onApiChange({});
+  assert.equal(b.calls.filter((c) => c[0] === "unloadModule").length, 0, "no captions module, nothing to do");
+  b.modules = ["spherical", "captions"];
+  b.events.onApiChange({});
+  assert.ok(b.calls.some((c) => c[0] === "unloadModule" && c[1] === "captions"));
+  assert.ok(b.calls.some((c) => c[0] === "setOption" && c[1] === "captions" && c[2] === "track"));
+});
+
+test("captions: onApiChange before ready does nothing and does not throw", async () => {
+  const host = container();
+  const player = new EmbedPlayer(host);
+  const opening = player.open("first", {});
+  await tick();
+  const b = builds.at(-1);
+  b.events.onApiChange({});   // methods throw until ready; must be swallowed
+  assert.equal(b.calls.length, 0);
+  b.becomeReady();
+  await opening;
 });

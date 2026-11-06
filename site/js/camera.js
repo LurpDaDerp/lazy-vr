@@ -15,6 +15,11 @@
  * Every session (open) gets a run id. The worker tags readings with it and
  * re-checks it after each await; the page drops readings from any other run,
  * so a reading from a retired session can never steer the next one.
+ *
+ * onError(error, { fatal }): fatal means the tracker stopped itself (the camera
+ * ended, never delivered a picture, or crash recovery gave up). By then running
+ * is false and the camera is released; error.fatal is set as well. Anything
+ * else (a worker crash being recovered, per-frame errors) is not fatal.
  */
 
 /* An unanswered permission prompt leaves getUserMedia pending forever (chrome's
@@ -78,13 +83,15 @@ async function listCameras() {
 
 export class HeadTracker {
   constructor({ models = "models", onStatus = () => {}, onReading = () => {}, onError = () => {},
-    permissionGrace = PERMISSION_GRACE_MS, modelGrace = MODEL_GRACE_MS } = {}) {
+    permissionGrace = PERMISSION_GRACE_MS, modelGrace = MODEL_GRACE_MS,
+    pictureTimeout = PICTURE_TIMEOUT_MS } = {}) {
     this.models = models.replace(/\/$/, "");
     this.onStatus = onStatus;
     this.onReading = onReading;
     this.onError = onError;
     this.permissionGrace = permissionGrace;
     this.modelGrace = modelGrace;
+    this.pictureTimeout = pictureTimeout;
 
     this.mode = "inline";
     this.rate = 0;
@@ -113,6 +120,8 @@ export class HeadTracker {
     this.resize = true;         // frames mode: createImageBitmap honours resize options
     this.reportedRun = 0;       // processing errors go to onError once per run
     this.config = {};           // live engine settings (camera position), re-sent to every engine
+    this.watched = null;        // { track, onEnded }: the live session's track
+    this.pictureWatch = 0;      // stream mode: timer for a camera that never delivers
   }
 
   /* Live settings for the pose solver (today: screenOffsetCm, from the camera
@@ -219,12 +228,21 @@ export class HeadTracker {
       case "reading":
         if (worker === this.worker) this.deliver(data.reading, data.run);
         break;
+      case "ended":
+        // The frame stream closed under a live run: the camera went away.
+        if (worker === this.worker && data.run === this.runId && this.running) {
+          this.halt(new Error("The camera stopped."));
+        }
+        break;
       case "ready":
         // A late "ready" from a retired run must not open a second slot.
         if (data.run === this.runId) this.inflight = false;
         break;
       case "error":
-        if (data.run === this.runId) this.processingError(new Error(data.message), data.run);
+        if (data.run === this.runId) {
+          this.pictureArrived(data.run);  // frames are arriving, even if they fail
+          this.processingError(new Error(data.message), data.run);
+        }
         break;
       default:
         break;
@@ -233,18 +251,27 @@ export class HeadTracker {
 
   deliver(reading, run) {
     if (!reading || !this.running || run !== this.runId) return;
+    this.pictureArrived(run);
     reading.run = run;
     if (Number.isFinite(reading.rate)) this.rate = reading.rate;
     this.onReading(reading);
   }
 
-  report(error) {
+  report(error, { fatal = false } = {}) {
     this.error = error;
+    if (fatal && error && typeof error === "object") error.fatal = true;
     try {
-      this.onError(error);
+      this.onError(error, { fatal });
     } catch (listenerError) {
       console.error(listenerError);
     }
+  }
+
+  /* The tracker stops itself: release the camera first, so a listener that
+   * reacts already sees running false, then say so as fatal. */
+  halt(error) {
+    this.stop();
+    this.report(error, { fatal: true });
   }
 
   /* Per-frame failures repeat at frame rate; tell the listener once per run. */
@@ -295,9 +322,11 @@ export class HeadTracker {
     try {
       await recovering;
     } catch (error) {
-      this.report(new Error(`Head tracking could not be restarted: ${messageOf(error)}`));
+      const failed = new Error(`Head tracking could not be restarted: ${messageOf(error)}`);
       // Nothing left to process frames: let the camera go rather than keep the light on.
-      if (this.running && this.openId === session) this.stop();
+      // With no live session nothing stops; an open() waiting on it fails by itself.
+      if (this.running && this.openId === session) this.halt(failed);
+      else this.report(failed);
       return;
     }
     // Rewire only a session that had been wired; an open() still on its way
@@ -307,8 +336,7 @@ export class HeadTracker {
       await this.begin(session);
     } catch (error) {
       if (this.openId !== session) return;
-      this.stop();
-      this.report(error);
+      this.halt(error);
     }
   }
 
@@ -398,6 +426,9 @@ export class HeadTracker {
     let error = null;
     const walk = async (list) => {
       for (const video of list) {
+        // Retired (a stop, or a newer open): ask nothing more, or another
+        // camera's light could come on after the viewer said no camera.
+        if (mine !== this.openId) return null;
         try {
           const got = await navigator.mediaDevices.getUserMedia({ video, audio: false });
           error = null;
@@ -445,7 +476,9 @@ export class HeadTracker {
     this.inflight = false;
     this.lastVideoTime = -1;
     this.reportedRun = 0;
+    this.clearPictureWatch();
     const track = this.freshTrack();
+    this.watchTrack(track, session);
 
     if (this.worker && track && typeof MediaStreamTrackProcessor !== "undefined") {
       try {
@@ -454,6 +487,7 @@ export class HeadTracker {
         this.processed = track;
         this.worker.postMessage({ type: "stream", stream: readable, run }, [readable]);
         this.mode = "worker";
+        this.watchPicture(run);
         return;
       } catch { /* no transferable streams here: the page carries the frames */ }
     }
@@ -471,6 +505,54 @@ export class HeadTracker {
     if (session !== this.openId) throw new Error(LET_GO);
     if (run !== this.runId) return;  // a crash recovery rewired this session meanwhile
     this.tick(run);
+  }
+
+  /* A track that ends on its own (unplugged, permission revoked, the system took
+   * the camera) stops the tracker. stop() never fires "ended", so a normal
+   * teardown cannot set this off; the guards drop a retired session's track. */
+  watchTrack(track, session) {
+    this.unwatchTrack();
+    if (!track || typeof track.addEventListener !== "function") return;
+    const onEnded = () => {
+      if (!this.watched || this.watched.track !== track) return;
+      if (session !== this.openId || !this.running) return;
+      this.halt(new Error("The camera stopped."));
+    };
+    track.addEventListener("ended", onEnded, { once: true });
+    this.watched = { track, onEnded };
+  }
+
+  unwatchTrack() {
+    const watched = this.watched;
+    this.watched = null;
+    if (watched && typeof watched.track.removeEventListener === "function") {
+      watched.track.removeEventListener("ended", watched.onEnded);
+    }
+  }
+
+  /* Stream mode never sees the picture on the page (attachVideo's timeout
+   * covers the other modes): a run with no reading or error by the deadline
+   * has a camera that opened but delivers nothing. */
+  watchPicture(run) {
+    this.clearPictureWatch();
+    const watch = setTimeout(() => {
+      if (this.pictureWatch !== watch) return;
+      this.pictureWatch = 0;
+      if (run !== this.runId || !this.running) return;
+      this.halt(new Error("The camera opened but never delivered a picture."));
+    }, this.pictureTimeout);
+    // Node only (the tests): never hold the process open for it.
+    if (typeof watch === "object" && typeof watch.unref === "function") watch.unref();
+    this.pictureWatch = watch;
+  }
+
+  pictureArrived(run) {
+    if (this.pictureWatch && run === this.runId) this.clearPictureWatch();
+  }
+
+  clearPictureWatch() {
+    if (this.pictureWatch) clearTimeout(this.pictureWatch);
+    this.pictureWatch = 0;
   }
 
   /* A processor stays attached to its track. After a crash its stream died with
@@ -508,7 +590,7 @@ export class HeadTracker {
     await new Promise((resolve) => {
       const check = () => {
         if (video.videoWidth || failed || session !== this.openId
-          || Date.now() - started > PICTURE_TIMEOUT_MS) {
+          || Date.now() - started > this.pictureTimeout) {
           clearInterval(watch);
           video.removeEventListener("loadedmetadata", check);
           resolve();
@@ -608,6 +690,8 @@ export class HeadTracker {
     this.openId += 1;
     this.busy = false;
     this.inflight = false;
+    this.unwatchTrack();
+    this.clearPictureWatch();
     if (this.worker) this.worker.postMessage({ type: "stop" });
     const stream = this.stream;
     this.stream = null;
