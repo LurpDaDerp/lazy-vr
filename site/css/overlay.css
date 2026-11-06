@@ -1,161 +1,112 @@
-/* The overlay: the house lights going down.  Status lines while the tracker
- * starts, the camera opens and the player is built; the calibration's
- * get-ready and its hold; errors with a button.  Nearly opaque, so the HUD
- * and the picture beneath stay quiet: the fixation ring is the only lit
- * thing on it. */
+/* What stands over the picture when the player needs an answer: the
+ * camera sheet, the big Play button, the end panel, the error panel, and
+ * the shortcuts popover.  All sit inside #player, under the chrome (whose
+ * bars sit clear of them) and over the picture. */
 
-#overlay {
-  position: fixed;
-  inset: 0;
-  /* Above the library (30): the self-test result and any error reached
-     from a deep link must show over the shelves, not behind them. */
-  z-index: 35;
-  display: grid;
-  /* Dome Deep at 96%: the picture is a suggestion behind the lights, not a
-     view.  A faint grain over the vignette breaks the banding a smooth
-     radial gradient shows exactly where the eye is asked to hold still;
-     blended overlay, its mean is neutral, so it dithers the dark without
-     lifting it. */
-  background:
-    url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='160' height='160'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='1.1' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='1 0 0 0 0 1 0 0 0 0 1 0 0 0 0 0 0 0 0 0.06'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E") repeat,
-    var(--vignette),
-    color-mix(in srgb, var(--dome-deep) 96%, transparent);
-  background-blend-mode: overlay, normal, normal;
-  /* Lights come down slower than the HUD wakes (180ms), and go up slower still. */
-  transition: opacity 320ms var(--ease-out), visibility 0s;
-}
-
-/* Gone: faded and out of the tab order, so a lingering "Play" cannot be
-   focused through an invisible sheet. */
-#overlay.gone {
-  opacity: 0;
-  visibility: hidden;
-  pointer-events: none;
-  transition: opacity 500ms var(--ease-out), visibility 0s linear 500ms;
-}
-
-/* Calibrating changes nothing else on the sheet; the ring is the difference. */
-
-/* -- the fixation ring: the one authored animation ------------------ */
-
-#fixation {
-  position: fixed;
-  top: 50%;
-  left: 50%;
-  width: 48px;
-  height: 48px;
-  z-index: 36;
-  pointer-events: none;
-  opacity: 0;
-  transform: translate(-50%, -50%) scale(0.6);
-  transition: opacity 240ms var(--ease-out), transform 240ms var(--ease-out);
-}
-#fixation.on {
-  opacity: 1;
-  transform: translate(-50%, -50%) scale(1);
-}
-#fixation svg {
-  display: block;
-  width: 48px;
-  height: 48px;
-  overflow: visible;   /* the dot's halo may spill past the box */
-}
-/* Class selectors only: an id here would outrank the dot's own fill. */
-.ring-track, .ring-count, .ring-fill { fill: none; }
-
-/* At rest: a hairline circle. */
-.ring-track {
-  stroke: var(--rail-strong);
-  stroke-width: 1;
-  transition: stroke var(--t-fast) var(--ease-out);
-}
-
-/* The countdown: three arcs, a third of the circumference each (2π·21 / 3,
-   less a 4px gap), starting at twelve o'clock and going clockwise.  Brass,
-   not lamp: these only ever show during the get-ready phase, and the lamp
-   is what says the tracker has started reading. */
-.ring-count {
-  stroke: var(--brass);
-  stroke-width: 2;
-  stroke-dasharray: 39.98 999;
-  transform-origin: 24px 24px;
-  opacity: 0;
-  transition: opacity 200ms var(--ease-out);
-}
-.ring-count[data-third="1"] { transform: rotate(-90deg); }
-.ring-count[data-third="2"] { transform: rotate(30deg); }
-.ring-count[data-third="3"] { transform: rotate(150deg); }
-.ring-count.on { opacity: 1; }
-/* The count stays lit in the DOM once the hold starts; the fill takes over
-   the same circle, so the arcs step aside or the progress could not be seen. */
-#fixation.holding .ring-count { opacity: 0; }
-
-/* The hold: the ring fills clockwise with the calibration progress.  The
-   full circumference is 131.95; app.js sets --fill from 0 to 1. */
-.ring-fill {
-  stroke: var(--lamp);
-  stroke-width: 2;
-  stroke-dasharray: 131.95;
-  stroke-dashoffset: calc(131.95 * (1 - var(--fill, 0)));
-  transform: rotate(-90deg);
-  transform-origin: 24px 24px;
-  opacity: 0;
-  transition: stroke-dashoffset 120ms linear, opacity var(--t-fast) var(--ease-out);
-}
-#fixation.holding .ring-fill { opacity: 1; }
-
-/* The dot, and the one glow on the page. */
-.ring-dot {
-  fill: var(--lamp);
-  filter: drop-shadow(0 0 10px var(--lamp-glow));
-  transition: fill var(--t-fast) var(--ease-out), filter var(--t-fast) var(--ease-out);
-}
-
-/* Getting ready: the three seconds before the tracker reads anything.  A
-   viewer who cannot tell the run-up from the measuring holds their breath
-   through the countdown and relaxes exactly when it starts to matter, so
-   the two phases are lit differently.  Here the whole ring is brass and
-   unlit -- engraved, not live -- and the lamp and its glow come on with the
-   hold.  Colour and nothing else: the dot marks the centre the calibration
-   is measured against, and moving it by a pixel would tilt the map. */
-#fixation.getready .ring-track { stroke: var(--rail); }
-#fixation.getready .ring-dot {
-  fill: var(--brass);
-  filter: none;
-}
-
-/* A look-away: track and dot flash ember for the 600ms the class is on. */
-#fixation.away .ring-track { stroke: var(--ember); }
-#fixation.away .ring-dot {
-  fill: var(--ember);
-  filter: drop-shadow(0 0 10px var(--ember-soft));
-}
-
-/* -- one line of text, below the ring --------------------------------- */
-
-#overlaybox {
+.scrim-center {
   position: absolute;
-  top: calc(50% + 72px);
-  left: 0;
-  right: 0;
-  padding: 0 var(--gutter);
+  inset: 0;
+  z-index: 3;
+  display: grid;
+  place-items: center;
+  padding: var(--gutter);
+  background: var(--vignette), rgba(6, 8, 20, 0.72);
+}
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: var(--s-3);
+}
+.actions .icon { width: 18px; height: 18px; }
+
+/* -- the big Play: a lamp disc, the one live thing on screen ----------- */
+
+#bigplay { background: var(--scrim); }
+/* With nothing loaded behind it (a deep link before its click) the room
+   is dark, not a hole. */
+#bigplay.ready { background: var(--vignette), var(--dome-deep); }
+.bigplay {
+  display: grid;
+  place-items: center;
+  width: 80px;
+  height: 80px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: var(--lamp);
+  color: var(--dome-deep);
+  transition: background var(--t-base) var(--ease-out), transform var(--t-fast) var(--ease-out);
+}
+.bigplay .icon { width: 34px; height: 34px; transform: translateX(2px); }
+.bigplay:hover { background: var(--lamp-deep); }
+.bigplay:active { transform: translateY(1px); }
+.bigplay:focus-visible { outline-offset: 4px; border-radius: 50%; }
+
+/* -- error: one line of what happened, then the way on ----------------- */
+
+.errbox {
+  display: grid;
+  justify-items: center;
+  gap: var(--s-4);
+  max-width: 52ch;
   text-align: center;
 }
-
-#overlaytext {
-  max-width: 52ch;
-  margin: 0 auto;
+#errtext {
   font: var(--t-body);
   color: var(--star);
   text-wrap: balance;
 }
 
-#retry { margin-top: var(--s-4); }
+/* -- the camera sheet: small, over a player that is already playing ---- */
 
-/* base.css gives the button a display; the attribute must still win. */
-#overlay [hidden] { display: none !important; }
-
-/* No scale on the ring for anyone who asked for less motion. */
-@media (prefers-reduced-motion: reduce) {
-  #fixation { transform: translate(-50%, -50%); }
+.sheet {
+  position: absolute;
+  z-index: 3;
+  left: 50%;
+  bottom: 120px;
+  transform: translateX(-50%);
+  width: min(440px, calc(100vw - 2 * var(--gutter)));
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--s-4) var(--s-3);
+  padding: var(--s-6);
+  border: 1px solid var(--rail);
+  border-radius: var(--r-md);
+  background: var(--seat);
+  color: var(--star);
 }
+@starting-style {
+  .sheet:not([hidden]) { opacity: 0; transform: translateX(-50%) translateY(6px); }
+}
+.sheet { transition: opacity var(--t-slow) var(--ease-out), transform var(--t-slow) var(--ease-out); }
+.sheet-icon { width: 24px; height: 24px; color: var(--star-dim); margin-top: 1px; }
+.sheet p { font: var(--t-body); }
+.sheet .actions { grid-column: 1 / -1; justify-content: flex-start; }
+
+/* -- shortcuts: a small popover, centred ------------------------------- */
+
+#shortcuts {
+  position: absolute;
+  z-index: 6;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: min(400px, calc(100vw - 2 * var(--gutter)));
+  max-height: calc(100vh - 2 * var(--gutter));
+  overflow-y: auto;
+  padding: var(--s-6);
+  border: 1px solid var(--rail);
+  border-radius: var(--r-md);
+  background: var(--seat);
+  user-select: text;
+}
+#shortcutlist {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: var(--s-2) var(--s-4);
+  margin: 0;
+  font: var(--t-title);
+}
+#shortcutlist dt { color: var(--brass); white-space: nowrap; }
+#shortcutlist dd { margin: 0; color: var(--star); }

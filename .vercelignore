@@ -1,7 +1,18 @@
+# Uploaded by `vercel deploy` unless listed here (the CLI does not read
+# .gitignore).  The page is site/, the function is api/ + server/.
 .venv
+.pytest_cache
+__pycache__
+node_modules
 videos
 tests
-node_modules
+tools
+docs
+.impeccable
+DESIGN.md
+PRODUCT.md
+CLAUDE.md
+*.md
 Dockerfile
 fly.toml
 render.yaml

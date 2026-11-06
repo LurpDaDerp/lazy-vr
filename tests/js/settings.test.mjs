@@ -1,12 +1,9 @@
-/* The settings store: defaults, the deadzone migration, and the bounds that
- * keep hand-edited storage from breaking the map. */
-
 import assert from "node:assert/strict";
 import { test } from "node:test";
 
-import { DEADZONE_FLOOR, DEFAULTS as CONTROL } from "../../site/js/control.js";
 import {
-  SETTINGS_DEFAULTS, SETTINGS_VERSION, normalize, readSettings, writeSettings,
+  CAMERA_POSITIONS, RESETTABLE, SETTINGS_DEFAULTS, SETTINGS_KEY, SETTINGS_VERSION, createSaver, fillFor,
+  normalize, readSettings, resetSteeringAndPicture, screenOffsetCm, steeringOptions, writeSettings,
 } from "../../site/js/settings.js";
 
 function memoryStorage(initial = {}) {
@@ -14,121 +11,160 @@ function memoryStorage(initial = {}) {
   return {
     getItem: (key) => (map.has(key) ? map.get(key) : null),
     setItem: (key, value) => { map.set(key, String(value)); },
-    dump: () => Object.fromEntries(map),
+    writes: () => map,
   };
 }
 
-test("defaults: nothing stored means the shipped defaults, current version", () => {
-  const settings = normalize({});
-  assert.deepEqual(settings, { ...SETTINGS_DEFAULTS });
-  assert.equal(settings.version, SETTINGS_VERSION);
-  assert.equal(settings.deadzone, CONTROL.deadzoneYaw);
+test("defaults: v4, steering at ×1, horizontal fov 100", () => {
+  const s = normalize({});
+  assert.deepEqual(s, { ...SETTINGS_DEFAULTS });
+  assert.equal(SETTINGS_VERSION, 4);
+  assert.equal(SETTINGS_KEY, "lazyvr.settings");
+  assert.equal(s.fov, 100);
+  assert.equal(s.sensitivity, 1);
+  assert.equal(s.turnSpeed, 1);
+  assert.equal(s.eyeAssist, true);
+  assert.equal(s.cameraPosition, "above");
+  assert.equal(s.diagnostics, false);
 });
 
-test("defaults: normalize never hands back the frozen defaults object", () => {
-  const settings = normalize({});
-  settings.sens = 2;
-  assert.equal(SETTINGS_DEFAULTS.sens, 1);
+test("defaults: never the frozen object itself", () => {
+  const s = normalize({});
+  s.sensitivity = 2;
+  assert.equal(SETTINGS_DEFAULTS.sensitivity, 1);
 });
 
-test("migration: a setting this page no longer has is dropped, not carried", () => {
-  // The raw-stream engine is gone, and so are its keys.  Spreading the
-  // stored blob over the defaults would keep them in the object, write them
-  // back on the next save, and read them again for ever after.
-  const settings = normalize({ version: 2, engine: "stream", codecs: "vp9,av01", maxfps: 60 });
-  assert.deepEqual(Object.keys(settings).sort(), Object.keys(SETTINGS_DEFAULTS).sort());
-  assert.equal("engine" in settings, false);
-  assert.equal("codecs" in settings, false);
-  // And what a stored blob does still name is kept.
-  assert.equal(normalize({ version: 2, engine: "stream", sens: 1.6 }).sens, 1.6);
+test("migration from v3: gaze keys dropped, fov reset, sound/camera/diagnostics carried", () => {
+  const v3 = {
+    version: 3, sens: 1.6, deadzone: 2.4, free: true, blur: false, hints: false, invx: true, invy: true,
+    fov: 85, quality: 1440, volume: 0.4, muted: true, camera: "cam-123", diagnostics: true,
+  };
+  const s = normalize(v3);
+  assert.deepEqual(Object.keys(s).sort(), Object.keys(SETTINGS_DEFAULTS).sort());
+  for (const gone of ["sens", "deadzone", "free", "blur", "hints", "invx", "invy"]) assert.equal(gone in s, false, gone);
+  assert.equal(s.fov, 100, "fov semantics changed (vertical → horizontal): reset");
+  assert.equal(s.volume, 0.4);
+  assert.equal(s.muted, true);
+  assert.equal(s.camera, "cam-123");
+  assert.equal(s.diagnostics, true);
+  assert.equal(s.quality, 1440);
+  // The old inversions were for gaze; head inversion starts off.
+  assert.equal(s.invertYaw, false);
+  assert.equal(s.invertPitch, false);
+  assert.equal(s.version, 4);
 });
 
-test("migration: a stored array or a stored string is not a settings object", () => {
-  assert.deepEqual(normalize([1, 2, 3]), { ...SETTINGS_DEFAULTS });
-  assert.deepEqual(normalize("nonsense"), { ...SETTINGS_DEFAULTS });
-  assert.deepEqual(normalize(null), { ...SETTINGS_DEFAULTS });
+test("migration: no version at all is legacy too", () => {
+  assert.equal(normalize({ fov: 70 }).fov, 100);
 });
 
-test("migration: a deadzone that was only ever a past default moves on", () => {
-  assert.equal(normalize({ version: 1, deadzone: 3.0 }).deadzone, CONTROL.deadzoneYaw);
-  assert.equal(normalize({ version: 2, deadzone: 1.5 }).deadzone, CONTROL.deadzoneYaw);
-  assert.equal(normalize({ deadzone: 1.5 }).deadzone, CONTROL.deadzoneYaw);
+test("v4 keeps its own fov, and a future version is not treated as legacy", () => {
+  assert.equal(normalize({ version: 4, fov: 70 }).fov, 70);
+  assert.equal(normalize({ version: 5, fov: 70 }).fov, 70);
 });
 
-test("migration: a deadzone the viewer chose survives the version bump", () => {
-  const settings = normalize({ version: 2, deadzone: 2.4 });
-  assert.equal(settings.deadzone, 2.4);
-  assert.equal(settings.version, SETTINGS_VERSION);
+test("bounds: garbage and out-of-range values cannot break steering", () => {
+  const s = normalize({
+    version: 4, sensitivity: 9, turnSpeed: -1, fov: 500, volume: 3, quality: 999,
+    eyeAssist: "yes", invertYaw: 1, muted: "true", camera: 42, cameraPosition: "ceiling", diagnostics: null,
+  });
+  assert.equal(s.sensitivity, 2);
+  assert.equal(s.turnSpeed, 0.5);
+  assert.equal(s.fov, 120);
+  assert.equal(s.volume, 1);
+  assert.equal(s.quality, "auto");
+  assert.equal(s.eyeAssist, true);
+  assert.equal(s.invertYaw, false);
+  assert.equal(s.muted, false);
+  assert.equal(s.camera, "");
+  assert.equal(s.cameraPosition, "above");
+  assert.equal(s.diagnostics, false);
+  assert.equal(normalize({ version: 4, fov: 10 }).fov, 60);
+  assert.equal(normalize({ version: 4, sensitivity: "" }).sensitivity, 1);
+  assert.equal(normalize({ version: 4, sensitivity: null }).sensitivity, 1);
+  assert.equal(normalize({ version: 4, sensitivity: "1.5" }).sensitivity, 1.5);
+  assert.equal(normalize({ version: 4, sensitivity: NaN }).sensitivity, 1);
+  assert.equal(normalize({ version: 4, sensitivity: true }).sensitivity, 1);
+  assert.equal(normalize({ version: 4, quality: "2160" }).quality, 2160);
+  assert.equal(normalize({ version: 4, volume: 0 }).volume, 0);
 });
 
-test("migration: a current-version save is never migrated, even at an old default", () => {
-  assert.equal(normalize({ version: SETTINGS_VERSION, deadzone: 1.5 }).deadzone, 1.5);
+test("not an object: defaults", () => {
+  for (const junk of [null, undefined, "x", 42, [1, 2]]) assert.deepEqual(normalize(junk), { ...SETTINGS_DEFAULTS });
 });
 
-test("bounds: numbers are clamped to their sliders, garbage falls back", () => {
-  const settings = normalize({ sens: 9, deadzone: 0, fov: 200 });
-  assert.equal(settings.sens, 2.5);
-  // Not 0, and not 1 either: below the noise floor a deadzone stops being a
-  // deadzone, and the bias in the calibrated centre walks the view.
-  assert.equal(settings.deadzone, DEADZONE_FLOOR);
-  assert.equal(settings.fov, 100);
-  const junk = normalize({ sens: "abc", deadzone: null, fov: undefined, version: SETTINGS_VERSION });
-  assert.equal(junk.sens, 1);
-  assert.equal(junk.deadzone, CONTROL.deadzoneYaw);
-  assert.equal(junk.fov, 75);
-});
-
-test("bounds: quality is one of the offered tiers or auto", () => {
-  assert.equal(normalize({ quality: "1440" }).quality, 1440);
-  assert.equal(normalize({ quality: 2160 }).quality, 2160);
-  assert.equal(normalize({ quality: "999" }).quality, "auto");
-  assert.equal(normalize({ quality: "auto" }).quality, "auto");
-});
-
-test("bounds: booleans are strict, and blur defaults on", () => {
-  const settings = normalize({ blur: undefined, invx: "yes", invy: 1, free: true });
-  assert.equal(settings.blur, true);
-  assert.equal(settings.invx, false);
-  assert.equal(settings.invy, false);
-  assert.equal(settings.free, true);
-  assert.equal(normalize({ blur: false }).blur, false);
-});
-
-test("new keys: camera id, diagnostics, key hints, volume and mute", () => {
-  const settings = normalize({});
-  assert.equal(settings.camera, "");
-  assert.equal(settings.diagnostics, false);
-  assert.equal(settings.hints, true);
-  assert.equal(settings.volume, 1);
-  assert.equal(settings.muted, false);
-  const chosen = normalize({ camera: "abc123", diagnostics: true, hints: false, volume: 0.4, muted: true });
-  assert.equal(chosen.camera, "abc123");
-  assert.equal(chosen.diagnostics, true);
-  assert.equal(chosen.hints, false);
-  assert.equal(chosen.volume, 0.4);
-  assert.equal(chosen.muted, true);
-  const junk = normalize({ camera: 42, volume: 3, muted: "no" });
-  assert.equal(junk.camera, "");
-  assert.equal(junk.volume, 1);
-  assert.equal(junk.muted, false);
-  assert.equal(normalize({ volume: -1 }).volume, 0);
-});
-
-test("storage: unreadable or missing storage yields defaults", () => {
-  assert.deepEqual(readSettings(memoryStorage()), { ...SETTINGS_DEFAULTS });
-  const broken = { getItem: () => { throw new Error("private window"); } };
-  assert.deepEqual(readSettings(broken), { ...SETTINGS_DEFAULTS });
-  assert.deepEqual(readSettings(memoryStorage({ "lazyvr.settings": "{not json" })), { ...SETTINGS_DEFAULTS });
-});
-
-test("storage: a round trip keeps what was chosen and stamps the version", () => {
+test("read/write round trip; unreadable storage means defaults", () => {
   const storage = memoryStorage();
-  writeSettings({ ...SETTINGS_DEFAULTS, sens: 1.6, quality: 1080, hints: false }, storage);
-  const back = readSettings(storage);
-  assert.equal(back.sens, 1.6);
-  assert.equal(back.quality, 1080);
-  assert.equal(back.hints, false);
-  assert.equal(back.version, SETTINGS_VERSION);
-  const failing = { getItem: () => null, setItem: () => { throw new Error("quota"); } };
-  assert.doesNotThrow(() => writeSettings({ ...SETTINGS_DEFAULTS }, failing));
+  const s = { ...normalize({}), sensitivity: 1.25, volume: 0.3 };
+  assert.equal(writeSettings(s, storage), true);
+  const stored = JSON.parse(storage.getItem(SETTINGS_KEY));
+  assert.equal(stored.version, 4);
+  assert.deepEqual(readSettings(storage), s);
+  assert.deepEqual(readSettings(memoryStorage({ [SETTINGS_KEY]: "{not json" })), { ...SETTINGS_DEFAULTS });
+  assert.deepEqual(readSettings(null), { ...SETTINGS_DEFAULTS });
+  const refusing = { getItem: () => null, setItem: () => { throw new Error("quota"); } };
+  assert.equal(writeSettings(s, refusing), false);
+  assert.equal(writeSettings(s, null), false);
+});
+
+test("reset: steering and picture only; volume, mute, camera and interface stay", () => {
+  const custom = normalize({
+    version: 4, sensitivity: 1.7, turnSpeed: 0.6, eyeAssist: false, invertYaw: true, invertPitch: true,
+    fov: 70, quality: 1080, volume: 0.25, muted: true, camera: "cam-9", cameraPosition: "below", diagnostics: true,
+  });
+  const reset = resetSteeringAndPicture(custom);
+  for (const key of RESETTABLE) assert.equal(reset[key], SETTINGS_DEFAULTS[key], key);
+  assert.equal(reset.volume, 0.25);
+  assert.equal(reset.muted, true);
+  assert.equal(reset.camera, "cam-9");
+  assert.equal(reset.cameraPosition, "below");
+  assert.equal(reset.diagnostics, true);
+  assert.notEqual(reset, custom);
+  assert.equal(custom.sensitivity, 1.7, "input not mutated");
+});
+
+test("steeringOptions and screenOffsetCm", () => {
+  const s = normalize({ version: 4, sensitivity: 1.5, invertPitch: true, cameraPosition: "below" });
+  assert.deepEqual(steeringOptions(s), { sensitivity: 1.5, turnSpeed: 1, eyeAssist: true, invertYaw: false, invertPitch: true });
+  assert.equal(screenOffsetCm(s), -10);
+  assert.equal(screenOffsetCm({ cameraPosition: "above" }), 12);
+  assert.equal(screenOffsetCm({ cameraPosition: "beside" }), 0);
+  assert.equal(screenOffsetCm({}), 12);
+  assert.equal(screenOffsetCm(null), 12);
+  assert.deepEqual({ ...CAMERA_POSITIONS }, { above: 12, below: -10, beside: 0 });
+});
+
+test("createSaver: debounced, last write wins, flush writes now", () => {
+  const storage = memoryStorage();
+  const timers = new Map();
+  let nextId = 1;
+  const saver = createSaver(storage, {
+    delay: 300,
+    setTimer: (fn, ms) => { const id = nextId++; timers.set(id, { fn, ms }); return id; },
+    clearTimer: (id) => timers.delete(id),
+  });
+  saver.save({ ...normalize({}), sensitivity: 1.1 });
+  saver.save({ ...normalize({}), sensitivity: 1.2 });
+  assert.equal(timers.size, 1, "one pending timer");
+  assert.equal(storage.getItem(SETTINGS_KEY), null, "nothing written yet");
+  assert.equal(saver.pending, true);
+  const [[, { fn, ms }]] = timers;
+  assert.equal(ms, 300);
+  fn();
+  assert.equal(JSON.parse(storage.getItem(SETTINGS_KEY)).sensitivity, 1.2);
+  assert.equal(saver.pending, false);
+
+  saver.save({ ...normalize({}), sensitivity: 1.3 });
+  saver.flush();
+  assert.equal(JSON.parse(storage.getItem(SETTINGS_KEY)).sensitivity, 1.3);
+  assert.equal(timers.size, 0);
+  saver.flush();   // nothing pending: harmless
+});
+
+test("fillFor: slider fill percentage, guarded", () => {
+  assert.equal(fillFor(1, 0.5, 2), "33.3%");
+  assert.equal(fillFor(100, 60, 120), "66.7%");
+  assert.equal(fillFor(500, 60, 120), "100.0%");
+  assert.equal(fillFor("x", 0, 1), "0.0%");
+  assert.equal(fillFor(1, 1, 1), "0.0%");
 });

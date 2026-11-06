@@ -1,74 +1,69 @@
-/* The engine for everything from youtube: its own player in an iframe,
- * steered by the same body.
+/* YouTube's own player in an iframe, steered by the view and sized for 360.
  *
- * Playback always works here, because it is youtube playing to youtube; the
- * price is ads when a clip carries them, and the loss of our renderer's
- * motion blur.
+ * Quality: the embed ignores every quality call; it picks its tier from the
+ * iframe's layout size.  So the iframe is laid out at k·W × k·H (k from the
+ * tier quality.js chose) and drawn back at W × H with transform: scale(1/k)
+ * inside an overflow-hidden stage.  See quality.js for the tier math.
  *
- * The IFrame API exposes setSphericalProperties() on 360 uploads, so the
- * gaze pipeline steers this player exactly as it steers the WebGL sphere:
- * body.view in, camera angles out, every frame the view moved.
+ * Lifecycle: ONE YT.Player for the life of the page (creating one per video
+ * leaks listeners and workers).  The first open() builds it with the video;
+ * later opens loadVideoById into it (autoplays).  close() bumps an era so a
+ * build still in flight knows its session is gone.
  *
- * Its own chrome is off (see playerVars): LazyVR draws a transport, a
- * title and a heading of its own, and two of each would fight.  Every
- * control the page needs it drives through this class instead.
+ * Its chrome is off (controls:0, disablekb, fs:0); the page draws its own.
+ * Ads are drawn by YouTube regardless and must stay clickable.
  */
 
-import { LEVEL_HEIGHTS, bestAllowedLevel } from "./quality.js";
+import { LEVEL_HEIGHTS, layoutScale, K_MAX } from "./quality.js";
 
 const DEG = Math.PI / 180;
+const API_TIMEOUT_MS = 15000;
+const READY_TIMEOUT_MS = 15000;
+const FIT_DEBOUNCE_MS = 150;
 
-export const EMBED_FOV = 75;
+export { K_MAX };
 
 /* Named for the viewer, not the API. */
-const REFUSALS = {
+export const REFUSALS = Object.freeze({
   2: "the video id is malformed",
   5: "youtube's player broke",
   100: "the video is gone",
   101: "the uploader blocks embedding",
   150: "the uploader blocks embedding",
-};
+  153: "the page sent no referrer, so youtube refused to play",
+});
 
-/* body.view (radians) -> the player's spherical properties (degrees).
- * The yaw sign was settled empirically against a live player -- the
- * compass-heading mapping panned mirrored -- so the player's yaw takes
- * body yaw directly.  Pitch is up-positive on both sides.  If a future
- * player build pans mirrored again, this is the one line to flip. */
+export function refusal(code) {
+  return REFUSALS[code] || `youtube's player refused (${code})`;
+}
+
+/* View (radians) → the player's spherical properties (degrees).
+ *
+ * Sign contract, shared with render.js: view.yaw > 0 = view turned to the
+ * user's LEFT.  YouTube's yaw "increases as the viewer turns left" (IFrame
+ * API reference) and that was confirmed on a live player, so it is passed
+ * straight through.  If a player build ever pans mirrored, flip this line. */
 export function sphericalFromView(view) {
   return {
     yaw: (((view.yaw / DEG) % 360) + 360) % 360,
     pitch: Math.max(-90, Math.min(90, view.pitch / DEG)),
-    roll: Math.max(-180, Math.min(180, -view.roll / DEG)),
-    fov: EMBED_FOV,
+    roll: Math.max(-180, Math.min(180, -(view.roll || 0) / DEG)) || 0,  // no -0 / NaN
   };
 }
 
-/* The iframe is built at window size and no larger.
- *
- * It used to be built at the display's pixel density -- 2x linear, four
- * times the area on a retina panel -- on the theory that a big viewport
- * coaxes a better tier out of the player.  It does not: forceBest() pins
- * the tier explicitly, so all the extra pixels bought was a 360 renderer
- * doing four times the work per frame, inside an iframe, while our camera
- * updates queued up behind it.  That was most of the embed's judder. */
-export function overscanFor(width, height, dpr = 1) {
-  return 1;
+/* The app's FOV is horizontal; YouTube's is "along the longer edge", which
+ * is the vertical one on a portrait viewport.  Clamped to YouTube's 30–120. */
+export function youtubeFov(hFovDeg, width, height) {
+  let fov = Number.isFinite(hFovDeg) ? hFovDeg : 100;
+  if (width > 0 && height > width) {
+    fov = 2 * Math.atan(Math.tan((fov * DEG) / 2) * (height / width)) / DEG;
+  }
+  return Math.max(30, Math.min(120, fov));
 }
 
-/* Steering is a postMessage per call; only bother when the view moved.
- *
- * The threshold is a tenth of a degree rather than a hundredth, because the
- * body never quite holds still -- the idle sway alone would otherwise post a
- * message every frame for the length of the clip, and the player would
- * redraw for a movement no one can see.  A real turn is 0.2 degrees per
- * frame at its slowest, so nothing the viewer asked for is ever missed.
- *
- * The field of view is judged exactly instead, because it is the one
- * property here that moves only when the viewer asks: nothing nudges it past
- * a threshold on its own.  Left out of the gate, a new field of view sat
- * unsent until the body happened to drift a tenth of a degree -- so the
- * slider did nothing for as long as the viewer held still to see what it had
- * done, which is exactly when they are looking. */
+/* Steering is a postMessage per call; only send when it shows.  0.1° is
+ * below what anyone sees and keeps a still head from posting every frame.
+ * fov is compared exactly: it only changes when the user asks. */
 export function movedEnough(last, next, epsilon = 0.1) {
   if (!last) return true;
   if (last.fov !== next.fov) return true;
@@ -78,83 +73,125 @@ export function movedEnough(last, next, epsilon = 0.1) {
     || Math.abs(next.roll - last.roll) > epsilon;
 }
 
-let apiPromise = null;
+// ------------------------------------------------------------ iframe API
 
-function iframeApi() {
+let apiPromise = null;
+let apiTag = null;
+
+/* Loads https://www.youtube.com/iframe_api once.  Rejects after 15 s (a
+ * content blocker can let the loader through and block the widget script, so
+ * onYouTubeIframeAPIReady never fires); a later call tries again. */
+export function iframeApi(timeoutMs = API_TIMEOUT_MS) {
   if (apiPromise) return apiPromise;
-  apiPromise = new Promise((resolve, reject) => {
-    if (window.YT && window.YT.Player) {
+  const attempt = new Promise((resolve, reject) => {
+    if (window.YT && typeof window.YT.Player === "function" && window.YT.loaded !== 0) {
       resolve(window.YT);
       return;
     }
-    const tag = document.createElement("script");
-    tag.src = "https://www.youtube.com/iframe_api";
-    tag.onerror = () => {
-      apiPromise = null;
-      reject(new Error("youtube's player script would not load"));
+    let timer = null;
+    const fail = (message) => {
+      clearTimeout(timer);
+      if (apiPromise === attempt) apiPromise = null;
+      reject(new Error(message));
     };
-    window.onYouTubeIframeAPIReady = () => resolve(window.YT);
-    document.head.appendChild(tag);
+    timer = setTimeout(() => fail("youtube's player script never became ready"), timeoutMs);
+    const previous = window.onYouTubeIframeAPIReady;
+    window.onYouTubeIframeAPIReady = () => {
+      clearTimeout(timer);
+      if (typeof previous === "function") { try { previous(); } catch { /* not ours */ } }
+      resolve(window.YT);
+    };
+    // A tag from a timed-out attempt may still be loading; do not add another.
+    if (!apiTag) {
+      apiTag = document.createElement("script");
+      apiTag.src = "https://www.youtube.com/iframe_api";
+      apiTag.async = true;
+      apiTag.onerror = () => {
+        if (apiTag && apiTag.parentNode) apiTag.parentNode.removeChild(apiTag);
+        apiTag = null;
+        fail("youtube's player script would not load");
+      };
+      document.head.appendChild(apiTag);
+    }
   });
-  return apiPromise;
+  apiPromise = attempt;
+  return attempt;
 }
 
+/* For tests: forget the module-level loader state. */
+export function resetIframeApiForTests() {
+  apiPromise = null;
+  apiTag = null;
+}
+
+// ------------------------------------------------------------ the player
+
+const raf = (fn) => (typeof requestAnimationFrame === "function" ? requestAnimationFrame(fn) : null);
+
 export class EmbedPlayer {
-  constructor(container) {
+  /* options.readyTimeoutMs / apiTimeoutMs exist for tests. */
+  constructor(container, { readyTimeoutMs = READY_TIMEOUT_MS, apiTimeoutMs = API_TIMEOUT_MS } = {}) {
     this.container = container;
-    this.player = null;
-    this.sent = null;
-    this.pendingCue = null;
+    this.readyTimeoutMs = readyTimeoutMs;
+    this.apiTimeoutMs = apiTimeoutMs;
+    this.player = null;      // a READY YT.Player, or null
+    this.stage = null;       // overflow-hidden W×H box holding the iframe
+    this.building = null;    // the in-flight first build, joined by later opens
     this.handlers = {};
-    // Which era of the page the player belongs to.  close() moves it on, so
-    // an open that is still building can find out that the session it was
-    // built for has gone (see open).
-    this.released = 0;
-    this.maxHeight = Infinity;
-    this.fov = EMBED_FOV;
+    this.released = 0;       // era; close() bumps it
+    this.fov = 100;          // horizontal degrees (settings)
     this.volume = 1;
     this.muted = false;
-    window.addEventListener("resize", () => this.fit());
+    this.tier = null;        // quality.js tier the layout is sized for
+    this.k = 1;              // current layout scale
+    this.size = { width: 0, height: 0 };   // stage size in CSS px
+    this.applied = null;     // last { innerW, innerH, k } pushed to the iframe
+    this.sent = null;        // last spherical properties sent
+    this.queued = null;      // properties waiting for the next frame
+    this.frameBusy = false;  // a send already happened this frame
+    this.assertOnPlay = false;
+    this.playbackQuality = null;
+    this.state = -1;
+    this.fitTimer = null;
+
+    const refit = () => {
+      clearTimeout(this.fitTimer);
+      this.fitTimer = setTimeout(() => this.fit(), FIT_DEBOUNCE_MS);
+    };
+    window.addEventListener("resize", refit);
+    if (typeof document !== "undefined" && document.addEventListener) {
+      document.addEventListener("fullscreenchange", refit);
+    }
   }
 
-  /* The quality ceiling, in tier height; forceBest stays under it. */
-  capHeight(maxHeight) {
-    this.maxHeight = maxHeight || Infinity;
-    this.forceBest();
+  /* Load the iframe API early (library idle) so the first pick is fast. */
+  preload() {
+    return iframeApi(this.apiTimeoutMs).then(() => true, () => false);
   }
 
-  /* Point the player at one video.  Resolves when it is ready to obey;
-   * `onEnded` and `onError` fire for everything after that.
-   *
-   * ONE player for the life of the page.  Creating and destroying youtube
-   * players per video leaks message listeners and workers -- each pick made
-   * the page a little heavier until only a reload cured it -- so the first
-   * open builds the player and every later one just loads into it. */
+  /* Point the player at a video; it starts playing on its own (autoplay).
+   * Resolves once the player has been handed the video.  Everything after
+   * that arrives through the handlers:
+   *   onPlaying(), onBuffering(), onPaused(), onEnded(), onError(message, code),
+   *   onAutoplayBlocked(), onQuality(label)
+   * Rejects if the player cannot be built, refuses the first video before it
+   * is ready, or the session is closed meanwhile ("let go of"). */
   async open(videoId, handlers = {}) {
-    this.handlers = handlers;
+    this.handlers = handlers || {};
     this.sent = null;
+    this.queued = null;
+    this.playbackQuality = null;
+    this.assertOnPlay = true;
     const era = this.released;
-    // A pick that starts while youtube's script is still downloading must
-    // not build a second player: this.player is only assigned once the
-    // build below finishes, so the reuse check would miss it, append a
-    // second mount to #embed, and orphan the first player's iframe, its
-    // message listeners and its workers for the life of the page.  Join the
-    // build in flight instead and then cue into the one player, as every
-    // later pick does.  A build that failed is nobody's to inherit.
+    // A pick during the first build joins it rather than building a second
+    // player (which would orphan the first iframe for the life of the page).
     if (this.building) {
-      try { await this.building; } catch { /* it failed; build again below */ }
+      try { await this.building; } catch { /* it failed and tore itself down */ }
+      if (this.released !== era) throw new Error("the video was let go of before it loaded");
     }
     if (this.player) {
       this.fit();
-      // Cue, not load: cueVideoById brings the video up without starting it,
-      // which is exactly the hold calibration wants -- loadVideoById
-      // autoplays, and raced the pause() the caller makes straight
-      // afterwards, so a clip could be several seconds in and audible under
-      // the calibration overlay.  And wait for it: returning here as soon
-      // as the call was made meant `playerReady` said yes while the player
-      // still held the *previous* video, so capHeight, pause and title all
-      // spoke to the wrong clip.
-      await this.cued(videoId);
+      this.player.loadVideoById(videoId);
       return;
     }
     let finished;
@@ -167,269 +204,303 @@ export class EmbedPlayer {
     }
   }
 
-  /* The one player this page ever builds. */
+  measure() {
+    const width = this.container.clientWidth || window.innerWidth || 0;
+    const height = this.container.clientHeight || window.innerHeight || 0;
+    this.size = { width, height };
+    return this.size;
+  }
+
+  layout() {
+    const { width, height } = this.measure();
+    const k = layoutScale(width, this.tier ? this.tier.w : width, K_MAX);
+    return { width, height, k, innerW: Math.round(width * k), innerH: Math.round(height * k) };
+  }
+
   async build(videoId, era) {
-    const YT = await iframeApi();
+    const YT = await iframeApi(this.apiTimeoutMs);
+    if (this.released !== era) throw new Error("the video was let go of before it loaded");
+    const stage = document.createElement("div");
+    stage.className = "embed-stage";
+    Object.assign(stage.style, { position: "absolute", left: "0", top: "0", width: "100%", height: "100%", overflow: "hidden" });
     const mount = document.createElement("div");
-    this.container.appendChild(mount);
-    const width = this.container.clientWidth || window.innerWidth;
-    const height = this.container.clientHeight || window.innerHeight;
-    const overscan = overscanFor(width, height, window.devicePixelRatio || 1);
-    // Held apart from this.player, because what this call has to answer for
-    // is the player it made itself: a pick that raced youtube's script load
-    // can have put another one there by the time this build finishes.
+    stage.appendChild(mount);
+    this.container.appendChild(stage);
+    const { innerW, innerH } = this.layout();
+
     let built = null;
-    await new Promise((resolve, reject) => {
-      let settled = false;
-      const timer = setTimeout(() => {
-        settled = true;
-        reject(new Error("youtube's player never became ready"));
-      }, 15000);
-      built = this.player = new YT.Player(mount, {
-        videoId,
-        width: Math.round(width * overscan),
-        height: Math.round(height * overscan),
-        // youtube's own chrome, off: `controls` takes the bottom bar and
-        // the hover gradients that would sit under our transport,
-        // `modestbranding` the logo, `rel` the end-screen grid, and
-        // `iv_load_policy` the annotations.  `disablekb` keeps its
-        // shortcuts off Space, the arrows, M and F, which app.js binds;
-        // `fs` because LazyVR owns fullscreen for the whole session.  None
-        // of this reaches the ad UI, which youtube draws regardless -- a
-        // skip button must stay there, and stay clickable.
-        playerVars: {
-          autoplay: 1, controls: 0, modestbranding: 1, rel: 0, iv_load_policy: 3,
-          playsinline: 1, disablekb: 1, fs: 0, origin: location.origin,
-        },
-        events: {
-          onReady: () => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            resolve();
+    const teardown = () => {
+      try { if (built && typeof built.destroy === "function") built.destroy(); } catch { /* half-built */ }
+      if (stage.parentNode) stage.parentNode.removeChild(stage);
+      if (this.player === built) this.player = null;
+      if (this.stage === stage) this.stage = null;
+    };
+
+    try {
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const settle = (error) => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (error) reject(error); else resolve();
+        };
+        const timer = setTimeout(() => settle(new Error("youtube's player never became ready")), this.readyTimeoutMs);
+        const options = {
+          videoId,
+          width: innerW,
+          height: innerH,
+          // Never set a no-referrer policy anywhere: YouTube answers 153.
+          playerVars: {
+            enablejsapi: 1, origin: location.origin, controls: 0, disablekb: 1, fs: 0,
+            playsinline: 1, iv_load_policy: 3, rel: 0, autoplay: 1, cc_load_policy: 0,
           },
-          onError: (event) => {
-            const error = new Error(REFUSALS[event.data] || `youtube's player refused (${event.data})`);
-            if (!settled) {
-              settled = true;
-              clearTimeout(timer);
-              reject(error);
-            } else if (this.pendingCue) {
-              this.settleCue(error);
-            } else if (this.handlers.onError) {
-              this.handlers.onError(error);
-            }
+          events: {
+            onReady: () => settle(),
+            onError: (event) => {
+              const code = event && event.data;
+              if (!settled) settle(new Error(refusal(code)));
+              else this.emit("onError", refusal(code), code);
+            },
+            onStateChange: (event) => this.onState(event && event.data),
+            onPlaybackQualityChange: (event) => {
+              this.playbackQuality = event && event.data;
+              this.emit("onQuality", this.playbackQuality);
+            },
+            onAutoplayBlocked: () => this.emit("onAutoplayBlocked"),
           },
-          onStateChange: (event) => {
-            if (event.data === YT.PlayerState.CUED) this.settleCue();
-            if (event.data === YT.PlayerState.PLAYING) {
-              this.forceBest();
-              this.muteCaptions();
-              this.setSound(this.volume, this.muted);
-            }
-            if (event.data === YT.PlayerState.ENDED && this.handlers.onEnded) this.handlers.onEnded();
-          },
-        },
+        };
+        try {
+          built = new YT.Player(mount, options);
+        } catch (error) {
+          settle(error instanceof Error ? error : new Error(String(error)));
+        }
       });
-    });
-    // Escape while youtube's script and its player were still loading.
-    // close() ran when there was nothing yet to stop, and playerVars carries
-    // autoplay -- so this player came up talking, in a library where the
-    // chrome is gone, the overlay is down and nothing is left to pause it,
-    // and it kept talking until the viewer picked something else.
+    } catch (error) {
+      // Timed out or refused before ready: nothing about this player can be
+      // trusted to have its methods, so the next open builds fresh.
+      teardown();
+      throw error;
+    }
+
     if (this.released !== era) {
-      try { built.stopVideo(); } catch { /* it never got as far as playing */ }
+      // close() ran while building; the player came up autoplaying.  Keep it
+      // (it is ready and reusable) but silence it.
+      this.player = built;
+      this.stage = stage;
+      try { built.stopVideo(); } catch { /* never played */ }
       throw new Error("the video was let go of before it loaded");
     }
+    this.player = built;
+    this.stage = stage;
+    this.applied = null;
     this.fit();
   }
 
-  /* Hand the live player a new video and wait until it says it has it.
-   * The player keeps one onStateChange for its whole life, so CUED lands
-   * here however many videos have been through it. */
-  cued(videoId) {
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => this.settleCue(new Error("youtube's player never took the video")), 15000);
-      this.pendingCue = { resolve, reject, timer };
-      try {
-        this.player.cueVideoById(videoId);
-      } catch (error) {
-        // A player that was built but never became ready has none of its
-        // methods yet.  Letting the throw out of the executor rejects this
-        // promise but leaves pendingCue standing, and that stale record then
-        // swallows the next onError and fires its timer into somebody else's
-        // cue a quarter of a minute later.  Settle it here instead.
-        this.settleCue(error instanceof Error ? error : new Error(String(error)));
-      }
-    });
-  }
-
-  settleCue(error) {
-    const pending = this.pendingCue;
-    if (!pending) return;
-    this.pendingCue = null;
-    clearTimeout(pending.timer);
-    if (error) pending.reject(error);
-    else pending.resolve();
-  }
-
-  /* Size the reused iframe for the current window and pixel density, and
-   * scale it down onto the window, centred, covering. */
-  fit() {
-    const iframe = this.player && typeof this.player.getIframe === "function"
-      ? this.player.getIframe() : null;
-    if (!iframe) return;
-    const width = this.container.clientWidth || window.innerWidth;
-    const height = this.container.clientHeight || window.innerHeight;
-    const overscan = overscanFor(width, height, window.devicePixelRatio || 1);
-    const innerW = Math.round(width * overscan);
-    const innerH = Math.round(height * overscan);
-    if (typeof this.player.setSize === "function"
-        && (parseInt(iframe.getAttribute("width"), 10) !== innerW
-            || parseInt(iframe.getAttribute("height"), 10) !== innerH)) {
-      this.player.setSize(innerW, innerH);
+  emit(name, ...args) {
+    const handler = this.handlers[name];
+    if (typeof handler !== "function") return;
+    try {
+      handler(...args);
+    } catch (error) {
+      // An app bug must not unwind into YouTube's callback; surface it.
+      if (typeof reportError === "function") reportError(error);
+      else console.error(error);
     }
-    const scale = Math.max(width / innerW, height / innerH);
-    iframe.style.position = "absolute";
-    iframe.style.left = `${(width - innerW * scale) / 2}px`;
-    iframe.style.top = `${(height - innerH * scale) / 2}px`;
-    iframe.style.transformOrigin = "top left";
-    iframe.style.transform = `scale(${scale})`;
   }
 
-  /* Subtitles off, and kept off: the captions module reloads with every
-   * video, so this is re-asserted on every PLAYING alongside the quality. */
+  onState(state) {
+    const PS = (window.YT && window.YT.PlayerState) || {};
+    this.state = state;
+    if (state === PS.PLAYING) {
+      if (this.assertOnPlay) {
+        // First PLAYING of this video: the 360 renderer has just come up
+        // with its own default view, so re-send ours; re-assert sound and
+        // captions, which reload per video.
+        this.assertOnPlay = false;
+        this.sent = null;
+        this.muteCaptions();
+        this.setSound(this.volume, this.muted);
+      }
+      this.emit("onPlaying");
+    } else if (state === PS.BUFFERING) {
+      this.emit("onBuffering");
+    } else if (state === PS.PAUSED) {
+      this.emit("onPaused");
+    } else if (state === PS.ENDED) {
+      this.emit("onEnded");
+    }
+  }
+
+  /* Size the layout for the current tier.  Skips the postMessage when
+   * nothing changed. */
+  fit() {
+    clearTimeout(this.fitTimer);
+    this.fitTimer = null;
+    const player = this.player;
+    const iframe = player && typeof player.getIframe === "function" ? player.getIframe() : null;
+    const { width, height, k, innerW, innerH } = this.layout();
+    this.k = k;
+    if (!iframe || !width || !height) return;
+    const a = this.applied;
+    if (a && a.innerW === innerW && a.innerH === innerH && a.k === k) return;
+    if (typeof player.setSize === "function") player.setSize(innerW, innerH);
+    const style = iframe.style;
+    style.position = "absolute";
+    style.left = "0";
+    style.top = "0";
+    style.transformOrigin = "0 0";
+    style.transform = k === 1 ? "none" : `scale(${1 / k})`;
+    this.applied = { innerW, innerH, k };
+  }
+
+  /* The tier (quality.js) to size the layout for; null = window-sized.
+   * Applied immediately when a player exists, else at build. */
+  setTier(tier) {
+    const next = tier && Number.isFinite(tier.w) ? tier : null;
+    if ((next && next.label) === (this.tier && this.tier.label)) return;
+    this.tier = next;
+    this.fit();
+  }
+
+  /* What is actually playing: { label, height } or null before it says. */
+  quality() {
+    let label = null;
+    const player = this.player;
+    if (player && typeof player.getPlaybackQuality === "function") {
+      try { label = player.getPlaybackQuality() || null; } catch { label = null; }
+    }
+    if (!label || label === "unknown" || label === "auto") label = this.playbackQuality;
+    if (!label || !LEVEL_HEIGHTS[label]) return null;
+    return { label, height: LEVEL_HEIGHTS[label] };
+  }
+
+  /* Captions off, and kept off: the captions module reloads per video. */
   muteCaptions() {
-    if (!this.player) return;
+    if (!this.player || typeof this.player.unloadModule !== "function") return;
     for (const module of ["captions", "cc"]) {
       try { this.player.unloadModule(module); } catch { /* not loaded */ }
     }
   }
 
-  /* Pin the player to the best tier the display deserves.  The documented
-   * quality API has been a no-op for years, but the range form still works
-   * in current players; asserted on every PLAYING, so the downshift after
-   * a stall is undone as soon as playback resumes. */
-  forceBest() {
-    const player = this.player;
-    if (!player || typeof player.getAvailableQualityLevels !== "function") return;
-    const best = bestAllowedLevel(player.getAvailableQualityLevels(), this.maxHeight);
-    if (!best) return;
-    try {
-      if (typeof player.setPlaybackQualityRange === "function") {
-        player.setPlaybackQualityRange(best, best);
-      }
-      player.setPlaybackQuality(best);
-    } catch { /* an older player build; nothing more to be done */ }
-  }
-
-  /* Volume as a fraction, mute as a flag; remembered for a player that is
-   * not built yet and re-asserted when it is. */
+  /* volume 0..1, muted flag; remembered for a player not built yet. */
   setSound(volume, muted) {
-    this.volume = volume;
-    this.muted = muted;
+    if (Number.isFinite(volume)) this.volume = Math.max(0, Math.min(1, volume));
+    this.muted = !!muted;
     const player = this.player;
     if (!player || typeof player.setVolume !== "function") return;
     try {
-      player.setVolume(Math.round(volume * 100));
-      if (muted) player.mute(); else player.unMute();
-    } catch { /* mid-load; applied on the next PLAYING */ }
+      player.setVolume(Math.round(this.volume * 100));
+      if (this.muted) player.mute(); else player.unMute();
+    } catch { /* mid-load; re-asserted on the first PLAYING */ }
   }
 
+  /* Called every display frame with the steering view (radians).  Sends at
+   * most once per animation frame, and only when the view moved enough. */
   steer(view) {
+    if (!view || !Number.isFinite(view.yaw) || !Number.isFinite(view.pitch)) return;
     if (!this.player || typeof this.player.setSphericalProperties !== "function") return;
     const props = sphericalFromView(view);
-    props.fov = Math.max(30, Math.min(120, this.fov));
-    if (!movedEnough(this.sent, props)) return;
+    props.fov = youtubeFov(this.fov, this.size.width, this.size.height);
+    if (!movedEnough(this.sent, props)) { this.queued = null; return; }
+    if (this.frameBusy) { this.queued = props; return; }
+    this.send(props);
+  }
+
+  send(props) {
     this.sent = props;
-    this.player.setSphericalProperties({ ...props, enableOrientationSensor: false });
+    try {
+      this.player.setSphericalProperties({ ...props, enableOrientationSensor: false });
+    } catch { /* not a 360 video yet, or mid-load */ }
+    if (typeof requestAnimationFrame !== "function") return;
+    this.frameBusy = true;
+    raf(() => {
+      this.frameBusy = false;
+      const queued = this.queued;
+      this.queued = null;
+      if (queued && this.player && movedEnough(this.sent, queued)) this.send(queued);
+    });
   }
 
-  /* Like video.play(): resolves once playing, rejects when the browser
-   * wants a click first. */
-  async ensurePlaying() {
-    if (!this.player) throw new Error("no player");
-    const YT = window.YT;
-    this.player.playVideo();
-    const began = performance.now();
-    while (performance.now() - began < 1800) {
-      const state = this.player.getPlayerState();
-      if (state === YT.PlayerState.PLAYING || state === YT.PlayerState.BUFFERING) return;
-      await new Promise((resolve) => setTimeout(resolve, 150));
-    }
-    throw new Error("autoplay was blocked");
+  // ---------------------------------------------------------- transport
+
+  call(name, ...args) {
+    const player = this.player;
+    if (!player || typeof player[name] !== "function") return undefined;
+    try { return player[name](...args); } catch { return undefined; }
   }
 
-  pause() {
-    if (this.player && typeof this.player.pauseVideo === "function") this.player.pauseVideo();
-  }
+  play() { this.call("playVideo"); }
+  pause() { this.call("pauseVideo"); }
 
   get paused() {
-    const YT = window.YT;
-    if (!YT || !this.player || typeof this.player.getPlayerState !== "function") return true;
-    const state = this.player.getPlayerState();
-    return state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING;
+    const PS = window.YT && window.YT.PlayerState;
+    if (!PS || !this.player) return true;
+    const state = this.call("getPlayerState");
+    return state !== PS.PLAYING && state !== PS.BUFFERING;
+  }
+
+  get buffering() {
+    const PS = window.YT && window.YT.PlayerState;
+    return !!PS && this.call("getPlayerState") === PS.BUFFERING;
+  }
+
+  /* Seconds; 0 when unknown. */
+  currentTime() {
+    const t = this.call("getCurrentTime");
+    return Number.isFinite(t) && t > 0 ? t : 0;
+  }
+
+  /* Seconds; 0 until the player knows (YouTube's own convention). */
+  duration() {
+    const d = this.call("getDuration");
+    return Number.isFinite(d) && d > 0 ? d : 0;
+  }
+
+  /* 0..1 of the video loaded so far. */
+  bufferedFraction() {
+    const f = this.call("getVideoLoadedFraction");
+    return Number.isFinite(f) ? Math.max(0, Math.min(1, f)) : 0;
+  }
+
+  seekTo(seconds) {
+    if (!Number.isFinite(seconds)) return;
+    const duration = this.duration();
+    let target = Math.max(0, seconds);
+    // Seeking onto the very end ends the video; stop just short of it.
+    if (duration > 0) target = Math.min(target, Math.max(0, duration - 0.25));
+    this.call("seekTo", target, true);
   }
 
   seek(delta) {
-    if (!this.player || typeof this.player.getCurrentTime !== "function") return;
-    this.player.seekTo(Math.max(0, this.player.getCurrentTime() + delta), true);
+    if (!Number.isFinite(delta)) return;
+    this.seekTo(this.currentTime() + delta);
   }
 
-  /* The tier the player is actually showing, in pixels of height, or null
-   * before it has said. */
-  currentHeight() {
-    const player = this.player;
-    if (!player || typeof player.getPlaybackQuality !== "function") return null;
-    try {
-      return LEVEL_HEIGHTS[player.getPlaybackQuality()] || null;
-    } catch {
-      return null;
-    }
-  }
-
-  /* The video's own title, once the player has it.  A deep link arrives
-   * with nothing but an id, and this is the only place the real title
-   * exists now that nothing else asks youtube about the clip. */
+  /* The video's title once the player has it (deep links have only an id). */
   title() {
-    const player = this.player;
-    if (!player || typeof player.getVideoData !== "function") return null;
-    try {
-      return (player.getVideoData() || {}).title || null;
-    } catch {
-      return null;
-    }
+    const data = this.call("getVideoData");
+    return (data && data.title) || null;
   }
 
-  /* Where the clip is, in the shape the <video> element reports. */
+  /* { currentTime, duration, paused, buffering } in <video>-like shape. */
   status() {
-    const YT = window.YT;
-    const player = this.player;
-    if (!YT || !player || typeof player.getPlayerState !== "function") {
-      return { currentTime: 0, duration: NaN, paused: true, buffering: false };
-    }
-    const state = player.getPlayerState();
     return {
-      currentTime: typeof player.getCurrentTime === "function" ? player.getCurrentTime() : 0,
-      duration: typeof player.getDuration === "function" ? player.getDuration() || NaN : NaN,
-      paused: state !== YT.PlayerState.PLAYING && state !== YT.PlayerState.BUFFERING,
-      buffering: state === YT.PlayerState.BUFFERING,
+      currentTime: this.currentTime(),
+      duration: this.duration(),
+      paused: this.paused,
+      buffering: this.buffering,
     };
   }
 
-  /* Stand down, keeping the player for the next video (see open). */
+  /* Stand down, keeping the player for the next video. */
   close() {
     this.handlers = {};
     this.sent = null;
-    // Everything still on its way here belongs to a session that has ended;
-    // a build that has not finished reads this and stands down (see open).
+    this.queued = null;
+    this.assertOnPlay = false;
+    this.playbackQuality = null;
     this.released += 1;
-    // A session let go of while its video was still arriving: whoever is
-    // waiting on the cue is told, rather than left on a promise the state
-    // change for this video will never resolve.
-    this.settleCue(new Error("the video was let go of before it loaded"));
-    if (this.player) {
-      try { this.player.stopVideo(); } catch { /* mid-load; it will stop */ }
-    }
+    this.call("stopVideo");
   }
 }

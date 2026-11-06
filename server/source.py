@@ -70,13 +70,105 @@ SEARCH_LIMIT = 24
 CATEGORY_TTL = 6 * 3600
 SEARCH_TTL = 15 * 60
 
-# Models and fonts change only with a deploy; the page's own files
-# revalidate after five minutes.  The API is never cacheable: its answers
-# already come out of the server's own cache, and a proxy holding a stale
-# one on top of that is only confusing.
-ASSET_CACHE = "public, max-age=86400, stale-while-revalidate=604800"
-PAGE_CACHE = "public, max-age=300, must-revalidate"
+# Cache-Control, decided once for both deployments (vercel.json repeats the
+# static ones as CDN headers; tests/test_api.py checks they agree).
+#
+# The page's ES modules are unversioned, so html/js/css always revalidate:
+# a browser mixing a new app.js with a cached old module gets a dead page
+# ("does not provide an export named ...").  Models and fonts are big and
+# change rarely.
+PAGE_CACHE = "no-cache"                                  # / and index.html
+CODE_CACHE = "public, max-age=0, must-revalidate"        # js/, css/, anything else
+ASSET_CACHE = "public, max-age=604800, stale-while-revalidate=86400"
 LONG_CACHED = ("models", "fonts")
+
+# The API is edge-cached (s-maxage) so a cold function does not re-run eight
+# yt-dlp searches per visitor.  Errors are never cached; an empty answer is
+# usually youtube challenging us, so it is cached only briefly.
+HOME_CACHE = "public, s-maxage=21600, stale-while-revalidate=86400"
+HOME_PARTIAL_CACHE = "public, s-maxage=300"
+SEARCH_CACHE = "public, s-maxage=900, stale-while-revalidate=3600"
+EMPTY_CACHE = "public, s-maxage=60"
+NO_STORE = "no-store"
+
+# Sent with every response (vercel.json carries the same set for the CDN).
+# Never COOP/COEP (they break the YouTube iframe) and never no-referrer
+# (YouTube refuses the embed with error 153).
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Permissions-Policy": 'camera=(self), fullscreen=(self "https://www.youtube.com"), '
+                          'autoplay=(self "https://www.youtube.com")',
+}
+
+
+def static_cache(path: str) -> str:
+    """Cache-Control for a static path under site/ ("/", "/js/app.js")."""
+    clean = path.split("?", 1)[0].lstrip("/")
+    if clean in ("", "index.html"):
+        return PAGE_CACHE
+    if clean.split("/", 1)[0] in LONG_CACHED:
+        return ASSET_CACHE
+    return CODE_CACHE
+
+
+def home_cache(shelves: list[dict]) -> str:
+    """Full answer -> long; some shelves failed or came back empty -> short;
+    nothing at all -> not cached."""
+    good = [s for s in shelves if s.get("clips") and not s.get("error")]
+    if not good:
+        return NO_STORE
+    return HOME_CACHE if len(good) == len(shelves) else HOME_PARTIAL_CACHE
+
+
+def search_cache(clips: list) -> str:
+    return SEARCH_CACHE if clips else EMPTY_CACHE
+
+
+class KeyedLocks:
+    """Per-key locks that exist only while someone holds or waits on them,
+    so a stream of unique search keys cannot grow the table.  Thread-safe."""
+
+    def __init__(self):
+        self._guard = threading.Lock()
+        self._locks: dict = {}  # key -> [lock, users]
+
+    def __len__(self):
+        with self._guard:
+            return len(self._locks)
+
+    def acquire(self, key):
+        with self._guard:
+            entry = self._locks.get(key)
+            if entry is None:
+                entry = self._locks[key] = [threading.Lock(), 0]
+            entry[1] += 1
+        entry[0].acquire()
+        return entry
+
+    def release(self, key, entry):
+        entry[0].release()
+        with self._guard:
+            entry[1] -= 1
+            if entry[1] == 0 and self._locks.get(key) is entry:
+                del self._locks[key]
+
+
+def cached_call(cache: "TTLCache", locks: KeyedLocks, key, producer, ttl: float):
+    """Single-flight: one producer call per key per TTL, however many threads
+    ask at once.  A failure is not cached; the next waiter tries itself."""
+    value = cache.get(key)
+    if value is not None:
+        return value
+    entry = locks.acquire(key)
+    try:
+        value = cache.get(key)
+        if value is None:
+            value = producer()
+            cache.put(key, value, cache_ttl(value, ttl))
+        return value
+    finally:
+        locks.release(key, entry)
 
 
 def search_url(query: str) -> str:

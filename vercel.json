@@ -1,8 +1,26 @@
 {
-  "version": 2,
-  "builds": [{ "src": "api/index.py", "use": "@vercel/python" }],
-  "routes": [
-    { "src": "/api/(.*)", "dest": "/api/index.py?vkind=api&vpath=$1" },
-    { "src": "/(.*)", "dest": "/api/index.py" }
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "framework": null,
+  "buildCommand": "",
+  "outputDirectory": "site",
+  "rewrites": [{ "source": "/api/(.*)", "destination": "/api/index.py" }],
+  "functions": {
+    "api/index.py": { "excludeFiles": "{site,tests,tools,docs,.impeccable,videos}/**" }
+  },
+  "headers": [
+    {
+      "source": "/(.*)",
+      "headers": [
+        { "key": "X-Content-Type-Options", "value": "nosniff" },
+        { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
+        { "key": "Permissions-Policy", "value": "camera=(self), fullscreen=(self \"https://www.youtube.com\"), autoplay=(self \"https://www.youtube.com\")" }
+      ]
+    },
+    { "source": "/", "headers": [{ "key": "Cache-Control", "value": "no-cache" }] },
+    { "source": "/index.html", "headers": [{ "key": "Cache-Control", "value": "no-cache" }] },
+    { "source": "/js/(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" }] },
+    { "source": "/css/(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=0, must-revalidate" }] },
+    { "source": "/models/(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=604800, stale-while-revalidate=86400" }] },
+    { "source": "/fonts/(.*)", "headers": [{ "key": "Cache-Control", "value": "public, max-age=604800, stale-while-revalidate=86400" }] }
   ]
 }

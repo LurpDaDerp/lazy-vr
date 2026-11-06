@@ -1,4 +1,1 @@
-site/models/*.onnx binary
 site/models/*.task binary
-tests/fixtures/*.npz binary
-tests/fixtures/*.npy binary

@@ -138,8 +138,9 @@ body:not(.browsing) #library {
 #local { flex: none; margin-left: auto; }
 #gear { flex: none; }
 
-/* Below 900px the search takes its own row (DESIGN.md, Layout). */
-@media (max-width: 900px) {
+/* On a narrow window the search takes its own row (DESIGN.md says 900px;
+   the one-line tagline needs the row to wrap a little earlier). */
+@media (max-width: 1100px) {
   #libhead { flex-wrap: wrap; }
   .brand { flex: 1; }
   .tagline { white-space: normal; }
@@ -454,4 +455,4 @@ body:not(.browsing) #library .strip { animation: none; }
   letter-spacing: var(--track-label);
   color: var(--star-dim);
 }
-#emptyfile { margin-top: var(--s-1); }
+#libempty .actions { justify-content: flex-start; margin-top: var(--s-1); }

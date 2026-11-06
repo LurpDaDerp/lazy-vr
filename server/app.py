@@ -22,7 +22,6 @@ import asyncio
 import mimetypes
 import os
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 from aiohttp import web
@@ -42,11 +41,45 @@ mimetypes.add_type("text/javascript", ".js")
 mimetypes.add_type("text/javascript", ".mjs")
 mimetypes.add_type("application/wasm", ".wasm")
 mimetypes.add_type("application/octet-stream", ".task")
-mimetypes.add_type("application/octet-stream", ".onnx")
 mimetypes.add_type("font/woff2", ".woff2")
 
 CACHE = source.TTLCache()
-LOCKS: dict[str, asyncio.Lock] = defaultdict(asyncio.Lock)
+
+
+class KeyedLocks:
+    """asyncio twin of source.KeyedLocks: a lock per key that exists only
+    while someone holds or waits on it, so unique search keys cannot grow
+    the table without bound."""
+
+    def __init__(self):
+        self._locks: dict[str, list] = {}  # key -> [asyncio.Lock, users]
+
+    def __len__(self):
+        return len(self._locks)
+
+    async def acquire(self, key):
+        entry = self._locks.get(key)
+        if entry is None:
+            entry = self._locks[key] = [asyncio.Lock(), 0]
+        entry[1] += 1
+        try:
+            await entry[0].acquire()
+        except BaseException:  # cancelled while waiting
+            self._forget(key, entry)
+            raise
+        return entry
+
+    def release(self, key, entry):
+        entry[0].release()
+        self._forget(key, entry)
+
+    def _forget(self, key, entry):
+        entry[1] -= 1
+        if entry[1] == 0 and self._locks.get(key) is entry:
+            del self._locks[key]
+
+
+LOCKS = KeyedLocks()
 
 
 async def cached(key: str, producer, ttl: float):
@@ -54,21 +87,21 @@ async def cached(key: str, producer, ttl: float):
     value = CACHE.get(key)
     if value is not None:
         return value
-    async with LOCKS[key]:
+    entry = await LOCKS.acquire(key)
+    try:
         value = CACHE.get(key)
         if value is None:
             value = await asyncio.to_thread(producer)
             CACHE.put(key, value, source.cache_ttl(value, ttl))
+    finally:
+        LOCKS.release(key, entry)
     return value
 
 
-def api_json(obj, status: int = 200) -> web.Response:
-    """Every API answer, shaped and headed the way Vercel's shapes it.
-
-    The error key matters: the page reads ``data.error`` and shows it, so
-    an endpoint that answers with aiohttp's own plain-text error page
-    instead of JSON leaves the viewer reading "the server said 400"."""
-    return web.json_response(obj, status=status, headers={"Cache-Control": "no-store"})
+def api_json(obj, status: int = 200, cache: str = source.NO_STORE) -> web.Response:
+    """Every API answer, shaped and headed the way the Vercel function's are.
+    Errors are JSON with an ``error`` key: the page shows ``data.error``."""
+    return web.json_response(obj, status=status, headers={"Cache-Control": cache})
 
 
 # ---------------------------------------------------------------- search
@@ -84,8 +117,8 @@ async def api_home(request: web.Request) -> web.Response:
             return {"id": category["id"], "title": category["title"], "clips": [],
                     "error": source.clean_error(error)}
 
-    shelves = await asyncio.gather(*(shelf(c) for c in source.CATEGORIES))
-    return api_json({"categories": list(shelves)})
+    shelves = list(await asyncio.gather(*(shelf(c) for c in source.CATEGORIES)))
+    return api_json({"categories": shelves}, cache=source.home_cache(shelves))
 
 
 async def api_search(request: web.Request) -> web.Response:
@@ -98,7 +131,7 @@ async def api_search(request: web.Request) -> web.Response:
                              source.SEARCH_TTL)
     except Exception as error:
         return api_json({"error": source.clean_error(error)}, status=502)
-    return api_json({"query": query, "clips": clips})
+    return api_json({"query": query, "clips": clips}, cache=source.search_cache(clips))
 
 
 # ---------------------------------------------------------------- wiring
@@ -122,22 +155,36 @@ def tailscale_ipv4() -> str:
 
 @web.middleware
 async def cache_headers(request: web.Request, handler):
-    """aiohttp's static route sends ETag and Last-Modified but no Cache-Control,
-    so browsers guess.  The rule and the two header values are source.py's, so
-    that a file cached for a day here is cached for a day on Vercel too.  The
-    API sets its own (no-store) in api_json."""
+    """The static files' Cache-Control, the same rule vercel.json gives the
+    CDN (source.static_cache).  API handlers set their own."""
     response = await handler(request)
-    path = request.path
-    if (request.method == "GET" and not path.startswith("/api/")
+    if (request.method in ("GET", "HEAD") and not request.path.startswith("/api/")
             and "Cache-Control" not in response.headers):
-        top = path.lstrip("/").split("/")[0]
-        response.headers["Cache-Control"] = (
-            source.ASSET_CACHE if top in source.LONG_CACHED else source.PAGE_CACHE)
+        response.headers["Cache-Control"] = source.static_cache(request.path)
     return response
 
 
+@web.middleware
+async def security_headers(request: web.Request, handler):
+    """vercel.json's security headers, for parity.  Never COOP/COEP (they break
+    the YouTube iframe) and never a no-referrer policy (YouTube error 153)."""
+    try:
+        response = await handler(request)
+    except web.HTTPException as error:
+        response = error
+        _secure(response)
+        raise
+    _secure(response)
+    return response
+
+
+def _secure(response):
+    for name, value in source.SECURITY_HEADERS.items():
+        response.headers.setdefault(name, value)
+
+
 def build_app() -> web.Application:
-    app = web.Application(middlewares=[cache_headers])
+    app = web.Application(middlewares=[security_headers, cache_headers])
     app.router.add_get("/", index)
     app.router.add_get("/api/home", api_home)
     app.router.add_get("/api/search", api_search)
@@ -164,7 +211,7 @@ def main() -> int:
         print(f"  http://{host}:{args.port}/")
     if len(hosts) > 1 or args.host == "0.0.0.0":
         print("note: browsers only give the CAMERA to a secure page, so on a remote")
-        print("      device an http:// address browses but cannot start gaze steering.")
+        print("      device an http:// address browses but cannot start head tracking.")
         print(f"      For that, publish it with TLS:  tailscale serve --bg {args.port}")
     web.run_app(build_app(), host=hosts if len(hosts) > 1 else hosts[0], port=args.port, print=None)
     return 0

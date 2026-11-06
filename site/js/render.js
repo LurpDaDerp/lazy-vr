@@ -1,10 +1,17 @@
-/* Equirectangular 360 rendering.
+/* Equirectangular 360 rendering for local files.
  *
- * A fullscreen quad plus a fragment shader that turns each pixel into a view
- * ray and samples the equirectangular frame.  No sphere mesh, no seam, no 3D
- * library.  The video is uploaded as a texture only on a genuinely new
- * frame: a 30 fps clip on a 60 Hz display would otherwise upload the same
- * 8K frame twice.
+ * A fullscreen triangle plus a fragment shader that turns each pixel into a
+ * view ray and samples the equirect frame: no mesh, no seam, no 3D library.
+ * The video is uploaded only on a genuinely new frame
+ * (requestVideoFrameCallback).
+ *
+ * Field of view: the app's FOV is HORIZONTAL (the same semantic YouTube's
+ * embed uses on desktop); the shader wants the vertical one, derived from
+ * the canvas aspect in verticalFov().
+ *
+ * Sign contract, shared with embed.js: view.yaw > 0 turns the view to the
+ * user's LEFT; view.pitch > 0 looks up.  directionFor() below mirrors the
+ * shader so the tests can pin this.
  */
 
 const VS = `#version 300 es
@@ -17,8 +24,8 @@ uniform sampler2D uTex;
 uniform vec2  uRes;
 uniform float uYaw;    // radians, + turns left
 uniform float uPitch;  // radians, + looks up
-uniform float uRoll;   // radians, the head leaning into a turn
-uniform float uFov;    // vertical field of view, radians
+uniform float uRoll;   // radians
+uniform float uFov;    // VERTICAL field of view, radians
 uniform float uBlur;   // radians of yaw smeared across one exposure
 out vec4 frag;
 
@@ -37,23 +44,18 @@ vec3 spin(vec3 dir, float angle) {
 }
 
 void main() {
-  // Screen position normalised on height, so the aspect ratio is honest.
+  // Normalised on height, so uFov is the vertical FOV and aspect is honest.
   vec2 p = (gl_FragCoord.xy - 0.5 * uRes) / uRes.y;
-  // Roll the sampling plane rather than the sphere: one rotation here
-  // instead of three out there, and the result is identical.
   float cr = cos(uRoll), sr = sin(uRoll);
   p = vec2(cr * p.x - sr * p.y, sr * p.x + cr * p.y);
 
   vec3 dir = normalize(vec3(p.x, p.y, -0.5 / tan(uFov * 0.5)));
 
-  // Pitch about the camera's own right, then yaw about world up: an FPS
-  // camera, so the horizon never rolls of its own accord.
+  // Pitch about the camera's right, then yaw about world up (FPS camera).
   float cp = cos(uPitch), sp = sin(uPitch);
   dir = vec3(dir.x, cp * dir.y - sp * dir.z, sp * dir.y + cp * dir.z);
   dir = spin(dir, uYaw);
 
-  // Under a fraction of a degree the smear is invisible and every tap would
-  // land on the same texel.  The branch is on a uniform, so it costs nothing.
   if (uBlur < 0.0008) {
     frag = sampleSphere(dir);
     return;
@@ -66,44 +68,95 @@ void main() {
   frag = total / float(TAPS);
 }`;
 
+const DEG = Math.PI / 180;
+const MAX_DPR = 2;
+
+/* Horizontal FOV (radians) → vertical FOV for a width×height drawing area. */
+export function verticalFov(hFovRad, width, height) {
+  const h = Number.isFinite(hFovRad) ? Math.min(Math.max(hFovRad, 1e-3), Math.PI - 1e-3) : 100 * DEG;
+  if (!(width > 0) || !(height > 0)) return h;
+  return 2 * Math.atan(Math.tan(h / 2) * (height / width));
+}
+
+/* JS mirror of the shader's ray for a screen point p (normalised on height,
+ * +x right, +y up).  Returns { lon, lat } in radians: lon > 0 is to the
+ * right of the frame centre (texture u > 0.5), lat > 0 up.  Keep in step
+ * with FS. */
+export function directionFor(px, py, view, vFovRad) {
+  const cr = Math.cos(view.roll || 0), sr = Math.sin(view.roll || 0);
+  const x0 = cr * px - sr * py, y0 = sr * px + cr * py;
+  let x = x0, y = y0, z = -0.5 / Math.tan(vFovRad / 2);
+  const n = Math.hypot(x, y, z);
+  x /= n; y /= n; z /= n;
+  const cp = Math.cos(view.pitch), sp = Math.sin(view.pitch);
+  [y, z] = [cp * y - sp * z, sp * y + cp * z];
+  const c = Math.cos(view.yaw), s = Math.sin(view.yaw);
+  [x, z] = [c * x + s * z, -s * x + c * z];
+  return { lon: Math.atan2(x, -z), lat: Math.asin(Math.max(-1, Math.min(1, y))) };
+}
+
 export class Renderer {
-  /* Throws if the browser has no WebGL2. */
-  constructor(canvas, video, fovDegrees = 75) {
+  /* Throws if the browser has no WebGL2.  hFovDegrees is HORIZONTAL. */
+  constructor(canvas, video, hFovDegrees = 100) {
     this.canvas = canvas;
     this.video = video;
-    this.fov = fovDegrees * Math.PI / 180;
+    this.hFov = 100 * DEG;
+    this.fov = hFovDegrees * DEG;
     const gl = canvas.getContext("webgl2", { alpha: false, antialias: false });
     if (!gl) throw new Error("This browser has no WebGL2, which the 360 renderer needs.");
     this.gl = gl;
     this.pendingFrame = false;
-    // Nothing may be drawn between losing the context and rebuilding on it.
-    this.lost = false;
+    this.lost = false;          // nothing may be drawn between loss and restore
+    this.sizeDirty = true;      // re-measure the canvas before the next draw
+    this.dpr = 0;
+    this.frameGen = 0;          // invalidates superseded rVFC chains
+    this.frameHandle = null;
     this.watchContext();
+    this.watchSize();
     this.init();
     this.watchFrames();
+    // A new source (src set, load()) restarts the frame chain: the browser
+    // may drop the old chain's callback when the media element reloads.
+    if (typeof video.addEventListener === "function") {
+      video.addEventListener("loadeddata", () => this.rearm());
+    }
   }
 
-  /* A WebGL context is not forever.  A driver reset, a laptop waking on the
-   * other GPU, or the browser reclaiming memory from a background tab takes
-   * it away, and every object made on it -- program, buffer, texture, uniform
-   * location -- goes with it.  Left alone the loss is silent and permanent:
-   * gl calls afterwards quietly do nothing, so the video is simply black for
-   * the rest of the session with no error anywhere and nothing to click.
-   * preventDefault is what earns the restored event; init() rebuilds. */
+  /* Horizontal FOV in radians (the app's semantic); non-finite is ignored. */
+  get fov() { return this.hFov; }
+  set fov(radians) {
+    if (Number.isFinite(radians) && radians > 0) this.hFov = Math.min(radians, Math.PI - 1e-3);
+  }
+  setFov(degrees) { this.fov = degrees * DEG; }
+
+  /* Context loss (driver reset, GPU switch, memory pressure) is silent and
+   * permanent unless handled: preventDefault earns the restore; init()
+   * rebuilds every GL object on the new context. */
   watchContext() {
     this.canvas.addEventListener("webglcontextlost", (event) => {
       event.preventDefault();
       this.lost = true;
     });
     this.canvas.addEventListener("webglcontextrestored", () => {
-      this.init();
+      try {
+        this.init();
+      } catch {
+        return; // stays lost; a later restore tries again
+      }
       this.lost = false;
-      // The new texture is a black pixel and the new context's viewport is
-      // unset; resize() would say nothing changed, since the canvas kept its
-      // size through the loss, so both have to be asked for here.
+      // New texture is a black pixel and the viewport is unset; the canvas
+      // kept its size, so resize() would not notice.
       this.pendingFrame = true;
       this.gl.viewport(0, 0, this.canvas.width, this.canvas.height);
     });
+  }
+
+  /* Resize only when the element actually changes size. */
+  watchSize() {
+    if (typeof ResizeObserver === "function") {
+      this.observer = new ResizeObserver(() => { this.sizeDirty = true; });
+      this.observer.observe(this.canvas);
+    }
   }
 
   compile(type, source) {
@@ -123,9 +176,8 @@ export class Renderer {
     gl.linkProgram(program);
     if (!gl.getProgramParameter(program, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(program));
     gl.useProgram(program);
-    // The linked program holds everything it needs; the shader objects are
-    // only kept alive by being attached.  One rebuild per context loss would
-    // otherwise leave the last pair behind each time.
+    // The linked program keeps what it needs; free the shader objects so a
+    // rebuild per context loss leaves nothing behind.
     for (const shader of shaders) { gl.detachShader(program, shader); gl.deleteShader(shader); }
 
     const buffer = gl.createBuffer();
@@ -142,8 +194,7 @@ export class Renderer {
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-    // A black frame until the first video frame arrives.  RGBA rather than
-    // RGB: it is the fast path for video uploads on most drivers.
+    // Black until the first frame; RGBA is the fast video-upload path.
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([0, 0, 0, 255]));
     this.texWidth = 1;
     this.texHeight = 1;
@@ -158,23 +209,50 @@ export class Renderer {
     };
   }
 
-  /* Upload only on a genuinely new video frame. */
+  /* Upload only on a genuinely new video frame.  Each call starts a fresh
+   * chain and retires the previous one (cancelled where supported, ignored
+   * by generation otherwise), so re-arming never doubles up. */
   watchFrames() {
-    if (!this.video.requestVideoFrameCallback) {
+    const video = this.video;
+    if (typeof video.requestVideoFrameCallback !== "function") {
       this.pendingFrame = true;
       return;
     }
-    this.video.requestVideoFrameCallback(() => {
+    if (this.frameHandle !== null && typeof video.cancelVideoFrameCallback === "function") {
+      try { video.cancelVideoFrameCallback(this.frameHandle); } catch { /* already fired */ }
+    }
+    const gen = ++this.frameGen;
+    const onFrame = () => {
+      if (gen !== this.frameGen) return;
       this.pendingFrame = true;
-      this.watchFrames();
-    });
+      this.frameHandle = video.requestVideoFrameCallback(onFrame);
+    };
+    this.frameHandle = video.requestVideoFrameCallback(onFrame);
   }
 
-  /* Match the drawing buffer to the element.  Returns true if it changed. */
+  /* New source on the same element: upload its first frame, restart the chain. */
+  rearm() {
+    this.pendingFrame = true;
+    this.watchFrames();
+  }
+
+  /* Set the video's source (optional) and re-arm.  Call with no argument
+   * when src was already set elsewhere. */
+  setSource(src) {
+    if (src !== undefined) this.video.src = src;
+    this.rearm();
+  }
+
+  /* Match the drawing buffer to the element.  Returns true if it changed.
+   * Reads layout, so draw() only calls it when the size may have changed
+   * (ResizeObserver fired, DPR changed, or there is no observer). */
   resize() {
-    const scale = Math.min(window.devicePixelRatio || 1, 2);
-    const width = Math.round(this.canvas.clientWidth * scale);
-    const height = Math.round(this.canvas.clientHeight * scale);
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    this.dpr = dpr;
+    this.sizeDirty = typeof ResizeObserver !== "function";
+    const scale = Math.min(dpr, MAX_DPR);
+    const width = Math.max(1, Math.round(this.canvas.clientWidth * scale));
+    const height = Math.max(1, Math.round(this.canvas.clientHeight * scale));
     if (this.canvas.width === width && this.canvas.height === height) return false;
     this.canvas.width = width;
     this.canvas.height = height;
@@ -183,32 +261,35 @@ export class Renderer {
   }
 
   draw(view) {
-    // Between the loss and the restore there is nothing to draw on and no
-    // program to draw with; every call would be a no-op that also reports a
-    // stream of INVALID_OPERATION into the console.
     if (this.lost) return;
+    const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+    if (this.sizeDirty || dpr !== this.dpr) this.resize();
     const gl = this.gl;
-    if (this.pendingFrame && this.video.readyState >= 2 && this.video.videoWidth) {
+    const video = this.video;
+    if (this.pendingFrame && video.readyState >= 2 && video.videoWidth) {
       gl.bindTexture(gl.TEXTURE_2D, this.texture);
       gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, false);
-      // Re-specify storage only when the frame size changes; a plain
-      // sub-image update is markedly cheaper for the 4K-and-up frames
-      // that dominate this library.
-      if (this.texWidth !== this.video.videoWidth || this.texHeight !== this.video.videoHeight) {
-        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
-        this.texWidth = this.video.videoWidth;
-        this.texHeight = this.video.videoHeight;
+      // Re-specify storage only on a size change; sub-image is far cheaper
+      // for 4K+ frames.
+      if (this.texWidth !== video.videoWidth || this.texHeight !== video.videoHeight) {
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, video);
+        this.texWidth = video.videoWidth;
+        this.texHeight = video.videoHeight;
       } else {
-        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, this.video);
+        gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, gl.RGBA, gl.UNSIGNED_BYTE, video);
       }
-      if (this.video.requestVideoFrameCallback) this.pendingFrame = false;
+      if (typeof video.requestVideoFrameCallback === "function") this.pendingFrame = false;
     }
     gl.uniform2f(this.uniforms.res, this.canvas.width, this.canvas.height);
-    gl.uniform1f(this.uniforms.yaw, view.yaw);
-    gl.uniform1f(this.uniforms.pitch, view.pitch);
-    gl.uniform1f(this.uniforms.roll, view.roll);
-    gl.uniform1f(this.uniforms.fov, this.fov);
-    gl.uniform1f(this.uniforms.blur, view.blur);
+    gl.uniform1f(this.uniforms.yaw, finiteOr0(view.yaw));
+    gl.uniform1f(this.uniforms.pitch, finiteOr0(view.pitch));
+    gl.uniform1f(this.uniforms.roll, finiteOr0(view.roll));
+    gl.uniform1f(this.uniforms.fov, verticalFov(this.hFov, this.canvas.width, this.canvas.height));
+    gl.uniform1f(this.uniforms.blur, finiteOr0(view.blur));
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
+}
+
+function finiteOr0(x) {
+  return Number.isFinite(x) ? x : 0;
 }

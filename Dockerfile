@@ -4,7 +4,7 @@
 #   docker run -p 8360:8360 lazyvr
 #
 # Put TLS in front of it (the platform's ingress, or any reverse proxy):
-# the camera API the gaze tracker needs only exists on HTTPS pages.
+# the camera API head tracking needs only exists on HTTPS pages.
 
 FROM python:3.13-slim
 

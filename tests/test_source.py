@@ -1,20 +1,14 @@
-"""The YouTube source: what counts as a clip, and how yt-dlp is asked.
+"""The YouTube source: what counts as a clip, how yt-dlp is asked, and the
+cache / single-flight rules both deployments share.
 
-Every function under test is pure over yt-dlp's dictionaries or the
-environment, so nothing here touches yt-dlp or the network.
-
-The last class is about the two deployments rather than the source: they
-answer the same endpoints from two files, and these tests are what keeps
-the two answers the same.  They import the deployment modules but never
-call a handler that would search.
+Pure over yt-dlp's dictionaries or the environment: nothing here touches
+yt-dlp or the network.  The deployments themselves are tested in
+test_api.py.
 """
 
-import asyncio
-import importlib.util
-import json
 import sys
-import tempfile
-import types
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -22,15 +16,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 import source  # noqa: E402
-
-
-def load(relative: str, name: str):
-    """One deployment module, loaded from its path -- api/index.py is not
-    importable by name from here, and neither file is a package."""
-    spec = importlib.util.spec_from_file_location(name, ROOT / relative)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def entry(**overrides):
@@ -223,144 +208,94 @@ class CategoryTests(unittest.TestCase):
             self.assertTrue(category["query"])
 
 
-class DeploymentParityTests(unittest.TestCase):
-    """server/app.py and api/index.py answer /api/home and /api/search twice.
+class CacheRuleTests(unittest.TestCase):
+    def test_static_paths(self):
+        self.assertEqual(source.static_cache("/"), "no-cache")
+        self.assertEqual(source.static_cache("/index.html"), "no-cache")
+        self.assertEqual(source.static_cache("/index.html?v=1"), "no-cache")
+        self.assertEqual(source.static_cache("/js/app.js"), "public, max-age=0, must-revalidate")
+        self.assertEqual(source.static_cache("/css/base.css"), "public, max-age=0, must-revalidate")
+        self.assertEqual(source.static_cache("/models/face_landmarker.task"),
+                         "public, max-age=604800, stale-while-revalidate=86400")
+        self.assertEqual(source.static_cache("/fonts/x.woff2"), source.ASSET_CACHE)
+        self.assertEqual(source.static_cache("/models/sub/deep.bin"), source.ASSET_CACHE)
+        self.assertEqual(source.static_cache("/modelsish.js"), source.CODE_CACHE)
 
-    The owner develops against the aiohttp server and deploys to Vercel, so
-    anything the two files decide separately is a difference that only
-    production ever shows.  Everything that shapes an answer lives in
-    source.py instead; these fail the moment a copy comes back."""
+    def test_home_is_cached_by_how_well_it_went(self):
+        full = [{"id": "a", "clips": [1]}, {"id": "b", "clips": [2]}]
+        failed = [{"id": "a", "clips": [1]}, {"id": "b", "clips": [], "error": "x"}]
+        # An empty shelf is usually youtube challenging us: not a success.
+        empty = [{"id": "a", "clips": [1]}, {"id": "b", "clips": []}]
+        dead = [{"id": "a", "clips": [], "error": "x"}, {"id": "b", "clips": []}]
+        self.assertEqual(source.home_cache(full), "public, s-maxage=21600, stale-while-revalidate=86400")
+        self.assertEqual(source.home_cache(failed), "public, s-maxage=300")
+        self.assertEqual(source.home_cache(empty), "public, s-maxage=300")
+        self.assertEqual(source.home_cache(dead), "no-store")
+        self.assertEqual(source.home_cache([]), "no-store")
 
-    SHARED = ("HOME_LIMIT", "SEARCH_LIMIT", "CATEGORY_TTL", "SEARCH_TTL",
-              "ASSET_CACHE", "PAGE_CACHE")
+    def test_search_is_cached_unless_empty(self):
+        self.assertEqual(source.search_cache([{"id": "x"}]),
+                         "public, s-maxage=900, stale-while-revalidate=3600")
+        self.assertEqual(source.search_cache([]), source.EMPTY_CACHE)
 
-    def test_source_owns_every_number_that_shapes_an_answer(self):
-        for name in self.SHARED:
-            self.assertTrue(hasattr(source, name), f"source.{name} is missing")
-
-    def test_the_vercel_function_keeps_no_copy_of_them(self):
-        module = load("api/index.py", "vercel_index")
-        for name in self.SHARED:
-            self.assertFalse(hasattr(module, name),
-                             f"api/index.py defines its own {name}; it must read source.{name}")
-
-    def test_the_aiohttp_server_keeps_no_copy_of_them(self):
-        try:
-            module = load("server/app.py", "aiohttp_app")
-        except ImportError as missing:  # aiohttp is not installed for the Vercel deploy
-            self.skipTest(str(missing))
-        for name in self.SHARED:
-            self.assertFalse(hasattr(module, name),
-                             f"server/app.py defines its own {name}; it must read source.{name}")
-
-    def test_both_refuse_an_empty_query_the_same_way(self):
-        # The page reads data.error out of the body and shows it, so an
-        # aiohttp exception -- whose body is plain text -- would leave a
-        # local viewer reading "the server said 400" while a Vercel viewer
-        # is told what was actually wrong.
-        vercel = load("api/index.py", "vercel_index")
-        self.assertEqual(vercel.api_search({}), (400, {"error": "q is required"}))
-        try:
-            local = load("server/app.py", "aiohttp_app")
-        except ImportError as missing:
-            self.skipTest(str(missing))
-        response = asyncio.run(local.api_search(types.SimpleNamespace(query={})))
-        self.assertEqual(response.status, 400)
-        self.assertEqual(json.loads(response.text), {"error": "q is required"})
-        self.assertEqual(response.headers["Cache-Control"], "no-store")
-
-    def test_the_same_search_shapes_the_same_two_answers(self):
-        """Given one identical search, the two files must emit one identical
-        body -- same shelves, same number of clips, same keys."""
-        vercel = load("api/index.py", "vercel_index")
-        try:
-            local = load("server/app.py", "aiohttp_app")
-        except ImportError as missing:
-            self.skipTest(str(missing))
-
-        def fake_search(query, limit=source.SEARCH_LIMIT):
-            return [source.to_clip(entry(id=f"{query[:3]}{index:08d}", title=f"{query} {index}"))
-                    for index in range(limit)]
-
-        real, source.search_360 = source.search_360, fake_search
-        vercel.CACHE, local.CACHE = source.TTLCache(), source.TTLCache()
-        try:
-            self.assertEqual(vercel.api_home()[1],
-                             json.loads(asyncio.run(local.api_home(None)).text))
-            self.assertEqual(
-                vercel.api_search({"q": ["aurora"]})[1],
-                json.loads(asyncio.run(local.api_search(
-                    types.SimpleNamespace(query={"q": "aurora"}))).text))
-        finally:
-            source.search_360 = real
+    def test_no_header_ever_breaks_the_youtube_embed(self):
+        names = {name.lower() for name in source.SECURITY_HEADERS}
+        self.assertNotIn("cross-origin-opener-policy", names)
+        self.assertNotIn("cross-origin-embedder-policy", names)
+        self.assertEqual(source.SECURITY_HEADERS["Referrer-Policy"], "strict-origin-when-cross-origin")
 
 
-class StaticFileTests(unittest.TestCase):
-    """The Vercel function serves ../site itself, so it is the one place
-    here that turns a visitor's path into a file to read."""
+class SingleFlightTests(unittest.TestCase):
+    def test_concurrent_callers_share_one_producer_call(self):
+        cache, locks = source.TTLCache(), source.KeyedLocks()
+        calls = []
+        gate = threading.Event()
 
-    def setUp(self):
-        self.module = load("api/index.py", "vercel_index")
+        def producer():
+            calls.append(1)
+            gate.wait(2)
+            return ["clip"]
 
-    def request(self, path):
-        seen = {}
+        results = []
+        threads = [threading.Thread(target=lambda: results.append(
+            source.cached_call(cache, locks, "k", producer, 60))) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        time.sleep(0.05)
+        gate.set()
+        for thread in threads:
+            thread.join(5)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(results, [["clip"]] * 8)
+        self.assertEqual(len(locks), 0, "a lock outlived its last user")
 
-        def start_response(status, headers):
-            seen["status"] = status
-            seen["headers"] = dict(headers)
+    def test_a_failure_is_not_cached_and_frees_the_lock(self):
+        cache, locks = source.TTLCache(), source.KeyedLocks()
 
-        body = b"".join(self.module.app(
-            {"PATH_INFO": path, "QUERY_STRING": "", "REQUEST_METHOD": "GET"}, start_response))
-        return seen["status"], seen["headers"], body
+        def boom():
+            raise RuntimeError("challenged")
 
-    def test_the_page_is_served(self):
-        status, headers, body = self.request("/")
-        self.assertTrue(status.startswith("200"))
-        self.assertEqual(headers["Content-Type"], "text/html")
-        self.assertIn(b"<html", body.lower())
+        with self.assertRaises(RuntimeError):
+            source.cached_call(cache, locks, "k", boom, 60)
+        self.assertEqual(len(locks), 0)
+        self.assertEqual(source.cached_call(cache, locks, "k", lambda: ["ok"], 60), ["ok"])
 
-    def test_climbing_out_of_the_site_directory_is_not_found(self):
-        for path in ("/../server/source.py", "/../requirements.txt", "/js/../../vercel.json"):
-            status, _, _ = self.request(path)
-            self.assertTrue(status.startswith("404"), f"{path} was served")
+    def test_unique_keys_do_not_grow_the_lock_table(self):
+        cache, locks = source.TTLCache(), source.KeyedLocks()
+        for i in range(1000):
+            source.cached_call(cache, locks, f"q:{i}", lambda: ["x"], 60)
+        self.assertEqual(len(locks), 0)
 
-    def test_a_sibling_that_merely_starts_with_site_is_not_inside_it(self):
-        # "site" is a prefix of "site-backup", so comparing the resolved
-        # path with startswith let a request climb one level and come back
-        # down into a directory that is not the site at all.
-        with tempfile.TemporaryDirectory() as tmp:
-            site = Path(tmp) / "site"
-            site.mkdir()
-            sibling = Path(tmp) / "site-backup"
-            sibling.mkdir()
-            (sibling / "secret.txt").write_text("not for the web", encoding="utf-8")
-            original, self.module.SITE = self.module.SITE, site
-            try:
-                status, _, body = self.request("/../site-backup/secret.txt")
-            finally:
-                self.module.SITE = original
-        self.assertTrue(status.startswith("404"), "a sibling directory was served")
-        self.assertNotIn(b"not for the web", body)
-
-    def test_a_path_the_filesystem_cannot_name_is_not_a_500(self):
-        # A 500 here would answer with an OSError quoting an absolute path
-        # inside the deployment.
-        status, _, body = self.request("/\x00")
-        self.assertTrue(status.startswith("404"), status)
-        self.assertNotIn(b"site", body)
-
-    def test_models_are_cached_for_a_day_and_the_page_is_not(self):
-        _, headers, _ = self.request("/models/mirror_permutation.json")
-        self.assertEqual(headers["Cache-Control"], source.ASSET_CACHE)
-        _, headers, _ = self.request("/js/library.js")
-        self.assertEqual(headers["Cache-Control"], source.PAGE_CACHE)
-
-    def test_an_unknown_endpoint_is_json_and_never_cached(self):
-        status, headers, body = self.request("/api/nope")
-        self.assertTrue(status.startswith("404"))
-        self.assertEqual(headers["Content-Type"], "application/json")
-        self.assertEqual(headers["Cache-Control"], "no-store")
-        self.assertIn("error", json.loads(body))
+    def test_an_empty_answer_is_cached_briefly(self):
+        clock = [0.0]
+        cache, locks = source.TTLCache(clock=lambda: clock[0]), source.KeyedLocks()
+        calls = []
+        source.cached_call(cache, locks, "k", lambda: calls.append(1) or [], 900)
+        source.cached_call(cache, locks, "k", lambda: calls.append(1) or [], 900)
+        self.assertEqual(len(calls), 1)
+        clock[0] = source.EMPTY_TTL + 1
+        source.cached_call(cache, locks, "k", lambda: calls.append(1) or [], 900)
+        self.assertEqual(len(calls), 2)
 
 
 if __name__ == "__main__":

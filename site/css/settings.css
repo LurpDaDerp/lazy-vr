@@ -1,6 +1,6 @@
-/* The settings drawer: a Seat panel on the right edge, one hairline from
- * the picture.  base.css draws every control (sliders, switches, selects,
- * buttons); this lays them out in groups. */
+/* Settings: a drawer on the right edge over the library, a popover anchored
+ * bottom-right over the player (the video keeps playing).  base.css draws
+ * every control; this lays them out in groups. */
 
 #settings {
   position: fixed;
@@ -28,6 +28,22 @@
 }
 
 #settings[hidden] { display: none !important; }
+
+/* Over the player: a popover above the bottom bar's right end. */
+body:not(.browsing) #settings {
+  top: auto;
+  right: var(--s-6);
+  bottom: 64px;
+  max-height: calc(100vh - 64px - var(--s-6));
+  border: 1px solid var(--rail);
+  border-radius: var(--r-md);
+}
+@starting-style {
+  body:not(.browsing) #settings:not([hidden]) {
+    transform: translateY(var(--s-2));
+    opacity: 0;
+  }
+}
 
 /* -- head --------------------------------------------------------------- */
 
@@ -123,7 +139,7 @@
 
 /* -- foot ---------------------------------------------------------------- */
 
-#setsreset { margin-top: var(--s-6); }
+.sets-reset { margin-top: var(--s-6); }
 
 .set-note {
   margin-top: var(--s-3);

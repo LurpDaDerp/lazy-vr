@@ -5,25 +5,78 @@
  * 360° feature filter, so every card is a real equirectangular upload.
  */
 
-async function getJson(url) {
+/* JSON from our own API.  An abort is rethrown as is (callers recognise it
+ * by name); every other failure becomes a sentence for the page. */
+async function getJson(url, { signal } = {}) {
   let response;
   try {
-    response = await fetch(url, { cache: "no-store" });
-  } catch {
+    response = await fetch(url, { signal });
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
     throw new Error("the LazyVR server is not answering");
   }
   let data = null;
   try {
     data = await response.json();
-  } catch { /* an error page, not JSON */ }
+  } catch (error) {
+    if (error && error.name === "AbortError") throw error;
+    /* an error page, not JSON */
+  }
   if (!response.ok || (data && data.error)) {
     throw new Error((data && data.error) || `the server said ${response.status}`);
   }
+  if (!data || typeof data !== "object") throw new Error("the server's answer was not readable");
   return data;
 }
 
-export const fetchHome = () => getJson("api/home");
-export const fetchSearch = (query) => getJson(`api/search?q=${encodeURIComponent(query)}`);
+export const fetchHome = (options) => getJson("api/home", options);
+export const fetchSearch = (query, options) => getJson(`api/search?q=${encodeURIComponent(query)}`, options);
+
+export const isAbort = (error) => Boolean(error && error.name === "AbortError");
+
+/* Newest wins: start() aborts whatever the previous start() began and hands
+ * back a signal plus a check that stays true only while this run is the
+ * latest.  Used for search, where an abandoned query must never render. */
+export class Latest {
+  constructor() {
+    this.controller = null;
+    this.run = 0;
+  }
+
+  start() {
+    this.abort();
+    const controller = new AbortController();
+    const run = ++this.run;
+    this.controller = controller;
+    return { signal: controller.signal, current: () => run === this.run && !controller.signal.aborted };
+  }
+
+  abort() {
+    this.run += 1;
+    if (this.controller) this.controller.abort();
+    this.controller = null;
+  }
+}
+
+/* Thumbnail candidates for a card.  The server hands out mqdefault
+ * (320×180); hqdefault (480×360, letterboxed 4:3 that object-fit: cover
+ * crops back to 16:9) always exists too, and hq720 (1280×720) exists for
+ * most uploads and is tried only where the card is big enough to use it. */
+const YT_THUMB = /^https:\/\/i\.ytimg\.com\/vi\/([A-Za-z0-9_-]{11})\//;
+
+export function thumbSources(clip) {
+  const thumb = clip && typeof clip.thumb === "string" ? clip.thumb : "";
+  const match = YT_THUMB.exec(thumb);
+  if (!match) return { src: thumb, srcset: "", fallback: "" };
+  const base = `https://i.ytimg.com/vi/${match[1]}`;
+  const safe = `${base}/mqdefault.jpg 320w, ${base}/hqdefault.jpg 480w`;
+  return { src: `${base}/mqdefault.jpg`, srcset: `${safe}, ${base}/hq720.jpg 1280w`, fallback: safe };
+}
+
+/* The card widths the CSS gives (library.css): shelves clamp(240px, 22vw,
+ * 320px), the results grid fills columns of at least 260px. */
+const SHELF_SIZES = "(min-width: 1455px) 320px, (min-width: 1091px) 22vw, 240px";
+const GRID_SIZES = "(min-width: 1200px) 25vw, (min-width: 700px) 40vw, 90vw";
 
 export function formatDuration(seconds) {
   if (!seconds || !isFinite(seconds)) return null;
@@ -69,11 +122,12 @@ const rowWatcher = typeof ResizeObserver === "function"
   ? new ResizeObserver((entries) => { for (const entry of entries) entry.target.__update?.(); })
   : null;
 
-export function makeCard(clip, onPick) {
+export function makeCard(clip, onPick, sizes = SHELF_SIZES) {
   const root = document.createElement("button");
   root.className = "card";
   root.type = "button";
   root.setAttribute("aria-label", `Play ${clip.title}`);
+  if (clip.id) root.dataset.id = clip.id;
 
   const strip = document.createElement("span");
   strip.className = "strip";
@@ -83,12 +137,28 @@ export function makeCard(clip, onPick) {
   image.decoding = "async";
   // The seat and its shimmer show until the picture is there; a picture
   // that never comes leaves a plain seat rather than a shimmer forever.
+  const sources = thumbSources(clip);
   image.addEventListener("load", () => { strip.classList.remove("loading"); strip.classList.add("loaded"); }, { once: true });
-  image.addEventListener("error", () => { strip.classList.remove("loading"); strip.classList.add("blank"); }, { once: true });
+  const failed = () => {
+    // hq720 is missing for some uploads; fall back once to the sizes that
+    // always exist before giving up on the picture.
+    if (sources.fallback && image.srcset !== sources.fallback) {
+      image.srcset = sources.fallback;
+      return;
+    }
+    image.removeEventListener("error", failed);
+    strip.classList.remove("loading");
+    strip.classList.add("blank");
+  };
+  image.addEventListener("error", failed);
   // The shimmer starts when the browser is about to fetch the picture (the
   // same margin a lazy image loads at), not the moment the card exists.
   if (loadWatcher) loadWatcher.observe(image);
-  image.src = clip.thumb;
+  if (sources.srcset) {
+    image.sizes = sizes;
+    image.srcset = sources.srcset;
+  }
+  image.src = sources.src;
   if (image.complete && image.naturalWidth) strip.classList.add("loaded");
   const badge = document.createElement("span");
   badge.className = "badge";
@@ -112,7 +182,7 @@ export function makeCard(clip, onPick) {
   });
 
   root.append(strip, title, meta);
-  root.addEventListener("click", () => onPick(clip));
+  root.addEventListener("click", () => onPick(clip, root));
   return root;
 }
 
@@ -185,6 +255,6 @@ export function renderShelves(container, categories, onPick) {
 export function renderResults(grid, clips, onPick) {
   releaseCards(grid);
   grid.textContent = "";
-  for (const clip of clips) grid.appendChild(makeCard(clip, onPick));
+  for (const clip of clips) grid.appendChild(makeCard(clip, onPick, GRID_SIZES));
   return clips.length;
 }
