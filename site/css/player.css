@@ -311,14 +311,16 @@ body.chrome-asleep [data-tip]::after { display: none; }
   left: 0;
   right: 0;
   top: 50%;
-  height: 2px;
-  transform: translateY(-50%);
+  height: 4px;
+  /* Drawn at its hover thickness and scaled down at rest: growing it is a
+     transform, not a relayout of the bar on every hover. */
+  transform: translateY(-50%) scaleY(0.5);
   border-radius: var(--r-round);
   background: var(--brass-dim);
   box-shadow: 0 1px 2px var(--scrim);
-  transition: height var(--t-fast) var(--ease-out);
+  transition: transform var(--t-fast) var(--ease-out);
 }
-.seek:hover .seek-rail, .seek.active .seek-rail, .seek:focus-visible .seek-rail { height: 4px; }
+.seek:hover .seek-rail, .seek.active .seek-rail, .seek:focus-visible .seek-rail { transform: translateY(-50%) scaleY(1); }
 .seek-buffered, .seek-hover, .seek-played {
   position: absolute;
   inset: 0 auto 0 0;
